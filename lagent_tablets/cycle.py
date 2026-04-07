@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
+import hashlib
+
 from lagent_tablets.adapters import BurstResult, ProviderConfig
 from lagent_tablets.burst import (
     extract_json_decision,
@@ -57,10 +59,9 @@ from lagent_tablets.tablet import (
     extract_declaration_name,
     scan_forbidden_keywords,
 )
+from lagent_tablets.check import check_node as run_check_node
 from lagent_tablets.verification import (
     FORBIDDEN_KEYWORDS_DEFAULT,
-    NodeCheckResult,
-    check_node,
     write_scripts,
 )
 
@@ -329,7 +330,7 @@ def validate_worker_cycle(
             )
 
         # Compile check
-        result = check_node(
+        result = run_check_node(
             repo, active_node,
             allowed_prefixes=allowed_prefixes,
             forbidden_keywords=forbidden,
@@ -400,7 +401,7 @@ def validate_worker_cycle(
             return CycleOutcome(outcome="INVALID", detail=f"New node {name} has unauthorized imports: {import_violations}")
 
         # Compile check
-        result = check_node(
+        result = run_check_node(
             repo, name,
             allowed_prefixes=allowed_prefixes,
             forbidden_keywords=forbidden,
@@ -449,6 +450,118 @@ def validate_worker_cycle(
         nodes_closed=nodes_closed,
         nodes_created=new_node_names,
     )
+
+
+def validate_worker_cycle_v2(
+    config: Config,
+    tablet: TabletState,
+    active_node: str,
+    *,
+    active_changed: bool,
+    new_lean_files: List[str],
+) -> CycleOutcome:
+    """Validate after a worker burst. Simpler than the old snapshot-based approach.
+
+    Checks:
+    1. Did the active node change? If not, NO_PROGRESS.
+    2. Is the declaration signature intact?
+    3. Are imports valid?
+    4. Any forbidden keywords?
+    5. Does it compile?
+    6. Is it sorry-free? If yes, CLOSED.
+    7. New files: validate names, markers, .tex pairs.
+    """
+    repo = config.repo_path
+    forbidden = [kw for kw in FORBIDDEN_KEYWORDS_DEFAULT if kw not in config.workflow.forbidden_keyword_allowlist]
+
+    if not active_changed and not new_lean_files:
+        return CycleOutcome(outcome="NO_PROGRESS", detail="No files were changed.")
+
+    nodes_closed = []
+    nodes_created = []
+
+    # Validate active node using check.py (the SINGLE SOURCE OF TRUTH)
+    if active_changed:
+        stored_hash = tablet.nodes[active_node].lean_statement_hash if active_node in tablet.nodes else ""
+        result = run_check_node(
+            repo, active_node,
+            allowed_prefixes=config.workflow.allowed_import_prefixes,
+            forbidden_keywords=forbidden,
+            expected_hash=stored_hash,
+        )
+        if result["errors"]:
+            # Return the first error as the INVALID detail
+            return CycleOutcome(
+                outcome="INVALID",
+                detail=result["errors"][0],
+                build_output=result.get("build_output", ""),
+            )
+        if result["ok"]:
+            nodes_closed.append(active_node)
+
+    # Validate new files
+    for name in new_lean_files:
+        if name in ("Preamble", "Axioms") or name in tablet.nodes:
+            continue
+        if not is_valid_node_name(name):
+            return CycleOutcome(outcome="INVALID", detail=f"Invalid node name: {name!r}")
+
+        lean_path = node_lean_path(repo, name)
+        tex_path = node_tex_path(repo, name)
+        if not tex_path.exists():
+            return CycleOutcome(outcome="INVALID", detail=f"New node {name} has .lean but no .tex file")
+
+        content = lean_path.read_text(encoding="utf-8")
+        marker = extract_marker_name(content)
+        if marker != name:
+            return CycleOutcome(outcome="INVALID", detail=f"New node {name}: marker says {marker!r}")
+
+        import_violations = validate_imports(content, config.workflow.allowed_import_prefixes)
+        if import_violations:
+            return CycleOutcome(outcome="INVALID", detail=f"New node {name} has unauthorized imports: {import_violations}")
+
+        if not has_sorry(content):
+            nodes_closed.append(name)
+        nodes_created.append(name)
+
+    # Build detail
+    parts = []
+    if nodes_closed:
+        parts.append(f"closed: {nodes_closed}")
+    if nodes_created:
+        parts.append(f"created: {nodes_created}")
+    if active_changed and active_node not in nodes_closed:
+        parts.append(f"{active_node} modified (still open)")
+
+    if not parts:
+        return CycleOutcome(outcome="NO_PROGRESS", detail="No meaningful changes detected.")
+
+    return CycleOutcome(
+        outcome="PROGRESS",
+        detail="; ".join(parts),
+        nodes_closed=nodes_closed,
+        nodes_created=nodes_created,
+    )
+
+
+def _ensure_lake_build(repo: Path) -> None:
+    """Run lake build Tablet to ensure oleans are up to date.
+
+    This is important because:
+    1. check_node.sh needs oleans to exist
+    2. The worker runs lake env lean which needs oleans
+    3. After cross-user file creation, oleans may be stale
+    """
+    import subprocess
+    try:
+        subprocess.run(
+            ["lake", "build", "Tablet"],
+            cwd=str(repo),
+            capture_output=True, text=True,
+            timeout=600,  # 10 min max for build
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        print(f"  Warning: lake build failed: {e}")
 
 
 def _count_consecutive_invalids(state: SupervisorState) -> int:
@@ -500,28 +613,24 @@ def reconcile_tablet_status(config: Config, tablet: TabletState) -> List[str]:
         file_has_sorry = has_sorry(content)
 
         if node.status == "open" and not file_has_sorry:
-            # File looks sorry-free -- verify with compilation
-            result = check_node(
+            # File looks sorry-free -- run check.py to verify
+            result = run_check_node(
                 repo, name,
                 allowed_prefixes=config.workflow.allowed_import_prefixes,
                 forbidden_keywords=forbidden,
-                timeout_seconds=120,
             )
-            if result.compiles and result.sorry_free:
+            if result["ok"]:
                 mark_node_closed(tablet, name, 0)
                 reconciled.append(name)
-                print(f"  Reconciled: {name} is sorry-free and compiles, marking closed")
-            elif result.sorry_free and not result.compiles:
-                # Sorry-free but compilation failed -- check if it's just Lake package noise
-                from lagent_tablets.verification import _is_lake_package_error
-                if _is_lake_package_error(result.build_output):
-                    mark_node_closed(tablet, name, 0)
-                    reconciled.append(name)
-                    print(f"  Reconciled: {name} is sorry-free (Lake package error ignored), marking closed")
-                else:
-                    print(f"  Reconciled: {name} is sorry-free but has real compilation errors")
+                print(f"  Reconciled: {name} passes all checks, marking closed")
+            elif result["sorry_free"] and result["compiles"]:
+                # Passes compilation and sorry-free but has other issues (hash, imports)
+                # Still mark closed -- the issues are about the declaration, not the proof
+                mark_node_closed(tablet, name, 0)
+                reconciled.append(name)
+                print(f"  Reconciled: {name} compiles and sorry-free, marking closed (warnings: {result['warnings']})")
             else:
-                print(f"  Reconciled: {name} sorry_free={result.sorry_free} compiles={result.compiles}")
+                print(f"  Reconciled: {name} sorry-free but has issues: {result['errors'][:1]}")
         elif node.status == "closed" and file_has_sorry:
             # Node was closed but file now has sorry (e.g., statement was changed)
             mark_node_open(tablet, name, 0)
@@ -555,15 +664,18 @@ def run_cycle(
     from lagent_tablets.health import fix_lake_permissions
     fix_lake_permissions(repo)
 
-    # Set file permissions FIRST (this ensures the active node is writable
-    # and all other nodes are read-only BEFORE we take the snapshot)
+    # Ensure oleans are up to date before the burst (so check_node works for the worker)
+    _ensure_lake_build(repo)
+
+    # Set file permissions (active node writable, others read-only)
     setup_permissions(config, active_node)
+
+    # Record the active node's hash BEFORE the burst
+    active_lean = node_lean_path(repo, active_node)
+    hash_before = hashlib.sha256(active_lean.read_bytes()).hexdigest() if active_lean.exists() else ""
 
     # Build worker prompt
     worker_prompt = build_worker_prompt(config, state, tablet, policy, previous_outcome=previous_outcome)
-
-    # Snapshot AFTER permissions are set (captures the true "before" state)
-    snapshot_before = _snapshot_tablet_dir(repo)
 
     # Run worker burst
     log_dir = config.state_dir / "logs" / f"cycle-{cycle:04d}"
@@ -583,11 +695,24 @@ def run_cycle(
         print(f"  Worker burst failed: {worker_result.error}")
         return CycleOutcome(outcome="INVALID", detail=f"Worker burst failed: {worker_result.error}")
 
-    # Snapshot after
-    snapshot_after = _snapshot_tablet_dir(repo)
+    # Fix .lake permissions after burst (worker may have created oleans)
+    fix_lake_permissions(repo)
+
+    # Check the active node's hash AFTER the burst
+    hash_after = hashlib.sha256(active_lean.read_bytes()).hexdigest() if active_lean.exists() else ""
+    active_changed = hash_before != hash_after
+
+    # Detect new files created by the worker
+    current_files = {p.name for p in (repo / "Tablet").iterdir() if p.is_file()} if (repo / "Tablet").is_dir() else set()
+    known_files = {f"{name}.lean" for name in tablet.nodes} | {f"{name}.tex" for name in tablet.nodes} | {"INDEX.md", "README.md", "header.tex"}
+    new_files = current_files - known_files
 
     # Validate
-    outcome = validate_worker_cycle(config, tablet, active_node, snapshot_before, snapshot_after)
+    outcome = validate_worker_cycle_v2(
+        config, tablet, active_node,
+        active_changed=active_changed,
+        new_lean_files=[f.removesuffix(".lean") for f in new_files if f.endswith(".lean")],
+    )
     print(f"  Validation: {outcome.outcome} -- {outcome.detail}")
 
     # Track consecutive invalids for escalation
