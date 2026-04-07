@@ -447,8 +447,11 @@ mathematics of a proof tablet -- a DAG of theorem nodes, each with an NL stateme
 
 You must check three things for the nodes listed below:
 
-A) NL/LEAN CORRESPONDENCE: Does each NL statement express the same mathematical content as its
-   Lean statement? Check quantifier scope, type constraints, implicit assumptions, edge cases.
+A) NL/LEAN CORRESPONDENCE: Does the Lean statement fully capture ALL mathematical claims made
+   by the NL statement? The Lean must formalize EVERY claim in the NL -- if the NL mentions
+   graphs, probability, or any mathematical structure that the Lean omits, that is a FAIL.
+   A Lean statement that proves only PART of the NL claim is NOT a valid correspondence.
+   Check: quantifier scope, type constraints, implicit assumptions, domain-specific context.
 
 B) PAPER-FAITHFULNESS: Is each new node a genuine, non-trivial intermediate step toward proving
    the paper's main results? Does it represent real mathematical progress, or does it merely

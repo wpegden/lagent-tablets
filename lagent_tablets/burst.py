@@ -231,11 +231,13 @@ def _build_command_parts(config: ProviderConfig) -> List[str]:
         return cmd
 
     if config.provider == "gemini":
-        cmd = ["gemini", "--approval-mode=yolo", "-p"]
+        # For Gemini: all flags MUST come before -p.
+        # -p takes the prompt as its argument: gemini [flags] -p "prompt"
+        cmd = ["gemini", "--approval-mode=yolo"]
         if config.model:
             cmd.extend(["--model", config.model])
         cmd.extend(config.extra_args or [])
-        cmd.append("__PROMPT__")
+        cmd.extend(["-p", "__PROMPT__"])
         return cmd
 
     raise ValueError(f"Unknown provider: {config.provider}")
