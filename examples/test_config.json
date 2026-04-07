@@ -1,0 +1,54 @@
+{
+  "repo_path": "/tmp/lagent-test-repo",
+  "goal_file": "GOAL.md",
+  "state_dir": ".agent-supervisor",
+  "max_cycles": 1,
+  "sleep_seconds": 1.0,
+  "startup_timeout_seconds": 120.0,
+  "burst_timeout_seconds": 600.0,
+  "worker": {
+    "provider": "claude",
+    "model": "sonnet",
+    "effort": "low"
+  },
+  "reviewer": {
+    "provider": "claude",
+    "model": "sonnet"
+  },
+  "verification": {
+    "provider": "claude",
+    "model": "claude-opus-4-6",
+    "thinking_budget": "high",
+    "max_context_tokens": 50000
+  },
+  "tmux": {
+    "session_name": "test-tablets",
+    "dashboard_window_name": "dashboard",
+    "kill_windows_after_capture": true,
+    "burst_user": "leanagent"
+  },
+  "workflow": {
+    "start_phase": "proof_formalization",
+    "paper_tex_path": "paper.tex",
+    "approved_axioms_path": "APPROVED_AXIOMS.json",
+    "allowed_import_prefixes": [
+      "Mathlib"
+    ],
+    "forbidden_keyword_allowlist": []
+  },
+  "chat": {
+    "root_dir": "/tmp/lagent-test-chats",
+    "repo_name": "test-project",
+    "project_name": "Test Project"
+  },
+  "git": {
+    "remote_url": null,
+    "remote_name": "origin",
+    "branch": "main",
+    "author_name": "lagent-supervisor",
+    "author_email": "lagent@localhost"
+  },
+  "branching": {
+    "max_current_branches": 1
+  }
+}
