@@ -60,7 +60,7 @@ Mode:  2775
 | File/Dir | Mode | Written by | Read by |
 |----------|------|-----------|---------|
 | `state.json` | 0640 | supervisor | supervisor |
-| `tablet.json` | 0640 | supervisor | supervisor |
+| `tablet.json` | 0640 | supervisor | both (worker reads for check.py hash verification) |
 | `scripts/` | 0755 (dir) | supervisor | both |
 | `scripts/*.sh` | 0755 | supervisor | both (executed by lagentworker) |
 | `logs/` | 2775 (dir) | supervisor | both |
