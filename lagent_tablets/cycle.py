@@ -22,7 +22,6 @@ from lagent_tablets.burst import (
     extract_json_decision,
     run_reviewer_burst,
     run_worker_burst,
-    tmux_kill_window,
 )
 from lagent_tablets.config import Config, Policy
 from lagent_tablets.prompts import build_reviewer_prompt, build_verification_prompt, build_worker_prompt
@@ -523,16 +522,6 @@ def run_cycle(
 
     print(f"=== Cycle {cycle} | Active: {active_node} ===")
 
-    # Kill any lingering agent processes from the previous cycle.
-    # This is critical: agents (especially Gemini) can survive tmux window kills
-    # and keep writing files, corrupting the next cycle's snapshot.
-    from lagent_tablets.burst import kill_agent_session
-    kill_agent_session(
-        config.tmux.session_name,
-        f"{config.worker.provider}-worker",
-        burst_user=config.tmux.burst_user,
-    )
-
     # Regenerate scripts each cycle (hot-reloadable)
     forbidden = [kw for kw in FORBIDDEN_KEYWORDS_DEFAULT if kw not in config.workflow.forbidden_keyword_allowlist]
     write_scripts(repo, config.state_dir, allowed_prefixes=config.workflow.allowed_import_prefixes, forbidden_keywords=forbidden)
@@ -553,8 +542,6 @@ def run_cycle(
 
     # Run worker burst
     log_dir = config.state_dir / "logs" / f"cycle-{cycle:04d}"
-    handoff_path = repo / "worker_handoff.json"
-    handoff_path.unlink(missing_ok=True)
 
     worker_result = run_worker_burst(
         config.worker,
@@ -563,10 +550,8 @@ def run_cycle(
         work_dir=repo,
         burst_user=config.tmux.burst_user,
         timeout_seconds=policy.timing.burst_timeout_seconds,
-        stall_threshold_seconds=policy.timing.stall_threshold_seconds,
-        max_stall_recoveries=policy.timing.max_stall_recoveries_per_burst,
+        startup_timeout_seconds=config.startup_timeout_seconds,
         log_dir=log_dir,
-        completion_marker=handoff_path,
     )
 
     if not worker_result.ok:
@@ -664,12 +649,9 @@ def run_cycle(
             reviewer_prompt,
             session_name=config.tmux.session_name,
             work_dir=repo,
-            burst_user=config.tmux.burst_user if config.reviewer.provider == "gemini" else None,
+            burst_user=config.tmux.burst_user,
             timeout_seconds=min(policy.timing.burst_timeout_seconds, 300),
-            stall_threshold_seconds=policy.timing.stall_threshold_seconds,
-            max_stall_recoveries=policy.timing.max_stall_recoveries_per_burst,
             log_dir=log_dir,
-            completion_marker=decision_path if config.reviewer.provider == "gemini" else None,
         )
 
         # Parse reviewer decision from output (non-interactive) or file (Gemini interactive)

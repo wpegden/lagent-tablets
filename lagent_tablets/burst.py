@@ -1,18 +1,11 @@
 """Burst execution: how to talk to agents.
 
-Handles tmux management, interactive/non-interactive execution, completion
-detection, stall detection/recovery, output capture, and JSON extraction.
+Uses the proven v1 pattern: a bash script wraps the agent command, writes
+start/exit marker files, and the supervisor waits only for those files.
+All agents run in non-interactive "print" mode (claude -p, gemini -p, codex exec).
+They can still use tools (edit files, run commands) -- they just exit when done.
 
-Execution strategy per provider and role:
-
-| Provider | Worker           | Reviewer/Verification      |
-|----------|-----------------|---------------------------|
-| Claude   | Interactive+marker | Non-interactive (`-p`)     |
-| Codex    | Non-interactive    | Non-interactive (`exec`)   |
-| Gemini   | Interactive+marker | Interactive+marker         |
-
-Gemini is ALWAYS interactive per CLI_NOTES.md recommendation: its non-interactive
-mode has open production-hardening gaps, while interactive mode is more reliable.
+The bash trap EXIT guarantees the exit marker is written even if the agent crashes.
 """
 
 from __future__ import annotations
@@ -22,116 +15,43 @@ import os
 import re
 import shlex
 import subprocess
-import tempfile
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from lagent_tablets.adapters import BurstResult, ProviderConfig, UsageSnapshot
+from lagent_tablets.adapters import BurstResult, ProviderConfig
 
 
 # ---------------------------------------------------------------------------
-# Rate limit detection patterns
+# Rate limit detection
 # ---------------------------------------------------------------------------
 
 RATE_LIMIT_PATTERNS = [
-    "rate limit",
-    "rate_limit",
-    "ratelimit",
-    "too many requests",
-    "429",
-    "resource_exhausted",
-    "model_capacity_exhausted",
-    "quota exceeded",
-    "usage limit",
-    "credit balance is too low",
-    "overloaded_error",
-    "hit your limit",
-    "exceeded retry limit",
-    "retryable",
+    "rate limit", "rate_limit", "ratelimit", "too many requests", "429",
+    "resource_exhausted", "model_capacity_exhausted", "quota exceeded",
+    "usage limit", "credit balance is too low", "overloaded_error",
+    "hit your limit", "exceeded retry limit",
 ]
 
-# Known auth issues that require session restart (not just retry)
 AUTH_FAILURE_PATTERNS = [
-    "not logged in",
-    "authentication failed",
-    "auth error",
-    "oauth",
-    "token expired",
-    "credentials",
+    "not logged in", "authentication failed", "auth error",
+    "token expired", "credentials",
 ]
 
 
 def is_rate_limited(output: str) -> bool:
-    """Check if output indicates a rate limit error."""
     lowered = output.lower()
-    return any(pattern in lowered for pattern in RATE_LIMIT_PATTERNS)
+    return any(p in lowered for p in RATE_LIMIT_PATTERNS)
 
 
 def is_auth_failure(output: str) -> bool:
-    """Check if output indicates an auth failure requiring session restart."""
     lowered = output.lower()
-    return any(pattern in lowered for pattern in AUTH_FAILURE_PATTERNS)
+    return any(p in lowered for p in AUTH_FAILURE_PATTERNS)
 
 
 # ---------------------------------------------------------------------------
-# Retry with backoff
-# ---------------------------------------------------------------------------
-
-def run_with_retry(
-    fn,
-    *,
-    max_retries: int = 5,
-    base_delay: float = 60.0,
-    max_delay: float = 900.0,
-    rate_limit_delay: float = 120.0,
-    log_path: Optional[Path] = None,
-) -> BurstResult:
-    """Retry a burst function with exponential backoff on rate limits.
-
-    The built-in retry logic in all three CLIs is unreliable:
-    - Claude: session permanently wedges on rate limit
-    - Codex: limited retry count, loses context on resume
-    - Gemini: infinite retry loop ignoring Retry-After header
-
-    We implement our own external retry wrapper.
-    """
-    last_result = None
-    for attempt in range(max_retries + 1):
-        result = fn()
-        last_result = result
-
-        if result.ok:
-            return result
-
-        # Check if this is a rate limit we should retry
-        if is_rate_limited(result.captured_output) or is_rate_limited(result.error):
-            if attempt >= max_retries:
-                result.error = f"Rate limited after {max_retries} retries: {result.error}"
-                return result
-            delay = min(rate_limit_delay * (2 ** attempt), max_delay)
-            print(f"  Rate limited (attempt {attempt + 1}/{max_retries}), waiting {delay:.0f}s...")
-            time.sleep(delay)
-            continue
-
-        # Auth failure: don't retry (needs human intervention or session restart)
-        if is_auth_failure(result.captured_output) or is_auth_failure(result.error):
-            result.error = f"Auth failure: {result.error}"
-            return result
-
-        # Other failures: retry with shorter backoff
-        if attempt >= max_retries:
-            return result
-        delay = min(base_delay * (2 ** attempt), max_delay)
-        print(f"  Burst failed (attempt {attempt + 1}/{max_retries}), waiting {delay:.0f}s...")
-        time.sleep(delay)
-
-    return last_result or BurstResult(ok=False, exit_code=None, captured_output="",
-                                       duration_seconds=0, error="No attempts made")
-
-
-# ---------------------------------------------------------------------------
-# tmux helpers
+# tmux helpers (minimal -- only what we need for script-based bursts)
 # ---------------------------------------------------------------------------
 
 def tmux_cmd(*args: str, check: bool = False, timeout: int = 10) -> subprocess.CompletedProcess:
@@ -149,595 +69,500 @@ def tmux_ensure_session(session: str) -> None:
         tmux_cmd("new-session", "-d", "-s", session, "-x", "220", "-y", "50")
 
 
-def tmux_window_exists(session: str, window: str) -> bool:
-    result = tmux_cmd("list-windows", "-t", session, "-F", "#{window_name}")
-    return window in result.stdout.splitlines()
-
-
-def tmux_create_window(session: str, window: str, *, cwd: Optional[Path] = None) -> str:
-    args = ["new-window", "-t", session, "-n", window, "-P", "-F", "#{pane_id}"]
-    if cwd:
-        args.extend(["-c", str(cwd)])
-    tmux_cmd(*args)
-    return f"{session}:{window}"
-
-
 def tmux_kill_window(session: str, window: str) -> None:
     tmux_cmd("kill-window", "-t", f"{session}:{window}")
 
 
-def tmux_send_escape(target: str) -> None:
-    tmux_cmd("send-keys", "-t", target, "Escape")
-
-
-def tmux_capture_pane(target: str, *, lines: int = 5000) -> str:
-    return tmux_cmd("capture-pane", "-t", target, "-p", "-S", f"-{lines}").stdout
-
-
-def tmux_pipe_pane(target: str, log_path: Path) -> None:
-    tmux_cmd("pipe-pane", "-t", target, f"cat >> {shlex.quote(str(log_path))}")
-
-
-def tmux_pane_is_dead(target: str) -> bool:
-    return tmux_cmd("display-message", "-t", target, "-p", "#{pane_dead}").stdout.strip() == "1"
-
-
-def tmux_pane_pid(target: str) -> Optional[int]:
-    """Get the PID of the process running in a tmux pane."""
-    result = tmux_cmd("display-message", "-t", target, "-p", "#{pane_pid}")
-    text = result.stdout.strip()
-    try:
-        return int(text) if text else None
-    except ValueError:
-        return None
-
-
-def kill_agent_session(session_name: str, window_name: str, *, burst_user: Optional[str] = None) -> None:
-    """Reliably kill an agent session: send Ctrl-C, kill the process tree, kill the window.
-
-    Just killing the tmux window doesn't kill child processes. We need to:
-    1. Send Ctrl-C to interrupt the agent
-    2. Find and kill the process tree
-    3. Kill the tmux window
-    """
-    target = f"{session_name}:{window_name}"
-
-    if not tmux_has_session(session_name) or not tmux_window_exists(session_name, window_name):
-        return
-
-    # Get the pane PID before we kill anything
-    pid = tmux_pane_pid(target)
-
-    # Send Ctrl-C to interrupt gracefully
-    tmux_cmd("send-keys", "-t", target, "C-c")
-    time.sleep(1)
-
-    # Kill the process tree
-    if pid:
-        try:
-            # Kill the process group (all children)
-            if burst_user:
-                subprocess.run(
-                    ["sudo", "-n", "-u", burst_user, "kill", "--", f"-{pid}"],
-                    capture_output=True, timeout=5,
-                )
-            else:
-                os.killpg(os.getpgid(pid), 9)
-        except (ProcessLookupError, PermissionError, OSError, subprocess.TimeoutExpired):
-            pass
-
-    # Kill any agent processes by name -- both as burst_user AND as current user.
-    # Old sessions from previous runs can survive tmux kills as the supervisor user.
-    if burst_user:
-        for agent in ("gemini", "claude"):
-            subprocess.run(
-                ["sudo", "-n", "-u", burst_user, "pkill", "-f", agent],
-                capture_output=True, timeout=5,
-            )
-    # Also kill our own orphaned agent processes
-    for agent in ("gemini",):  # Only gemini tends to orphan; claude is managed differently
-        subprocess.run(["pkill", "-f", agent], capture_output=True, timeout=5)
-
-    time.sleep(1)
-
-    # Kill the tmux window
-    tmux_kill_window(session_name, window_name)
-
-
-def tmux_send_prompt(target: str, prompt: str) -> None:
-    """Send a prompt to a tmux pane. Uses load-buffer for reliability with long text."""
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
-        f.write(prompt)
-        buf_path = f.name
-    try:
-        tmux_cmd("load-buffer", buf_path)
-        tmux_cmd("paste-buffer", "-t", target, "-d")
-        time.sleep(1)  # let TUI process the paste
-        tmux_cmd("send-keys", "-t", target, "Enter")
-    finally:
-        os.unlink(buf_path)
+def tmux_pane_is_dead(pane_id: str) -> bool:
+    result = tmux_cmd("display-message", "-p", "-t", pane_id, "#{pane_dead}", check=False)
+    if result.returncode != 0:
+        return True
+    return result.stdout.strip() == "1"
 
 
 # ---------------------------------------------------------------------------
-# Provider-specific ready detection (only used at startup)
-# ---------------------------------------------------------------------------
-
-def _claude_is_ready(pane_text: str) -> bool:
-    """Claude shows '❯' as its input prompt."""
-    lines = [line.strip() for line in pane_text.strip().splitlines()]
-    if not lines:
-        return False
-    last_prompt_idx = -1
-    for i in range(len(lines) - 1, max(len(lines) - 20, -1), -1):
-        if lines[i] == "❯" or lines[i].startswith("❯ "):
-            last_prompt_idx = i
-            break
-    if last_prompt_idx < 0:
-        return False
-    after = " ".join(lines[last_prompt_idx + 1:]).lower()
-    if "thinking" in after or "queued" in after or "cerebrating" in after:
-        return False
-    return True
-
-
-def _gemini_is_ready(pane_text: str) -> bool:
-    """Gemini shows 'Type your message' when ready. Auto-dismiss trust dialog."""
-    return "type your message" in pane_text.lower()
-
-
-def _gemini_has_trust_dialog(pane_text: str) -> bool:
-    return "do you trust the files" in pane_text.lower()
-
-
-def _agent_is_ready(provider: str, pane_text: str) -> bool:
-    if provider == "claude":
-        return _claude_is_ready(pane_text)
-    if provider == "gemini":
-        return _gemini_is_ready(pane_text)
-    return False
-
-
-# ---------------------------------------------------------------------------
-# Interactive session management
+# Path constants for burst_user environment
 # ---------------------------------------------------------------------------
 
 WORKER_PATH = "/home/leanagent/.local/bin:/home/leanagent/.elan/bin:/home/leanagent/.nvm/versions/node/v22.22.2/bin:/usr/local/bin:/usr/bin:/bin"
 WORKER_ELAN_HOME = "/home/leanagent/.elan"
 
 
-def ensure_interactive_window(
-    provider: str,
-    command: List[str],
+# ---------------------------------------------------------------------------
+# Burst script generation (the v1 reliable pattern)
+# ---------------------------------------------------------------------------
+
+def build_burst_script(
+    config: ProviderConfig,
     *,
-    session_name: str,
-    window_name: str,
+    prompt_file: Path,
+    start_file: Path,
+    exit_file: Path,
     work_dir: Path,
     burst_user: Optional[str] = None,
-    startup_timeout: float = 120,
-) -> str:
-    """Ensure a tmux window exists with the agent CLI running. Returns pane target.
+    log_prefix: str = "agent",
+) -> Path:
+    """Generate a bash script that wraps the agent command.
 
-    If burst_user is set, the agent runs as that user via sudo. This is the
-    primary mechanism for enforcing file permissions (the agent can only write
-    to files that are group-writable for the shared group).
+    The script:
+    1. Reads the prompt from prompt_file
+    2. Writes a start marker when it begins
+    3. Runs the agent command with the prompt
+    4. Writes an exit marker with the exit code (via trap EXIT)
+    5. The exit marker is ALWAYS written, even if the agent crashes
+
+    This is the proven v1 pattern for reliable agent communication.
     """
-    tmux_ensure_session(session_name)
-    target = f"{session_name}:{window_name}"
+    # Build the agent command with __PROMPT__ placeholder
+    cmd_parts = _build_command_parts(config)
 
-    if tmux_window_exists(session_name, window_name):
-        if tmux_pane_is_dead(target):
-            tmux_kill_window(session_name, window_name)
-        else:
-            pane_text = tmux_capture_pane(target, lines=50)
-            if _agent_is_ready(provider, pane_text):
-                return target
+    script_dir = start_file.parent
+    script_dir.mkdir(parents=True, exist_ok=True)
+    script_path = script_dir / f"{log_prefix}-burst.sh"
 
-    if not tmux_window_exists(session_name, window_name):
-        tmux_create_window(session_name, window_name, cwd=work_dir)
-        target = f"{session_name}:{window_name}"
+    env_lines = [
+        f"export PATH={shlex.quote(WORKER_PATH)}",
+        f"export ELAN_HOME={shlex.quote(WORKER_ELAN_HOME)}",
+    ]
+    if burst_user:
+        env_lines.append(f"export HOME=/home/{shlex.quote(burst_user)}")
 
-        if burst_user:
-            # Start a shell as burst_user with necessary env vars
-            # Pass through API keys so the agent CLI can authenticate
-            env_vars = f"PATH={shlex.quote(WORKER_PATH)} HOME=/home/{shlex.quote(burst_user)} ELAN_HOME={shlex.quote(WORKER_ELAN_HOME)}"
-            # Forward API keys from the supervisor's environment
-            for key in ("ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENAI_API_KEY"):
-                val = os.environ.get(key)
-                if val:
-                    env_vars += f" {key}={shlex.quote(val)}"
-            sudo_prefix = f"sudo -n -u {shlex.quote(burst_user)} env {env_vars}"
-            cmd_str = f"{sudo_prefix} bash -c {shlex.quote('cd ' + shlex.quote(str(work_dir)) + ' && ' + ' '.join(shlex.quote(c) for c in command))}"
-        else:
-            cmd_str = " ".join(shlex.quote(c) for c in command)
-        tmux_cmd("send-keys", "-t", target, cmd_str, "Enter")
+    # Forward API keys from supervisor environment
+    for key in ("ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENAI_API_KEY"):
+        val = os.environ.get(key)
+        if val:
+            env_lines.append(f"export {key}={shlex.quote(val)}")
 
-    deadline = time.monotonic() + startup_timeout
-    while time.monotonic() < deadline:
-        time.sleep(2)
-        pane_text = tmux_capture_pane(target, lines=50)
-        if provider == "gemini" and _gemini_has_trust_dialog(pane_text):
-            tmux_cmd("send-keys", "-t", target, "Enter")
-            time.sleep(3)
-            continue
-        if _agent_is_ready(provider, pane_text):
-            return target
+    lines = [
+        "#!/usr/bin/env bash",
+        "set -u",
+        "umask 0002",
+        f"START_FILE={shlex.quote(str(start_file))}",
+        f"EXIT_FILE={shlex.quote(str(exit_file))}",
+        f"PROMPT_FILE={shlex.quote(str(prompt_file))}",
+        f"WORK_DIR={shlex.quote(str(work_dir))}",
+        "",
+        "cleanup() {",
+        "  ec=$?",
+        '  printf "%s\\n" "$ec" > "$EXIT_FILE"',
+        '  exit "$ec"',
+        "}",
+        "trap cleanup EXIT",
+        "",
+        *env_lines,
+        "",
+        'cd "$WORK_DIR"',
+        'printf "%s\\n" "$(date -Is)" > "$START_FILE"',
+        'PROMPT_CONTENT=$(cat "$PROMPT_FILE")',
+        "",
+        "# Build the agent command, replacing __PROMPT__ with prompt content",
+        "cmd=(",
+    ]
+    for part in cmd_parts:
+        lines.append(f"  {shlex.quote(part)}")
+    lines += [
+        ")",
+        "real_cmd=()",
+        'for arg in "${cmd[@]}"; do',
+        '  if [[ "$arg" == "__PROMPT__" ]]; then',
+        '    real_cmd+=("$PROMPT_CONTENT")',
+        "  else",
+        '    real_cmd+=("$arg")',
+        "  fi",
+        "done",
+        "",
+        f'echo "[{log_prefix}-burst] provider={config.provider} start=$(date -Is)"',
+        '"${real_cmd[@]}"',
+        "ec=$?",
+        f'echo "[{log_prefix}-burst] end=$(date -Is) exit_code=$ec"',
+        'exit "$ec"',
+    ]
 
-    return target  # proceed even if not confirmed ready
-
-
-# ---------------------------------------------------------------------------
-# Interactive burst execution
-# ---------------------------------------------------------------------------
-
-def _write_prompt_file(prompt: str, work_dir: Path) -> Path:
-    """Write prompt to a temp file in the work directory (accessible to burst_user)."""
-    prompt_dir = work_dir / ".agent-supervisor" / "prompts"
-    prompt_dir.mkdir(parents=True, exist_ok=True)
-    prompt_path = prompt_dir / "current_prompt.txt"
-    prompt_path.write_text(prompt, encoding="utf-8")
-    # Make it readable by the burst user
-    import grp
-    try:
-        gid = grp.getgrnam("leanagent").gr_gid
-        os.chown(str(prompt_path), -1, gid)
-        os.chmod(str(prompt_path), 0o664)
-    except (KeyError, PermissionError):
-        pass
-    return prompt_path
-
-
-def run_interactive_burst(
-    provider: str,
-    command: List[str],
-    prompt: str,
-    *,
-    session_name: str,
-    window_name: str,
-    work_dir: Path,
-    burst_user: Optional[str] = None,
-    timeout_seconds: float = 14400,
-    stall_threshold_seconds: float = 900,
-    max_stall_recoveries: int = 3,
-    log_dir: Optional[Path] = None,
-    completion_marker: Optional[Path] = None,
-) -> BurstResult:
-    """Execute an interactive burst via tmux.
-
-    Completion: ONLY via marker file. Pane scraping is not used for completion.
-    Stall detection: via file mtimes across Tablet/ directory.
-    """
-    start = time.monotonic()
-    recovery_log: List[str] = []
-    stall_recoveries = 0
-
-    # For Gemini: always start a fresh window with -i flag for reliable prompt delivery.
-    # Gemini's TUI doesn't reliably accept pasted text, so we pass the prompt
-    # as a CLI argument each time.
-    if provider == "gemini":
-        # Kill any existing session completely -- process tree and all.
-        # Gemini's process can survive tmux window death and keep writing files.
-        kill_agent_session(session_name, window_name, burst_user=burst_user)
-        prompt_path = _write_prompt_file(prompt, work_dir)
-        # Use shell expansion to read the prompt file into the -i argument
-        gemini_cmd = list(command) + ["-i", f"$(cat {shlex.quote(str(prompt_path))})"]
-        target = ensure_interactive_window(
-            provider, gemini_cmd,
-            session_name=session_name, window_name=window_name, work_dir=work_dir,
-            burst_user=burst_user,
-        )
-    else:
-        target = ensure_interactive_window(
-            provider, command,
-            session_name=session_name, window_name=window_name, work_dir=work_dir,
-            burst_user=burst_user,
-        )
-
-    # Set up logging
-    log_path = None
-    if log_dir:
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / f"{provider}_burst.log"
-        log_path.write_text("", encoding="utf-8")
-        tmux_pipe_pane(target, log_path)
-
-    # Clean stale marker
-    if completion_marker:
-        completion_marker.parent.mkdir(parents=True, exist_ok=True)
-        completion_marker.unlink(missing_ok=True)
-
-    # Build watch list: all files in Tablet/ + marker
-    watch_files: List[Path] = []
-    tablet_dir = work_dir / "Tablet"
-    if tablet_dir.is_dir():
-        watch_files.extend(p for p in tablet_dir.iterdir() if p.is_file())
-    if completion_marker:
-        watch_files.append(completion_marker)
-
-    def _snapshot_mtimes() -> Dict[str, float]:
-        return {str(p): p.stat().st_mtime if p.exists() else 0 for p in watch_files}
-
-    last_activity = time.monotonic()
-    last_mtimes = _snapshot_mtimes()
-
-    # Send prompt (Claude: paste into existing session; Gemini: already passed via -i)
-    if provider != "gemini":
-        tmux_send_prompt(target, prompt)
-    time.sleep(3)
-
-    while True:
-        elapsed = time.monotonic() - start
-        if elapsed > timeout_seconds:
-            return BurstResult(
-                ok=False, exit_code=None,
-                captured_output=_read_log(log_path, target),
-                duration_seconds=elapsed,
-                stall_recoveries=stall_recoveries,
-                error=f"Burst timed out after {timeout_seconds:.0f}s",
-                recovery_log=recovery_log,
-            )
-
-        time.sleep(5)
-
-        # Pane died?
-        if tmux_pane_is_dead(target):
-            return BurstResult(
-                ok=False, exit_code=1,
-                captured_output=_read_log(log_path, target),
-                duration_seconds=time.monotonic() - start,
-                stall_recoveries=stall_recoveries,
-                error="Agent process died",
-                recovery_log=recovery_log,
-            )
-
-        # Completion: marker file exists
-        if completion_marker and completion_marker.exists():
-            time.sleep(2)  # let agent finish final writes
-            return BurstResult(
-                ok=True, exit_code=0,
-                captured_output=_read_log(log_path, target),
-                duration_seconds=time.monotonic() - start,
-                stall_recoveries=stall_recoveries,
-                recovery_log=recovery_log,
-            )
-
-        # Fallback completion: agent is idle at prompt for an extended period.
-        # Some agents complete work but don't write the marker file.
-        # Use a generous threshold -- hard problems can take 10+ minutes of thinking.
-        # We only trigger this after no file activity for a while AND agent looks idle.
-        if elapsed > 120 and time.monotonic() - last_activity > 60:
-            pane_text = tmux_capture_pane(target, lines=50)
-            if _agent_is_ready(provider, pane_text):
-                # Agent looks idle. Confirm by waiting and checking again.
-                time.sleep(5)
-                pane_text2 = tmux_capture_pane(target, lines=50)
-                if _agent_is_ready(provider, pane_text2):
-                    recovery_log.append("Fallback completion: agent idle, no marker written")
-                    return BurstResult(
-                        ok=True, exit_code=0,
-                        captured_output=_read_log(log_path, target),
-                        duration_seconds=time.monotonic() - start,
-                        stall_recoveries=stall_recoveries,
-                        recovery_log=recovery_log,
-                    )
-
-        # File activity tracking
-        current_mtimes = _snapshot_mtimes()
-        if current_mtimes != last_mtimes:
-            last_activity = time.monotonic()
-            last_mtimes = current_mtimes
-            # Re-scan for new files created by agent
-            if tablet_dir.is_dir():
-                new_files = [p for p in tablet_dir.iterdir() if p.is_file() and str(p) not in last_mtimes]
-                watch_files.extend(new_files)
-
-        # Stall?
-        if time.monotonic() - last_activity > stall_threshold_seconds:
-            stall_recoveries += 1
-            if stall_recoveries > max_stall_recoveries:
-                return BurstResult(
-                    ok=False, exit_code=None,
-                    captured_output=_read_log(log_path, target),
-                    duration_seconds=time.monotonic() - start,
-                    stall_recoveries=stall_recoveries,
-                    error=f"Exhausted {max_stall_recoveries} stall recoveries",
-                    recovery_log=recovery_log,
-                )
-
-            recovery_log.append(f"Stall recovery attempt {stall_recoveries}")
-            # Step 1: Esc
-            tmux_send_escape(target)
-            time.sleep(30)
-            if completion_marker and completion_marker.exists():
-                continue
-            # Step 2: Reprompt
-            recovery_log.append("  Re-sending prompt")
-            tmux_send_prompt(target, prompt)
-            time.sleep(60)
-            if completion_marker and completion_marker.exists():
-                continue
-            # Step 3: Kill and restart
-            recovery_log.append("  Killing and restarting session")
-            kill_agent_session(session_name, window_name, burst_user=burst_user)
-            time.sleep(2)
-            target = ensure_interactive_window(
-                provider, command,
-                session_name=session_name, window_name=window_name, work_dir=work_dir,
-                burst_user=burst_user,
-            )
-            if log_path:
-                tmux_pipe_pane(target, log_path)
-            tmux_send_prompt(target, prompt)
-            last_activity = time.monotonic()
-            last_mtimes = _snapshot_mtimes()
+    script_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    script_path.chmod(0o755)
+    return script_path
 
 
-# ---------------------------------------------------------------------------
-# Non-interactive burst execution
-# ---------------------------------------------------------------------------
+def _build_command_parts(config: ProviderConfig) -> List[str]:
+    """Build command parts with __PROMPT__ as the prompt placeholder.
 
-def run_noninteractive_burst(
-    command: List[str],
-    prompt: str,
-    *,
-    work_dir: Path,
-    timeout_seconds: float = 14400,
-    log_dir: Optional[Path] = None,
-) -> BurstResult:
-    """Execute a non-interactive burst as a subprocess."""
-    start = time.monotonic()
-
-    try:
-        proc = subprocess.run(
-            [*command, prompt],
-            capture_output=True, text=True,
-            cwd=str(work_dir),
-            timeout=timeout_seconds,
-        )
-        duration = time.monotonic() - start
-        output = proc.stdout
-        if log_dir:
-            log_dir.mkdir(parents=True, exist_ok=True)
-            (log_dir / "burst.jsonl").write_text(output, encoding="utf-8")
-
-        return BurstResult(
-            ok=proc.returncode == 0,
-            exit_code=proc.returncode,
-            captured_output=output,
-            duration_seconds=duration,
-        )
-    except subprocess.TimeoutExpired:
-        return BurstResult(
-            ok=False, exit_code=None, captured_output="",
-            duration_seconds=time.monotonic() - start,
-            error=f"Timed out after {timeout_seconds}s",
-        )
-    except FileNotFoundError:
-        return BurstResult(
-            ok=False, exit_code=None, captured_output="",
-            duration_seconds=time.monotonic() - start,
-            error=f"Command not found: {command[0]}",
-        )
-
-
-def run_noninteractive_prompt(
-    provider: str,
-    prompt: str,
-    *,
-    model: Optional[str] = None,
-    effort: Optional[str] = None,
-    extra_args: Optional[List[str]] = None,
-    work_dir: Path,
-    timeout_seconds: float = 300,
-    log_dir: Optional[Path] = None,
-) -> BurstResult:
-    """Run a non-interactive prompt (for reviewer/verification on Claude/Codex)."""
-    if provider == "claude":
-        cmd = ["claude", "-p", "--output-format", "json"]
-        if model:
-            cmd.extend(["--model", model])
-        if effort:
-            cmd.extend(["--effort", effort])
-    elif provider == "codex":
-        cmd = ["codex", "exec", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox"]
-        if model:
-            cmd.extend(["-m", model])
-    else:
-        cmd = ["claude", "-p"]
-
-    if extra_args:
-        cmd.extend(extra_args)
-
-    start = time.monotonic()
-    try:
-        proc = subprocess.run(
-            cmd, input=prompt, capture_output=True, text=True,
-            cwd=str(work_dir), timeout=timeout_seconds,
-        )
-        output = proc.stdout + "\n" + proc.stderr
-        if log_dir:
-            log_dir.mkdir(parents=True, exist_ok=True)
-            (log_dir / "reviewer_burst.log").write_text(output, encoding="utf-8")
-        return BurstResult(
-            ok=proc.returncode == 0,
-            exit_code=proc.returncode,
-            captured_output=output,
-            duration_seconds=time.monotonic() - start,
-        )
-    except subprocess.TimeoutExpired:
-        return BurstResult(
-            ok=False, exit_code=None, captured_output="",
-            duration_seconds=time.monotonic() - start,
-            error=f"Timed out after {timeout_seconds}s",
-        )
-    except FileNotFoundError:
-        return BurstResult(
-            ok=False, exit_code=None, captured_output="",
-            duration_seconds=time.monotonic() - start,
-            error=f"Command not found: {cmd[0]}",
-        )
-
-
-# ---------------------------------------------------------------------------
-# High-level burst dispatch
-# ---------------------------------------------------------------------------
-
-def build_command(config: ProviderConfig, *, initial: bool = True) -> List[str]:
-    """Build the CLI command for a provider.
-
-    Reliability notes (from CLI_NOTES.md + GitHub issue research):
-
-    Claude:
-    - Use ANTHROPIC_API_KEY env var (OAuth tokens expire after ~8h, breaking automation)
-    - Don't use --bare (breaks auth when using OAuth login)
-    - Sessions can permanently wedge on rate limit -- our external retry handles this
-    - Third-party harness detection may penalize automated use -- rate limit our calls
-
-    Codex:
-    - Avoid MCP servers in exec mode entirely (tool calls always cancelled)
-    - Compaction hangs are unrecoverable -- treat sessions as disposable
-    - --json flag for JSONL event output
-    - --ephemeral to avoid session state accumulation
-
-    Gemini:
-    - ALWAYS interactive (non-interactive mode has missing event handlers and broken retry)
-    - Use GEMINI_API_KEY env var (keytar/GNOME Keyring hangs on headless Linux)
-    - Run from the repo directory (not home) to avoid MemoryDiscovery scanning home dir
-    - Built-in 429 retry ignores Retry-After header -- our external retry handles this
+    All agents run in non-interactive mode:
+    - Claude: -p (print mode, still uses tools, exits when done)
+    - Codex: exec (non-interactive, exits when done)
+    - Gemini: -p (non-interactive prompt mode, exits when done)
     """
     if config.provider == "claude":
-        cmd = ["claude", "--dangerously-skip-permissions"]
+        cmd = ["claude", "-p", "--dangerously-skip-permissions"]
         if config.model:
             cmd.extend(["--model", config.model])
         if config.effort:
             cmd.extend(["--effort", config.effort])
         cmd.extend(config.extra_args or [])
-        if not initial:
-            cmd.insert(1, "--continue")
+        cmd.append("__PROMPT__")
         return cmd
 
     if config.provider == "codex":
-        cmd = ["codex", "exec", "--json", "--skip-git-repo-check",
+        cmd = ["codex", "exec", "--json",
+               "--skip-git-repo-check",
                "--dangerously-bypass-approvals-and-sandbox",
-               "--ephemeral"]  # avoid session state accumulation
+               "--ephemeral"]
         if config.model:
             cmd.extend(["-m", config.model])
         cmd.extend(config.extra_args or [])
+        cmd.append("__PROMPT__")
         return cmd
 
     if config.provider == "gemini":
-        # Gemini's -i flag passes the initial prompt as a CLI argument,
-        # which is far more reliable than pasting into the TUI.
-        # The prompt placeholder __PROMPT__ will be replaced at launch time.
-        cmd = ["gemini", "--approval-mode=yolo"]
+        cmd = ["gemini", "--approval-mode=yolo", "-p"]
         if config.model:
             cmd.extend(["--model", config.model])
         cmd.extend(config.extra_args or [])
-        if not initial:
-            cmd.extend(["--resume", "latest"])
+        cmd.append("__PROMPT__")
         return cmd
 
     raise ValueError(f"Unknown provider: {config.provider}")
 
+
+# ---------------------------------------------------------------------------
+# Wait for marker files (the reliable completion mechanism)
+# ---------------------------------------------------------------------------
+
+def wait_for_file(
+    path: Path,
+    pane_id: str,
+    timeout_seconds: float,
+    *,
+    poll_seconds: float = 0.5,
+    label: str = "marker",
+) -> None:
+    """Wait for a file to appear. Raises if timeout or pane dies."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        if path.exists():
+            return
+        if tmux_pane_is_dead(pane_id):
+            # Give a brief grace period for the trap to write the file
+            grace_end = time.monotonic() + 2.0
+            while time.monotonic() < grace_end:
+                if path.exists():
+                    return
+                time.sleep(0.1)
+            raise RuntimeError(f"Agent pane died before writing {label}: {path}")
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"Timed out after {timeout_seconds:.0f}s waiting for {label}: {path}")
+        time.sleep(poll_seconds)
+
+
+# ---------------------------------------------------------------------------
+# Run a burst (the main entry point)
+# ---------------------------------------------------------------------------
+
+def run_burst(
+    config: ProviderConfig,
+    prompt: str,
+    *,
+    role: str = "worker",
+    session_name: str,
+    work_dir: Path,
+    burst_user: Optional[str] = None,
+    startup_timeout_seconds: float = 120.0,
+    burst_timeout_seconds: float = 7200.0,
+    log_dir: Optional[Path] = None,
+) -> BurstResult:
+    """Run a single agent burst using the script-based pattern.
+
+    1. Write prompt to a file
+    2. Build a bash script that wraps the agent command
+    3. Launch the script in a tmux window (as burst_user via sudo)
+    4. Wait for the exit marker file
+    5. Read the captured output from the log file
+
+    This is deterministic: the exit marker is ALWAYS written via bash trap EXIT.
+    """
+    start = time.monotonic()
+
+    # Set up directories
+    if log_dir is None:
+        log_dir = work_dir / ".agent-supervisor" / "logs" / "bursts"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write prompt file
+    prompt_file = log_dir / f"{role}-prompt.txt"
+    prompt_file.write_text(prompt, encoding="utf-8")
+    prompt_file.chmod(0o644)
+
+    # Marker files
+    start_file = log_dir / f"{role}.started"
+    exit_file = log_dir / f"{role}.exit"
+    start_file.unlink(missing_ok=True)
+    exit_file.unlink(missing_ok=True)
+
+    # Per-cycle log
+    per_cycle_log = log_dir / f"{role}-{config.provider}.ansi.log"
+    per_cycle_log.parent.mkdir(parents=True, exist_ok=True)
+    per_cycle_log.write_text("", encoding="utf-8")
+
+    # Build the script
+    script_path = build_burst_script(
+        config,
+        prompt_file=prompt_file,
+        start_file=start_file,
+        exit_file=exit_file,
+        work_dir=work_dir,
+        burst_user=burst_user,
+        log_prefix=role,
+    )
+
+    # Launch in tmux
+    tmux_ensure_session(session_name)
+    window_name = f"{role}-burst"
+
+    # Kill any existing window
+    try:
+        tmux_kill_window(session_name, window_name)
+    except Exception:
+        pass
+    time.sleep(0.5)
+
+    # Create new window
+    proc = tmux_cmd(
+        "new-window", "-d", "-P", "-F", "#{window_id} #{pane_id}",
+        "-t", session_name, "-n", window_name,
+    )
+    if proc.returncode != 0:
+        return BurstResult(
+            ok=False, exit_code=None, captured_output="",
+            duration_seconds=time.monotonic() - start,
+            error=f"Failed to create tmux window: {proc.stderr}",
+        )
+    window_id, pane_id = proc.stdout.strip().split()
+
+    # Set remain-on-exit so we can capture output after the script finishes
+    tmux_cmd("set-window-option", "-t", window_id, "remain-on-exit", "on")
+
+    # Pipe pane output to log file
+    pipe_cmd = f"cat >> {shlex.quote(str(per_cycle_log))}"
+    tmux_cmd("pipe-pane", "-o", "-t", pane_id, pipe_cmd)
+
+    # Launch the script (as burst_user if configured)
+    if burst_user:
+        launch_cmd = f"sudo -n -u {shlex.quote(burst_user)} {shlex.quote(str(script_path))}; exit"
+    else:
+        launch_cmd = f"{shlex.quote(str(script_path))}; exit"
+    tmux_cmd("send-keys", "-t", pane_id, launch_cmd, "C-m")
+
+    # Wait for start marker
+    try:
+        wait_for_file(start_file, pane_id, startup_timeout_seconds, label="start marker")
+    except RuntimeError as e:
+        output = _read_log(per_cycle_log)
+        return BurstResult(
+            ok=False, exit_code=None, captured_output=output,
+            duration_seconds=time.monotonic() - start,
+            error=str(e),
+        )
+
+    # Wait for exit marker with stall detection.
+    # The agent might hang (rate limit stuck, network disconnect, OOM).
+    # We detect this by monitoring file activity: if no files in Tablet/ change
+    # for stall_minutes AND the exit marker hasn't appeared, the agent is stalled.
+    stall_minutes = 30  # no file activity for 30 minutes = stalled
+    try:
+        wait_for_file_with_stall_detection(
+            exit_file, pane_id, burst_timeout_seconds,
+            label="exit marker",
+            watch_dir=work_dir / "Tablet",
+            stall_timeout_seconds=stall_minutes * 60,
+            log_path=per_cycle_log,
+        )
+    except StallDetected as e:
+        output = _read_log(per_cycle_log)
+        # Kill the stalled agent and its process tree
+        _kill_pane_process_tree(pane_id)
+        tmux_cmd("kill-window", "-t", window_id, check=False)
+        return BurstResult(
+            ok=False, exit_code=None, captured_output=output,
+            duration_seconds=time.monotonic() - start,
+            error=f"Agent stalled: {e}",
+        )
+    except RuntimeError as e:
+        output = _read_log(per_cycle_log)
+        return BurstResult(
+            ok=False, exit_code=None, captured_output=output,
+            duration_seconds=time.monotonic() - start,
+            error=str(e),
+        )
+
+    # Read exit code
+    exit_code_text = exit_file.read_text(encoding="utf-8").strip()
+    try:
+        exit_code = int(exit_code_text)
+    except (ValueError, TypeError):
+        exit_code = 1
+
+    # Read output
+    time.sleep(0.5)  # let pipe flush
+    output = _read_log(per_cycle_log)
+
+    # Kill the window
+    tmux_cmd("kill-window", "-t", window_id, check=False)
+
+    duration = time.monotonic() - start
+    return BurstResult(
+        ok=exit_code == 0,
+        exit_code=exit_code,
+        captured_output=output,
+        duration_seconds=duration,
+    )
+
+
+class StallDetected(RuntimeError):
+    """Raised when the agent appears stalled (no file activity for too long)."""
+    pass
+
+
+def wait_for_file_with_stall_detection(
+    path: Path,
+    pane_id: str,
+    timeout_seconds: float,
+    *,
+    label: str = "marker",
+    watch_dir: Optional[Path] = None,
+    stall_timeout_seconds: float = 1800,
+    log_path: Optional[Path] = None,
+    poll_seconds: float = 5.0,
+) -> None:
+    """Wait for a file to appear, with stall detection based on filesystem activity.
+
+    A stall is detected when:
+    - No files in watch_dir have been modified for stall_timeout_seconds
+    - AND the log file hasn't been modified for stall_timeout_seconds
+    - AND the target file hasn't appeared
+
+    This catches agents that hang (rate limit loops, network disconnects, OOM)
+    even when the bash wrapper's trap EXIT can't fire (because the process is alive but stuck).
+    """
+    deadline = time.monotonic() + timeout_seconds
+    last_activity = time.monotonic()
+
+    def _latest_mtime() -> float:
+        """Get the most recent mtime across watched files."""
+        latest = 0.0
+        if watch_dir and watch_dir.is_dir():
+            for f in watch_dir.iterdir():
+                if f.is_file():
+                    try:
+                        latest = max(latest, f.stat().st_mtime)
+                    except OSError:
+                        pass
+        if log_path and log_path.exists():
+            try:
+                latest = max(latest, log_path.stat().st_mtime)
+            except OSError:
+                pass
+        return latest
+
+    last_seen_mtime = _latest_mtime()
+
+    while True:
+        if path.exists():
+            return
+
+        if tmux_pane_is_dead(pane_id):
+            grace_end = time.monotonic() + 2.0
+            while time.monotonic() < grace_end:
+                if path.exists():
+                    return
+                time.sleep(0.1)
+            raise RuntimeError(f"Agent pane died before writing {label}: {path}")
+
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"Timed out after {timeout_seconds:.0f}s waiting for {label}: {path}")
+
+        # Check for file activity
+        current_mtime = _latest_mtime()
+        if current_mtime > last_seen_mtime:
+            last_activity = time.monotonic()
+            last_seen_mtime = current_mtime
+
+        # Stall detection
+        idle_seconds = time.monotonic() - last_activity
+        if idle_seconds > stall_timeout_seconds:
+            raise StallDetected(
+                f"No file activity for {idle_seconds:.0f}s (threshold: {stall_timeout_seconds:.0f}s). "
+                f"Agent may be hung."
+            )
+
+        time.sleep(poll_seconds)
+
+
+def _kill_pane_process_tree(pane_id: str) -> None:
+    """Kill the process tree running in a tmux pane."""
+    result = tmux_cmd("display-message", "-t", pane_id, "-p", "#{pane_pid}")
+    pid_text = result.stdout.strip()
+    if not pid_text:
+        return
+    try:
+        pid = int(pid_text)
+        # Kill the process group
+        os.killpg(os.getpgid(pid), 9)
+    except (ValueError, ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def _read_log(log_path: Path) -> str:
+    if log_path.exists():
+        return log_path.read_text(encoding="utf-8", errors="replace")
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Retry with backoff
+# ---------------------------------------------------------------------------
+
+def run_with_retry(
+    fn,
+    *,
+    max_retries: int = 5,
+    base_delay: float = 60.0,
+    max_delay: float = 900.0,
+    rate_limit_delay: float = 120.0,
+) -> BurstResult:
+    """Retry a burst function with exponential backoff on rate limits."""
+    last_result = None
+    for attempt in range(max_retries + 1):
+        result = fn()
+        last_result = result
+
+        if result.ok:
+            return result
+
+        if is_rate_limited(result.captured_output) or is_rate_limited(result.error):
+            if attempt >= max_retries:
+                result.error = f"Rate limited after {max_retries} retries: {result.error}"
+                return result
+            delay = min(rate_limit_delay * (2 ** attempt), max_delay)
+            print(f"  Rate limited (attempt {attempt + 1}/{max_retries}), waiting {delay:.0f}s...")
+            time.sleep(delay)
+            continue
+
+        if is_auth_failure(result.captured_output) or is_auth_failure(result.error):
+            result.error = f"Auth failure: {result.error}"
+            return result
+
+        if attempt >= max_retries:
+            return result
+        delay = min(base_delay * (2 ** attempt), max_delay)
+        print(f"  Burst failed (attempt {attempt + 1}/{max_retries}), waiting {delay:.0f}s...")
+        time.sleep(delay)
+
+    return last_result or BurstResult(ok=False, exit_code=None, captured_output="",
+                                       duration_seconds=0, error="No attempts made")
+
+
+# ---------------------------------------------------------------------------
+# High-level burst functions
+# ---------------------------------------------------------------------------
 
 def run_worker_burst(
     config: ProviderConfig,
@@ -746,41 +571,24 @@ def run_worker_burst(
     session_name: str,
     work_dir: Path,
     burst_user: Optional[str] = None,
-    timeout_seconds: float = 14400,
-    stall_threshold_seconds: float = 900,
-    max_stall_recoveries: int = 3,
+    timeout_seconds: float = 7200.0,
+    startup_timeout_seconds: float = 120.0,
     max_rate_limit_retries: int = 5,
     log_dir: Optional[Path] = None,
-    completion_marker: Optional[Path] = None,
+    **_kwargs,  # accept and ignore extra kwargs for compatibility
 ) -> BurstResult:
-    """Run a worker burst with external retry for rate limits.
-
-    Claude/Gemini: interactive (as burst_user for permission enforcement).
-    Codex: non-interactive.
-    All providers: external retry wrapper for rate limits.
-    """
-    cmd = build_command(config)
-
+    """Run a worker burst with retry."""
     def _run():
-        if config.provider == "codex":
-            return run_noninteractive_burst(
-                cmd, prompt, work_dir=work_dir,
-                timeout_seconds=timeout_seconds, log_dir=log_dir,
-            )
-        # Claude and Gemini: interactive, as burst_user
-        return run_interactive_burst(
-            config.provider, cmd, prompt,
+        return run_burst(
+            config, prompt,
+            role="worker",
             session_name=session_name,
-            window_name=f"{config.provider}-worker",
             work_dir=work_dir,
             burst_user=burst_user,
-            timeout_seconds=timeout_seconds,
-            stall_threshold_seconds=stall_threshold_seconds,
-            max_stall_recoveries=max_stall_recoveries,
+            startup_timeout_seconds=startup_timeout_seconds,
+            burst_timeout_seconds=timeout_seconds,
             log_dir=log_dir,
-            completion_marker=completion_marker,
         )
-
     return run_with_retry(_run, max_retries=max_rate_limit_retries, rate_limit_delay=120.0)
 
 
@@ -791,40 +599,24 @@ def run_reviewer_burst(
     session_name: str,
     work_dir: Path,
     burst_user: Optional[str] = None,
-    timeout_seconds: float = 300,
-    stall_threshold_seconds: float = 900,
-    max_stall_recoveries: int = 3,
+    timeout_seconds: float = 300.0,
+    startup_timeout_seconds: float = 60.0,
     max_rate_limit_retries: int = 3,
     log_dir: Optional[Path] = None,
-    completion_marker: Optional[Path] = None,
+    **_kwargs,
 ) -> BurstResult:
-    """Run a reviewer burst with external retry for rate limits.
-
-    Claude/Codex: non-interactive. Gemini: interactive (always, as burst_user).
-    All providers: external retry wrapper for rate limits.
-    """
+    """Run a reviewer burst with retry."""
     def _run():
-        if config.provider == "gemini":
-            cmd = build_command(config)
-            return run_interactive_burst(
-                config.provider, cmd, prompt,
-                session_name=session_name,
-                window_name="gemini-reviewer",
-                work_dir=work_dir,
-                burst_user=burst_user,
-                timeout_seconds=timeout_seconds,
-                stall_threshold_seconds=stall_threshold_seconds,
-                max_stall_recoveries=max_stall_recoveries,
-                log_dir=log_dir,
-                completion_marker=completion_marker,
-            )
-        # Claude and Codex: non-interactive
-        return run_noninteractive_prompt(
-            config.provider, prompt,
-            model=config.model, effort=config.effort, extra_args=config.extra_args,
-            work_dir=work_dir, timeout_seconds=timeout_seconds, log_dir=log_dir,
+        return run_burst(
+            config, prompt,
+            role="reviewer",
+            session_name=session_name,
+            work_dir=work_dir,
+            burst_user=burst_user,
+            startup_timeout_seconds=startup_timeout_seconds,
+            burst_timeout_seconds=timeout_seconds,
+            log_dir=log_dir,
         )
-
     return run_with_retry(_run, max_retries=max_rate_limit_retries, rate_limit_delay=60.0)
 
 
@@ -918,23 +710,6 @@ def parse_claude_json_usage(json_text: str) -> Optional[Dict[str, Any]]:
         data = json.loads(json_text)
     except json.JSONDecodeError:
         return None
-    usage = data.get("usage")
-    if isinstance(usage, dict):
-        return {
-            "input_tokens": int(usage.get("input_tokens", 0)),
-            "output_tokens": int(usage.get("output_tokens", 0)),
-            "total_cost_usd": data.get("total_cost_usd"),
-        }
+    if isinstance(data, dict) and "total_cost_usd" in data:
+        return {"total_cost_usd": data.get("total_cost_usd")}
     return None
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _read_log(log_path: Optional[Path], target: str) -> str:
-    if log_path and log_path.exists():
-        text = log_path.read_text(encoding="utf-8", errors="replace")
-        if text.strip():
-            return text
-    return tmux_capture_pane(target, lines=10000)
