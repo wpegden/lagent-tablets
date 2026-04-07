@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""Benchmark: 3 agents review NL/Lean statement correspondence."""
+"""Benchmark: 3 agents review NL/Lean statement correspondence.
+
+Uses the SAME run_burst code as the supervisor -- no manual subprocess calls.
+"""
 
 import json
-import subprocess
 import sys
 import time
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from lagent_tablets.prompts import _read_file
+from lagent_tablets.burst import run_burst, extract_json_decision
+from lagent_tablets.adapters import ProviderConfig
 
-# The NL and Lean statements to check
 NL_STATEMENT = r"""
 \begin{theorem}[Connectivity threshold limit]
 For $p = (\log n + c)/n$ where $c$ is a fixed real constant, the expected number
@@ -27,12 +29,10 @@ theorem threshold_limit (c : ℝ) :
       Filter.atTop (nhds (Real.exp (-c)))
 """.strip()
 
-# This is the exact prompt the supervisor's verification model would use
-VERIFICATION_PROMPT = f"""You are a mathematical verification agent. Your job is to check whether a natural language
+PROMPT = f"""You are a mathematical verification agent. Your job is to check whether a natural language
 mathematical statement expresses the same mathematical content as a Lean 4 formal statement.
 
-Think carefully and systematically about whether these express the same mathematical content.
-Check quantifier scope, type constraints, implicit assumptions, and edge cases.
+Think carefully and systematically.
 
 === NATURAL LANGUAGE STATEMENT ===
 {NL_STATEMENT}
@@ -48,120 +48,74 @@ expected values, or any mathematical structure that the Lean omits, that is a FA
 A Lean statement that proves only PART of the NL claim is NOT a valid correspondence.
 
 Specifically check:
-1. Does the NL statement make claims about mathematical OBJECTS (graphs, random variables, etc.) that the Lean does not mention?
-2. Does the Lean statement prove only an analytical fact while the NL claims something about a specific mathematical domain?
-3. Are there implicit assumptions, domain context, or interpretations in the NL that are absent from the Lean?
+1. Does the NL make claims about mathematical OBJECTS (graphs, random variables, etc.) that the Lean omits?
+2. Does the Lean prove only an analytical fact while the NL claims something about a specific domain?
+3. Are there implicit assumptions or interpretations in the NL absent from the Lean?
 
-Be STRICT. If the NL says "the expected number of isolated vertices" but the Lean just proves a limit about a real sequence, that is a FAIL -- the probabilistic/graph-theoretic interpretation is missing from the Lean.
-
-Return a JSON object:
-{{
-  "decision": "PASS" or "FAIL",
-  "correspondence_issues": [
-    {{"category": "missing_in_lean | missing_in_nl | different_claim | implicit_assumption", "description": "..."}}
-  ],
-  "summary": "Brief overall assessment"
-}}
+Be STRICT. Return JSON:
+{{"decision": "PASS" or "FAIL", "correspondence_issues": [{{"category": "...", "description": "..."}}], "summary": "..."}}
 """
 
+TESTS = {
+    "claude_opus_max": ProviderConfig(provider="claude", model="opus", effort="max"),
+    "gemini_top":      ProviderConfig(provider="gemini", model="gemini-2.5-pro"),
+    "codex_xhigh":     ProviderConfig(provider="codex", extra_args=["-c", 'model_reasoning_effort="high"']),
+}
 
-def run_verification(name: str, provider: str, model: str, effort: str = "") -> dict:
-    """Run the verification prompt via CLI."""
+
+def run_one(name: str) -> dict:
+    config = TESTS[name]
+    work_dir = Path(f"/tmp/lagent-nlbench-{name}")
+    work_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = work_dir / "logs"
+
     print(f"[{name}] Starting...", flush=True)
     t0 = time.time()
 
-    if provider == "claude":
-        cmd = ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json",
-               "--model", model]
-        if effort:
-            cmd.extend(["--effort", effort])
-    elif provider == "gemini":
-        cmd = ["gemini", "--approval-mode=yolo", "-p"]
-        if model:
-            cmd.extend(["--model", model])
-    elif provider == "codex":
-        cmd = ["codex", "exec", "--json", "--skip-git-repo-check",
-               "--dangerously-bypass-approvals-and-sandbox", "--ephemeral"]
-        if effort:
-            cmd.extend(["-c", f'model_reasoning_effort="{effort}"'])
+    result = run_burst(
+        config, PROMPT,
+        role="reviewer",
+        session_name=f"nlbench-{name}",
+        work_dir=work_dir,
+        burst_user="lagentworker",
+        startup_timeout_seconds=30,
+        burst_timeout_seconds=300,
+        log_dir=log_dir,
+    )
+    elapsed = time.time() - t0
+    print(f"[{name}] Done in {elapsed:.0f}s, ok={result.ok}, exit={result.exit_code}", flush=True)
 
+    # Parse decision from output
+    decision = extract_json_decision(result.captured_output)
+
+    # Try to get cost from Claude JSON wrapper
+    cost = None
     try:
-        proc = subprocess.run(
-            ["sudo", "-n", "-u", "lagentworker", "env",
-             "PATH=/home/leanagent/.local/bin:/home/leanagent/.elan/bin:/home/leanagent/.nvm/versions/node/v22.22.2/bin:/usr/local/bin:/usr/bin:/bin",
-             "HOME=/home/lagentworker",
-             "ELAN_HOME=/home/leanagent/.elan",
-             *cmd],
-            input=VERIFICATION_PROMPT,
-            capture_output=True, text=True,
-            timeout=600,
-        )
-        elapsed = time.time() - t0
-        output = proc.stdout + "\n" + proc.stderr
-        print(f"[{name}] Done in {elapsed:.0f}s, exit={proc.returncode}", flush=True)
+        wrapper = json.loads(result.captured_output.strip())
+        cost = wrapper.get("total_cost_usd")
+    except (json.JSONDecodeError, AttributeError):
+        pass
 
-        # Try to extract the JSON decision
-        decision = None
-        # Claude wraps in JSON
-        try:
-            wrapper = json.loads(proc.stdout.strip())
-            if "result" in wrapper:
-                inner = wrapper["result"]
-                # Try to parse inner as JSON
-                try:
-                    decision = json.loads(inner)
-                except json.JSONDecodeError:
-                    # Look for JSON in markdown code block
-                    import re
-                    m = re.search(r'```(?:json)?\s*\n?(.*?)```', inner, re.DOTALL)
-                    if m:
-                        decision = json.loads(m.group(1).strip())
-            elif "decision" in wrapper:
-                decision = wrapper
-            cost = wrapper.get("total_cost_usd")
-        except json.JSONDecodeError:
-            cost = None
-            # Try to find JSON in raw output
-            import re
-            for candidate in re.finditer(r'\{[^{}]*"decision"[^{}]*\}', output, re.DOTALL):
-                try:
-                    decision = json.loads(candidate.group())
-                    break
-                except json.JSONDecodeError:
-                    pass
+    return {
+        "name": name,
+        "elapsed_seconds": round(elapsed, 1),
+        "exit_code": result.exit_code,
+        "ok": result.ok,
+        "decision": decision,
+        "cost_usd": cost,
+        "output_preview": result.captured_output[:300],
+        "error": result.error,
+    }
 
-        return {
-            "name": name,
-            "provider": provider,
-            "model": model,
-            "effort": effort,
-            "elapsed_seconds": round(elapsed, 1),
-            "exit_code": proc.returncode,
-            "decision": decision,
-            "cost_usd": cost,
-            "output_chars": len(output),
-            "raw_output_preview": output[:500],
-        }
-    except subprocess.TimeoutExpired:
-        return {"name": name, "error": "Timed out after 600s", "elapsed_seconds": 600}
-    except Exception as e:
-        return {"name": name, "error": str(e)}
-
-
-TESTS = {
-    "claude_opus_max":    ("claude", "opus", "max"),
-    "gemini_top":         ("gemini", "gemini-2.5-pro", ""),
-    "codex_xhigh":        ("codex", "", "high"),
-}
 
 if __name__ == "__main__":
     results = {}
     with ThreadPoolExecutor(max_workers=3) as pool:
-        futures = {pool.submit(run_verification, name, *args): name for name, args in TESTS.items()}
-        for future in as_completed(futures):
-            name = futures[future]
+        futures = {pool.submit(run_one, name): name for name in TESTS}
+        for f in as_completed(futures):
+            name = futures[f]
             try:
-                results[name] = future.result()
+                results[name] = f.result()
             except Exception as e:
                 results[name] = {"name": name, "error": str(e)}
 

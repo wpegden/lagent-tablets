@@ -184,9 +184,9 @@ def build_burst_script(
         "",
         f'echo "[{log_prefix}-burst] provider={config.provider} start=$(date -Is)"',
         f'# External watchdog: kill agent after {agent_timeout_seconds}s if it hangs',
-        f'# Redirect stdout/stderr to both the terminal and a log file',
+        f'# Redirect stdout/stderr to a log file (no tee -- tee keeps pipe alive after agent exits)',
         f'LOG_FILE={shlex.quote(str(start_file.parent / f"{log_prefix}-output.log"))}',
-        f'timeout --signal=TERM --kill-after=30 {agent_timeout_seconds} "${{real_cmd[@]}}" 2>&1 | tee -a "$LOG_FILE"',
+        f'timeout --signal=TERM --kill-after=30 {agent_timeout_seconds} "${{real_cmd[@]}}" > "$LOG_FILE" 2>&1',
         "ec=$?",
         "# timeout exit codes: 124=timed out, 137=killed",
         'if [ "$ec" -eq 124 ] || [ "$ec" -eq 137 ]; then',
@@ -610,7 +610,15 @@ def run_worker_burst(
             burst_timeout_seconds=timeout_seconds,
             log_dir=log_dir,
         )
-    return run_with_retry(_run, max_retries=max_rate_limit_retries, rate_limit_delay=120.0)
+    def _run_with_empty_check():
+        result = _run()
+        # Detect "agent exited 0 but did nothing" (common with Gemini 429)
+        if result.ok and len(result.captured_output.strip()) < 50:
+            result.ok = False
+            result.error = "Agent exited successfully but produced no meaningful output (possible rate limit)"
+        return result
+
+    return run_with_retry(_run_with_empty_check, max_retries=max_rate_limit_retries, rate_limit_delay=120.0)
 
 
 def run_reviewer_burst(
