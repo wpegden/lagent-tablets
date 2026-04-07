@@ -184,7 +184,9 @@ def build_burst_script(
         "",
         f'echo "[{log_prefix}-burst] provider={config.provider} start=$(date -Is)"',
         f'# External watchdog: kill agent after {agent_timeout_seconds}s if it hangs',
-        f'timeout --signal=TERM --kill-after=30 {agent_timeout_seconds} "${{real_cmd[@]}}"',
+        f'# Redirect stdout/stderr to both the terminal and a log file',
+        f'LOG_FILE={shlex.quote(str(start_file.parent / f"{log_prefix}-output.log"))}',
+        f'timeout --signal=TERM --kill-after=30 {agent_timeout_seconds} "${{real_cmd[@]}}" 2>&1 | tee -a "$LOG_FILE"',
         "ec=$?",
         "# timeout exit codes: 124=timed out, 137=killed",
         'if [ "$ec" -eq 124 ] || [ "$ec" -eq 137 ]; then',
@@ -416,9 +418,10 @@ def run_burst(
     except (ValueError, TypeError):
         exit_code = 1
 
-    # Read output
+    # Read output -- check both the pipe-pane log and the direct output log
     time.sleep(0.5)  # let pipe flush
-    output = _read_log(per_cycle_log)
+    output_log = log_dir / f"{role}-output.log"
+    output = _read_log(output_log) or _read_log(per_cycle_log)
 
     # Kill the window
     tmux_cmd("kill-window", "-t", window_id, check=False)

@@ -172,12 +172,37 @@ def setup_permissions(config: Config, active_node: str) -> None:
         if not path.is_file():
             continue
         try:
-            os.chown(str(path), -1, gid)
-            if path.name in writable_basenames:
-                os.chmod(str(path), 0o664)  # group-writable
+            stat = path.stat()
+            target_mode = 0o664 if path.name in writable_basenames else 0o644
+
+            # If we own the file, just set permissions
+            if stat.st_uid == os.getuid():
+                if stat.st_gid != gid:
+                    os.chown(str(path), -1, gid)
+                if (stat.st_mode & 0o777) != target_mode:
+                    os.chmod(str(path), target_mode)
             else:
-                os.chmod(str(path), 0o644)  # read-only for group
-        except PermissionError:
+                # File owned by another user (lagentworker).
+                # We can't chown it, but if the directory is group-writable,
+                # we can delete and recreate it with the right ownership.
+                # Only do this for supervisor-generated files, NOT tablet node files
+                # (which the worker legitimately created).
+                if path.name in {"INDEX.md", "README.md", "header.tex"}:
+                    content = path.read_text(encoding="utf-8")
+                    path.unlink()
+                    path.write_text(content, encoding="utf-8")
+                    os.chmod(str(path), target_mode)
+                # For node files owned by lagentworker: the group permissions
+                # still apply (lagentworker is in leanagent group).
+                # 0o644 means owner(lagentworker)=rw, group(leanagent)=r, other=r
+                # 0o664 means owner(lagentworker)=rw, group(leanagent)=rw, other=r
+                # We need sudo to change these. Use a targeted chmod via sudo.
+                else:
+                    import subprocess as sp
+                    sp.run(["sudo", "-n", "-u", "lagentworker", "chmod",
+                            oct(target_mode)[2:], str(path)],
+                           capture_output=True, timeout=5)
+        except (PermissionError, OSError):
             pass
 
     # worker_handoff.json: group-writable so the worker can create it
