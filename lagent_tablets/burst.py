@@ -637,6 +637,17 @@ def run_reviewer_burst(
 ) -> BurstResult:
     """Run a reviewer burst with retry."""
     def _run():
+        if config.provider == "gemini":
+            return run_gemini_interactive_burst(
+                config, prompt,
+                role="reviewer",
+                session_name=session_name,
+                work_dir=work_dir,
+                burst_user=burst_user,
+                startup_timeout_seconds=startup_timeout_seconds,
+                burst_timeout_seconds=timeout_seconds,
+                log_dir=log_dir,
+            )
         return run_burst(
             config, prompt,
             role="reviewer",
