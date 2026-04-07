@@ -270,6 +270,7 @@ You must NOT:
 - Modify the declaration line (`theorem {node_name} ...` -- this is frozen)
 - Add `axiom`, `constant`, `unsafe`, `native_decide`, or other forbidden keywords
 - Import anything other than `Tablet.*` or `Mathlib.*`
+- Delegate to sub-agents or use web search (work directly, do not delegate)
 
 MANDATORY BEFORE SUBMITTING: Run the self-check and fix any errors:
   {check_node} {node_name}

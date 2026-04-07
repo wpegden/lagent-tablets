@@ -160,6 +160,17 @@ def build_burst_script(
     ]
     for part in cmd_parts:
         lines.append(f"  {shlex.quote(part)}")
+    # Determine the timeout for the agent command itself.
+    # This is coreutils `timeout` as an EXTERNAL watchdog.
+    # The bash trap EXIT still fires on SIGTERM, writing the exit marker.
+    # This protects against:
+    # - Claude -p infinite retry loops on permission denial
+    # - Claude -p SIGTERM after 3-10 min (we set a longer timeout)
+    # - Gemini sub-agent hangs
+    # - Codex tool-call hang regression
+    # - Dead websocket with 5-min detection
+    agent_timeout_seconds = 3600  # 1 hour default per burst
+
     lines += [
         ")",
         "real_cmd=()",
@@ -172,8 +183,13 @@ def build_burst_script(
         "done",
         "",
         f'echo "[{log_prefix}-burst] provider={config.provider} start=$(date -Is)"',
-        '"${real_cmd[@]}"',
+        f'# External watchdog: kill agent after {agent_timeout_seconds}s if it hangs',
+        f'timeout --signal=TERM --kill-after=30 {agent_timeout_seconds} "${{real_cmd[@]}}"',
         "ec=$?",
+        "# timeout exit codes: 124=timed out, 137=killed",
+        'if [ "$ec" -eq 124 ] || [ "$ec" -eq 137 ]; then',
+        f'  echo "[{log_prefix}-burst] AGENT TIMED OUT after {agent_timeout_seconds}s"',
+        "fi",
         f'echo "[{log_prefix}-burst] end=$(date -Is) exit_code=$ec"',
         'exit "$ec"',
     ]

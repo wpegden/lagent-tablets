@@ -2,13 +2,13 @@
   "repo_path": "/home/leanagent/math/connectivity_gnp_tablets",
   "goal_file": "GOAL.md",
   "state_dir": ".agent-supervisor",
-  "max_cycles": 3,
+  "max_cycles": 5,
   "sleep_seconds": 2.0,
   "startup_timeout_seconds": 120.0,
-  "burst_timeout_seconds": 7200.0,
+  "burst_timeout_seconds": 7200,
   "worker": {
     "provider": "claude",
-    "model": "sonnet",
+    "model": "opus",
     "effort": "high"
   },
   "reviewer": {
