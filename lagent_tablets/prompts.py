@@ -271,8 +271,10 @@ You must NOT:
 - Add `axiom`, `constant`, `unsafe`, `native_decide`, or other forbidden keywords
 - Import anything other than `Tablet.*` or `Mathlib.*`
 
-Before writing worker_handoff.json, run the self-check:
+MANDATORY BEFORE SUBMITTING: Run the self-check and fix any errors:
   {check_node} {node_name}
+You MUST iterate until check_node.sh reports "Compiles: OK" before writing worker_handoff.json.
+If check_node.sh reports compilation errors, fix them and run it again.
 
 WHEN DONE -- write `worker_handoff.json` IMMEDIATELY with:
 {{

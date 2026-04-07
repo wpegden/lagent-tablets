@@ -533,6 +533,42 @@ def generate_header_tex() -> str:
     )
 
 
+def _safe_write(path: Path, content: str) -> None:
+    """Write a file safely, handling cross-user ownership.
+
+    If the file exists and is owned by another user (e.g., lagentworker),
+    we can't chmod or overwrite it directly. Instead, delete it first
+    (which works if the DIRECTORY is writable by our group) then create a new file.
+    """
+    import tempfile
+    if path.exists():
+        try:
+            path.write_text(content, encoding="utf-8")
+            path.chmod(0o664)
+            return
+        except PermissionError:
+            # File owned by another user -- delete and recreate
+            try:
+                path.unlink()
+            except PermissionError:
+                # Can't delete either -- try temp file + rename in the same dir
+                fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
+                try:
+                    os.write(fd, content.encode("utf-8"))
+                    os.close(fd)
+                    os.replace(tmp, str(path))
+                except Exception:
+                    os.close(fd)
+                    os.unlink(tmp)
+                    raise
+                return
+    path.write_text(content, encoding="utf-8")
+    try:
+        path.chmod(0o664)
+    except PermissionError:
+        pass
+
+
 def generate_tablet_root_lean(tablet: TabletState) -> str:
     """Generate the root Tablet.lean file that imports all tablet modules.
 
@@ -546,20 +582,29 @@ def generate_tablet_root_lean(tablet: TabletState) -> str:
 
 
 def regenerate_support_files(tablet: TabletState, repo_path: Path) -> None:
-    """Regenerate INDEX.md, README.md, header.tex, and Tablet.lean root."""
+    """Regenerate INDEX.md, README.md, header.tex, and Tablet.lean root.
+
+    These are supervisor-generated files. We ensure they're writable by
+    the supervisor (group-writable) since lagentworker might have created
+    them in a previous cycle.
+    """
     tdir = tablet_dir(repo_path)
     tdir.mkdir(parents=True, exist_ok=True)
 
-    index_md_path(repo_path).write_text(generate_index_md(tablet, repo_path), encoding="utf-8")
-    readme_md_path(repo_path).write_text(generate_readme_md(tablet), encoding="utf-8")
+    for target, content_fn in [
+        (index_md_path(repo_path), lambda: generate_index_md(tablet, repo_path)),
+        (readme_md_path(repo_path), lambda: generate_readme_md(tablet)),
+        (repo_path / "Tablet.lean", lambda: generate_tablet_root_lean(tablet)),
+    ]:
+        _safe_write(target, content_fn())
 
     htex = header_tex_path(repo_path)
     if not htex.exists():
         htex.write_text(generate_header_tex(), encoding="utf-8")
-
-    # Root Tablet.lean (required by Lake)
-    root_lean = repo_path / "Tablet.lean"
-    root_lean.write_text(generate_tablet_root_lean(tablet), encoding="utf-8")
+        try:
+            htex.chmod(0o664)
+        except PermissionError:
+            pass
 
 
 # ---------------------------------------------------------------------------
