@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from lagent_tablets.burst import run_burst, extract_json_decision
+from lagent_tablets.burst import run_reviewer_burst, extract_json_decision
 from lagent_tablets.adapters import ProviderConfig
 
 NL_STATEMENT = r"""
@@ -72,14 +72,13 @@ def run_one(name: str) -> dict:
     print(f"[{name}] Starting...", flush=True)
     t0 = time.time()
 
-    result = run_burst(
+    result = run_reviewer_burst(
         config, PROMPT,
-        role="reviewer",
         session_name=f"nlbench-{name}",
         work_dir=work_dir,
         burst_user="lagentworker",
+        timeout_seconds=300,
         startup_timeout_seconds=30,
-        burst_timeout_seconds=300,
         log_dir=log_dir,
     )
     elapsed = time.time() - t0

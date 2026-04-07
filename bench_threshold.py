@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from lagent_tablets.burst import run_burst
+from lagent_tablets.burst import run_worker_burst
 from lagent_tablets.adapters import ProviderConfig
 from lagent_tablets.check import check_node
 
@@ -60,14 +60,13 @@ def run_one(name: str) -> dict:
     print(f"[{name}] Starting...", flush=True)
     t0 = time.time()
 
-    result = run_burst(
+    result = run_worker_burst(
         config, PROMPT_TEMPLATE,
-        role="worker",
         session_name=f"bench-{name}",
         work_dir=repo,
         burst_user="lagentworker",
+        timeout_seconds=3600,
         startup_timeout_seconds=60,
-        burst_timeout_seconds=3600,
         log_dir=log_dir,
     )
 
