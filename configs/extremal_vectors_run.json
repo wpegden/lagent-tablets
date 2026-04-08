@@ -34,7 +34,7 @@
       {
         "provider": "claude",
         "model": "claude-opus-4-6",
-        "extra_args": ["--effort", "max"],
+        "effort": "max",
         "label": "Claude Opus max"
       },
       {
@@ -46,6 +46,7 @@
       {
         "provider": "codex",
         "model": "gpt-5.4",
+        "effort": "xhigh",
         "label": "Codex 5.4 xhigh"
       }
     ],
@@ -53,7 +54,7 @@
       {
         "provider": "claude",
         "model": "claude-opus-4-6",
-        "extra_args": ["--effort", "max"],
+        "effort": "max",
         "label": "Claude Opus max"
       },
       {
@@ -65,6 +66,7 @@
       {
         "provider": "codex",
         "model": "gpt-5.4",
+        "effort": "xhigh",
         "label": "Codex 5.4 xhigh"
       }
     ]

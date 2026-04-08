@@ -255,8 +255,9 @@ class TestVerificationPrompt(unittest.TestCase):
             modified_nodes=[],
             paper_tex="\\section{Main Result}\nThe theorem states...\n",
         )
-        self.assertIn("SOURCE PAPER", prompt)
-        self.assertIn("Main Result", prompt)
+        self.assertIn("paper", prompt.lower())  # references paper file path
+        # Paper content is read from disk, not inlined
+        self.assertIn("paper.tex", prompt)
 
 
 if __name__ == "__main__":

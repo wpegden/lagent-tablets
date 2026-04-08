@@ -765,6 +765,7 @@ def _run_single_correspondence_agent(
     agent_provider = ProviderConfig(
         provider=agent_config.provider,
         model=agent_config.model,
+        effort=getattr(agent_config, 'effort', None),
         extra_args=agent_config.extra_args,
         fallback_models=getattr(agent_config, 'fallback_models', []),
     )
@@ -835,6 +836,7 @@ def _run_single_soundness_agent(
     agent_provider = ProviderConfig(
         provider=agent_config.provider,
         model=agent_config.model,
+        effort=getattr(agent_config, 'effort', None),
         extra_args=agent_config.extra_args,
         fallback_models=getattr(agent_config, 'fallback_models', []),
     )
@@ -968,6 +970,7 @@ def _run_single_node_soundness(
     agent_provider = ProviderConfig(
         provider=agent_config.provider,
         model=agent_config.model,
+        effort=getattr(agent_config, 'effort', None),
         extra_args=agent_config.extra_args,
         fallback_models=getattr(agent_config, 'fallback_models', []),
     )

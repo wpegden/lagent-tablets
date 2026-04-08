@@ -233,6 +233,120 @@ class TestPromptNoInlineContent(unittest.TestCase):
         self.assertIn("Tablet/{name}.lean", prompt)
 
 
+class TestEffortPassthrough(unittest.TestCase):
+    """Verify effort/reasoning_effort is passed through to each backend."""
+
+    def test_codex_effort_in_script(self):
+        """Codex script includes reasoning_effort when effort is set."""
+        from lagent_tablets.agents.codex_headless import build_script
+        config = ProviderConfig(provider="codex", model="gpt-5.4", effort="xhigh")
+        tmpdir = Path(tempfile.mkdtemp())
+        script = build_script(config, prompt_file=tmpdir / "p.txt",
+                              start_file=tmpdir / "s", exit_file=tmpdir / "e",
+                              work_dir=tmpdir)
+        content = script.read_text()
+        self.assertIn("reasoning_effort", content,
+                      "codex script must include reasoning_effort when effort is set")
+        self.assertIn("xhigh", content)
+
+    def test_codex_no_effort_when_none(self):
+        """Codex script omits reasoning_effort when effort is None."""
+        from lagent_tablets.agents.codex_headless import build_script
+        config = ProviderConfig(provider="codex", model="gpt-5.4")
+        tmpdir = Path(tempfile.mkdtemp())
+        script = build_script(config, prompt_file=tmpdir / "p.txt",
+                              start_file=tmpdir / "s", exit_file=tmpdir / "e",
+                              work_dir=tmpdir)
+        content = script.read_text()
+        self.assertNotIn("reasoning_effort", content)
+
+    def test_claude_effort_in_command(self):
+        """Claude command includes --effort when set."""
+        from lagent_tablets.agents.agentapi_backend import _agent_command
+        config = ProviderConfig(provider="claude", model="opus", effort="max")
+        cmd = _agent_command(config)
+        self.assertIn("--effort", cmd)
+        idx = cmd.index("--effort")
+        self.assertEqual(cmd[idx + 1], "max")
+
+    def test_claude_no_effort_when_none(self):
+        """Claude command omits --effort when not set."""
+        from lagent_tablets.agents.agentapi_backend import _agent_command
+        config = ProviderConfig(provider="claude", model="opus")
+        cmd = _agent_command(config)
+        self.assertNotIn("--effort", cmd)
+
+    def test_effort_from_config_to_provider(self):
+        """CorrespondenceAgentConfig.effort flows to ProviderConfig."""
+        from lagent_tablets.config import CorrespondenceAgentConfig
+        agent = CorrespondenceAgentConfig(provider="codex", model="gpt-5.4", effort="xhigh")
+        provider = ProviderConfig(
+            provider=agent.provider, model=agent.model,
+            effort=getattr(agent, 'effort', None),
+            extra_args=agent.extra_args,
+        )
+        self.assertEqual(provider.effort, "xhigh")
+
+    def test_effort_parsed_from_json(self):
+        """Config parser reads effort from correspondence_agents JSON."""
+        from lagent_tablets.config import _parse_verification_config
+        raw = {
+            "correspondence_agents": [
+                {"provider": "codex", "model": "gpt-5.4", "effort": "xhigh"},
+                {"provider": "claude", "model": "opus", "effort": "max"},
+                {"provider": "gemini", "model": "auto"},
+            ],
+            "soundness_agents": [
+                {"provider": "codex", "model": "gpt-5.4", "effort": "xhigh"},
+            ],
+        }
+        v = _parse_verification_config(raw)
+        self.assertEqual(v.correspondence_agents[0].effort, "xhigh")
+        self.assertEqual(v.correspondence_agents[1].effort, "max")
+        self.assertIsNone(v.correspondence_agents[2].effort)
+        self.assertEqual(v.soundness_agents[0].effort, "xhigh")
+
+
+class TestFullConfigLoad(unittest.TestCase):
+    """End-to-end test: load real config and verify all agents are configured correctly."""
+
+    def test_extremal_vectors_config(self):
+        from lagent_tablets.config import load_config
+        config = load_config(Path("configs/extremal_vectors_run.json"))
+
+        # Worker
+        self.assertEqual(config.worker.provider, "codex")
+        self.assertEqual(config.worker.effort, "xhigh")
+
+        # Easy/hard workers
+        self.assertIsNotNone(config.easy_worker)
+        self.assertEqual(config.easy_worker.provider, "gemini")
+        self.assertIsNotNone(config.hard_worker)
+        self.assertEqual(config.hard_worker.provider, "codex")
+        self.assertEqual(config.hard_worker.effort, "xhigh")
+
+        # Reviewer
+        self.assertEqual(config.reviewer.provider, "codex")
+        self.assertEqual(config.reviewer.effort, "xhigh")
+
+        # Correspondence agents
+        corr = config.verification.correspondence_agents
+        self.assertEqual(len(corr), 3)
+        claude_agent = [a for a in corr if a.provider == "claude"][0]
+        codex_agent = [a for a in corr if a.provider == "codex"][0]
+        gemini_agent = [a for a in corr if a.provider == "gemini"][0]
+        self.assertEqual(claude_agent.effort, "max")
+        self.assertEqual(codex_agent.effort, "xhigh")
+        self.assertIsNone(gemini_agent.effort)
+        self.assertTrue(len(gemini_agent.fallback_models) > 0)
+
+        # Soundness agents
+        sound = config.verification.soundness_agents
+        self.assertEqual(len(sound), 3)
+        codex_sound = [a for a in sound if a.provider == "codex"][0]
+        self.assertEqual(codex_sound.effort, "xhigh")
+
+
 class TestWorkerBurstDoneFile(unittest.TestCase):
     """Worker burst always uses worker_handoff.json."""
 

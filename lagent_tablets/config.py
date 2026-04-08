@@ -78,9 +78,10 @@ class BranchingConfig:
 
 @dataclass
 class CorrespondenceAgentConfig:
-    """Config for one correspondence verification agent."""
+    """Config for one correspondence/soundness verification agent."""
     provider: str = "claude"
     model: str = "claude-opus-4-6"
+    effort: Optional[str] = None  # codex: xhigh, claude: max, etc.
     extra_args: List[str] = field(default_factory=list)
     fallback_models: List[str] = field(default_factory=list)
     label: str = ""  # human-readable label for disagreement reporting
@@ -281,6 +282,7 @@ def _parse_verification_config(raw: Any) -> VerificationConfig:
                 corr_agents.append(CorrespondenceAgentConfig(
                     provider=provider,
                     model=model,
+                    effort=agent_raw.get("effort") or None,
                     extra_args=list(agent_raw.get("extra_args", [])),
                     fallback_models=list(agent_raw.get("fallback_models", [])),
                     label=str(agent_raw.get("label", f"{provider}/{model or 'auto'}")),
@@ -300,6 +302,7 @@ def _parse_verification_config(raw: Any) -> VerificationConfig:
                 sound_agents.append(CorrespondenceAgentConfig(
                     provider=provider,
                     model=model,
+                    effort=agent_raw.get("effort") or None,
                     extra_args=list(agent_raw.get("extra_args", [])),
                     fallback_models=list(agent_raw.get("fallback_models", [])),
                     label=str(agent_raw.get("label", f"{provider}/{model or 'auto'}")),
