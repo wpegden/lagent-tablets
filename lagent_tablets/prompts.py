@@ -695,26 +695,27 @@ def build_correspondence_prompt(
         sections.append(f"--- HUMAN FEEDBACK ---\n{human_input}\n")
     sections.append(_load_template("correspondence_role.md"))
 
-    # Nodes to check — show their .lean and .tex
+    # List nodes to check — agent reads files from disk
     if node_names:
         sections.append("=== NODES TO CHECK ===\n")
+        sections.append("For each node below, read `Tablet/{name}.lean` and `Tablet/{name}.tex` to verify correspondence.\n")
         for name in sorted(node_names):
             node = tablet.nodes.get(name)
             if not node:
                 continue
-            tex_content = _read_file(node_tex_path(config.repo_path, name), "(no .tex file)")
-            lean_content = _read_file(node_lean_path(config.repo_path, name), "(no .lean file)")
-            sections.append(f"--- Node: {name} (kind: {node.kind}) ---")
-            sections.append(f"NL content (.tex):\n{tex_content}")
-            sections.append(f"Lean file:\n{lean_content}")
-            sections.append("")
-
-    sections.append("You have read access to all files in `Tablet/`. Read any imported node's `.lean` or `.tex` to follow definition chains.\n")
-
-    if paper_tex:
-        sections.append("=== SOURCE PAPER ===\n")
-        sections.append(_trim(paper_tex, 15000))
+            # Show imports so agent knows the DAG structure
+            lean_path = node_lean_path(config.repo_path, name)
+            imports = []
+            if lean_path.exists():
+                imports = extract_tablet_imports(lean_path.read_text(encoding="utf-8"))
+            imports_str = ", ".join(imports) if imports else "none"
+            sections.append(f"- **{name}** (kind: {node.kind}, difficulty: {node.difficulty}) — imports: {imports_str}")
         sections.append("")
+
+    sections.append("You have read access to all files in `Tablet/`. Read each node's `.lean` and `.tex` files, and follow import chains to verify definitions.\n")
+
+    if config.workflow.paper_tex_path:
+        sections.append(f"The source paper is at `{config.workflow.paper_tex_path}`. Read it as needed for context.\n")
 
     response_fmt = _load_template("correspondence_response_format.md")
     if output_file != "correspondence_result.json":

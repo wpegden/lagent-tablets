@@ -204,6 +204,7 @@ def run_reviewer_burst(
     log_dir: Optional[Path] = None,
     port: Optional[int] = None,
     fresh: bool = False,
+    done_file: Optional[Path] = None,
     **_kwargs,
 ) -> BurstResult:
     """Run a reviewer burst -- dispatches to the right backend.
@@ -225,7 +226,7 @@ def run_reviewer_burst(
             return run(config, prompt, role="reviewer", work_dir=work_dir,
                       burst_user=burst_user, timeout=timeout_seconds,
                       port=port, fresh=fresh,
-                      done_file=work_dir / "reviewer_decision.json")
+                      done_file=done_file or work_dir / "reviewer_decision.json")
 
         # Unknown providers: script-based headless
         from lagent_tablets.agents.script_headless import run

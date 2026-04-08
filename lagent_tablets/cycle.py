@@ -775,6 +775,7 @@ def _run_single_correspondence_agent(
         work_dir=repo, burst_user=config.tmux.burst_user,
         timeout_seconds=120, log_dir=log_dir, fresh=True,
         port=port,
+        done_file=result_file,
     )
 
     decision = None
@@ -977,6 +978,7 @@ def _run_single_node_soundness(
         work_dir=repo, burst_user=config.tmux.burst_user,
         timeout_seconds=120, log_dir=log_dir, fresh=True,
         port=port,
+        done_file=result_file,
     )
 
     decision = None
@@ -1330,7 +1332,7 @@ def _run_nl_verification(
                 session_name=config.tmux.session_name,
                 work_dir=repo, burst_user=config.tmux.burst_user,
                 timeout_seconds=120, log_dir=log_dir, fresh=True,
-                port=3286,
+                port=3286, done_file=corr_file,
             )
             corr_decision = None
             if corr_file.exists():
@@ -1392,7 +1394,7 @@ def _run_nl_verification(
                 session_name=config.tmux.session_name,
                 work_dir=repo, burst_user=config.tmux.burst_user,
                 timeout_seconds=120, log_dir=log_dir, fresh=True,
-                port=3287,
+                port=3287, done_file=proof_file,
             )
             proof_decision = None
             if proof_file.exists():
