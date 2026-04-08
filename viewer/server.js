@@ -237,6 +237,26 @@ app.get(`${BASE}/api/nodes.json`, (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+app.get(`${BASE}/api/state-at/:cycle`, (req, res) => {
+  const cycle = parseInt(req.params.cycle, 10);
+  if (isNaN(cycle)) return res.status(400).json({ error: 'Invalid cycle' });
+  try {
+    const tag = `cycle-${cycle}`;
+    const tabletRaw = git(`show ${tag}:.agent-supervisor/tablet.json`);
+    const stateRaw = git(`show ${tag}:.agent-supervisor/state.json`);
+    const tablet = JSON.parse(tabletRaw);
+    const state = JSON.parse(stateRaw);
+    const nodes = buildNodes(tablet);
+    const verif = getVerificationStatus(tablet);
+    for (const [name, vs] of Object.entries(verif)) {
+      if (nodes[name]) nodes[name].verification = vs;
+    }
+    res.json({ state, tablet, nodes });
+  } catch (e) {
+    res.status(404).json({ error: `Cycle ${cycle} not found: ${e.message}` });
+  }
+});
+
 app.get(`${BASE}/api/diff/:cycle`, (req, res) => {
   const cycle = parseInt(req.params.cycle, 10);
   if (isNaN(cycle)) return res.status(400).send('Invalid cycle');

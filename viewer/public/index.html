@@ -403,16 +403,45 @@ function escHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
-function updateCycleInfo() {
+async function updateCycleInfo() {
   const slider = document.getElementById('cycle-slider');
   const val = parseInt(slider.value);
-  const cycle = allCycles.find(c => c.cycle === val);
   const info = document.getElementById('cycle-info');
-  if (cycle) {
-    info.textContent = `Cycle ${val}: ${cycle.outcome?.outcome || '?'} | ${cycle.tablet_summary?.total_nodes || '?'} nodes | ${cycle.duration_seconds?.toFixed(0) || '?'}s`;
-  } else {
-    info.textContent = val === parseInt(slider.max) ? 'Current' : `Cycle ${val}`;
+  const isLatest = val === parseInt(slider.max);
+
+  if (isLatest) {
+    // Show current live state
+    info.textContent = 'Current';
+    const [nodesRes, stateRes] = await Promise.all([
+      fetch('api/nodes.json').then(r => r.json()),
+      fetch('api/state.json').then(r => r.json()),
+    ]);
+    allNodes = nodesRes;
+    currentState = stateRes;
+    renderDAG();
+    return;
   }
+
+  const cycle = allCycles.find(c => c.cycle === val);
+  if (cycle) {
+    info.textContent = `Cycle ${val}: ${cycle.phase || '?'} | ${cycle.outcome || '?'}`;
+  } else {
+    info.textContent = `Cycle ${val}`;
+  }
+
+  // Load historical state from git
+  try {
+    const resp = await fetch(`api/state-at/${val}`);
+    if (resp.ok) {
+      const data = await resp.json();
+      allNodes = data.nodes;
+      currentState = { state: data.state, tablet: data.tablet };
+      const svg = document.getElementById('dag-svg');
+      const savedVB = svg.getAttribute('viewBox');
+      renderDAG();
+      if (savedVB) svg.setAttribute('viewBox', savedVB);
+    }
+  } catch {}
 }
 
 document.getElementById('cycle-slider').addEventListener('input', updateCycleInfo);
