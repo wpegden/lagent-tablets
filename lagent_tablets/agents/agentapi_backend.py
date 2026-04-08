@@ -414,44 +414,37 @@ def wait_for_stable(port: int, *, timeout: float = 3600, poll_interval: float = 
     # No done_file — use the message-count-based approach
     initial_msg_count = len(get_messages(port))
 
-    # Phase 1: wait for status to leave 'stable' (agent starts processing)
-    phase1_deadline = time.monotonic() + 30
-    saw_non_stable = False
-    while time.monotonic() < phase1_deadline:
-        try:
-            req = urllib.request.Request(f"http://localhost:{port}/status")
-            resp = urllib.request.urlopen(req, timeout=5)
-            data = json.loads(resp.read().decode("utf-8"))
-            if data.get("status") != "stable":
-                saw_non_stable = True
-                last_activity = time.monotonic()
-                break
-        except Exception:
-            pass
-        time.sleep(1)
-
-    # Phase 2: wait for status to return to 'stable'
+    # Single unified loop: wait for agent to process and become stable again.
+    # The agent is "done" when status returns to "stable" AND there are new
+    # messages beyond what existed before we sent the prompt.
+    # We track liveness: as long as status is "running", the timer resets.
+    # We also track message count to distinguish "never started" from "finished."
+    saw_running = False
     while True:
         try:
             req = urllib.request.Request(f"http://localhost:{port}/status")
             resp = urllib.request.urlopen(req, timeout=5)
             data = json.loads(resp.read().decode("utf-8"))
-            if data.get("status") == "stable":
-                # Only accept if the agent actually produced new messages
-                current_msg_count = len(get_messages(port))
-                if current_msg_count > initial_msg_count:
-                    return True
-                if not saw_non_stable:
-                    time.sleep(2)
-                    continue
+            status = data.get("status", "unknown")
+
+            if status != "stable":
+                saw_running = True
+                last_activity = time.monotonic()
+            elif saw_running:
+                # Was running, now stable — agent finished
                 return True
-            else:
-                saw_non_stable = True
-                last_activity = time.monotonic()  # agent is active
+            # else: still stable, agent hasn't started yet — keep waiting
         except Exception:
-            pass
+            # Server unreachable — agent crashed
+            return False
+
         if time.monotonic() - last_activity > idle_timeout:
-            print(f"  wait_for_stable: idle timeout after {idle_timeout:.0f}s")
+            # Check if the agent produced any new messages at all
+            current_msg_count = len(get_messages(port))
+            if current_msg_count > initial_msg_count + 1:
+                # There are new messages — agent did work, might just be slow
+                return True
+            print(f"  wait_for_stable: idle timeout after {idle_timeout:.0f}s (saw_running={saw_running})")
             return False
         time.sleep(poll_interval)
     return False
