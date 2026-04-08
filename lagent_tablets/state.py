@@ -105,16 +105,19 @@ class TabletNode:
     name: str
     kind: str  # "preamble", "paper_main_result", "paper_intermediate", "helper_lemma"
     status: str  # "open", "closed"
+    difficulty: str = "hard"  # "easy" or "hard"
     title: str = ""
     paper_provenance: str = ""
     lean_statement_hash: str = ""
     closed_at_cycle: Optional[int] = None
     invalidated_at_cycle: Optional[int] = None
+    easy_attempts: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
             "kind": self.kind,
             "status": self.status,
+            "difficulty": self.difficulty,
             "title": self.title,
         }
         if self.paper_provenance:
@@ -125,19 +128,26 @@ class TabletNode:
             d["closed_at_cycle"] = self.closed_at_cycle
         if self.invalidated_at_cycle is not None:
             d["invalidated_at_cycle"] = self.invalidated_at_cycle
+        if self.easy_attempts > 0:
+            d["easy_attempts"] = self.easy_attempts
         return d
 
     @classmethod
     def from_dict(cls, name: str, raw: Dict[str, Any]) -> TabletNode:
+        diff = str(raw.get("difficulty", "hard"))
+        if diff not in ("easy", "hard"):
+            diff = "hard"
         return cls(
             name=name,
             kind=str(raw.get("kind", "helper_lemma")),
             status=str(raw.get("status", "open")),
+            difficulty=diff,
             title=str(raw.get("title", "")),
             paper_provenance=str(raw.get("paper_provenance", "")),
             lean_statement_hash=str(raw.get("lean_statement_hash", "")),
             closed_at_cycle=raw.get("closed_at_cycle"),
             invalidated_at_cycle=raw.get("invalidated_at_cycle"),
+            easy_attempts=int(raw.get("easy_attempts", 0)),
         )
 
 
@@ -165,11 +175,21 @@ class TabletState:
     def open_nodes(self) -> int:
         return sum(1 for n in self.nodes.values() if n.kind != "preamble" and n.status == "open")
 
+    @property
+    def easy_open_nodes(self) -> int:
+        return sum(1 for n in self.nodes.values() if n.kind != "preamble" and n.status == "open" and n.difficulty == "easy")
+
+    @property
+    def hard_open_nodes(self) -> int:
+        return sum(1 for n in self.nodes.values() if n.kind != "preamble" and n.status == "open" and n.difficulty == "hard")
+
     def metrics(self) -> Dict[str, Any]:
         return {
             "total_nodes": self.total_nodes,
             "closed_nodes": self.closed_nodes,
             "open_nodes": self.open_nodes,
+            "easy_open": self.easy_open_nodes,
+            "hard_open": self.hard_open_nodes,
         }
 
     def to_dict(self) -> Dict[str, Any]:
@@ -226,6 +246,7 @@ class SupervisorState:
     validation_summary: Optional[Dict[str, Any]] = None
     stuck_recovery_attempts: List[Dict[str, Any]] = field(default_factory=list)
     human_input: str = ""
+    human_input_at_cycle: int = 0
     awaiting_human_input: bool = False
     cleanup_last_good_commit: str = ""
     agent_token_usage: Dict[str, Any] = field(default_factory=dict)
@@ -241,6 +262,7 @@ class SupervisorState:
             "validation_summary": self.validation_summary,
             "stuck_recovery_attempts": self.stuck_recovery_attempts,
             "human_input": self.human_input,
+            "human_input_at_cycle": self.human_input_at_cycle,
             "awaiting_human_input": self.awaiting_human_input,
             "cleanup_last_good_commit": self.cleanup_last_good_commit,
             "agent_token_usage": self.agent_token_usage,
@@ -260,6 +282,7 @@ class SupervisorState:
             validation_summary=raw.get("validation_summary"),
             stuck_recovery_attempts=list(raw.get("stuck_recovery_attempts", [])),
             human_input=str(raw.get("human_input", "")),
+            human_input_at_cycle=int(raw.get("human_input_at_cycle", 0)),
             awaiting_human_input=bool(raw.get("awaiting_human_input", False)),
             cleanup_last_good_commit=str(raw.get("cleanup_last_good_commit", "")),
             agent_token_usage=dict(raw.get("agent_token_usage", {})),

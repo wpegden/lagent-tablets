@@ -26,9 +26,16 @@ from lagent_tablets.burst import (
     run_worker_burst,
 )
 from lagent_tablets.config import Config, Policy
-from lagent_tablets.prompts import build_reviewer_prompt, build_verification_prompt, build_worker_prompt
+from lagent_tablets.prompts import (
+    build_reviewer_prompt,
+    build_correspondence_prompt,
+    build_nl_proof_prompt,
+    build_verification_prompt,
+    build_worker_prompt,
+)
 from lagent_tablets.state import (
     SupervisorState,
+    TabletNode,
     TabletState,
     load_json,
     save_json,
@@ -60,6 +67,39 @@ from lagent_tablets.tablet import (
     scan_forbidden_keywords,
 )
 from lagent_tablets.check import check_node as run_check_node
+
+
+def _accumulate_usage(state: SupervisorState, role: str, usage: Optional[Dict[str, Any]]) -> None:
+    """Add a burst's token usage to the running totals in state.agent_token_usage.
+
+    Tracks per-role (worker, reviewer, correspondence, nl_proof) and per-model.
+    """
+    if not usage:
+        return
+    if not isinstance(state.agent_token_usage, dict):
+        state.agent_token_usage = {}
+
+    # Per-role accumulation
+    if role not in state.agent_token_usage:
+        state.agent_token_usage[role] = {"input_tokens": 0, "output_tokens": 0, "calls": 0}
+    bucket = state.agent_token_usage[role]
+    bucket["input_tokens"] += usage.get("input_tokens", 0)
+    bucket["output_tokens"] += usage.get("output_tokens", 0)
+    bucket["cached_input_tokens"] = bucket.get("cached_input_tokens", 0) + usage.get("cached_input_tokens", usage.get("cache_read_input_tokens", 0))
+    bucket["calls"] += 1
+
+    # Per-model tracking within the role
+    model = usage.get("model", "unknown")
+    provider = usage.get("provider", "unknown")
+    model_key = f"{provider}/{model}"
+    if "by_model" not in bucket:
+        bucket["by_model"] = {}
+    if model_key not in bucket["by_model"]:
+        bucket["by_model"][model_key] = {"input_tokens": 0, "output_tokens": 0, "calls": 0}
+    mbucket = bucket["by_model"][model_key]
+    mbucket["input_tokens"] += usage.get("input_tokens", 0)
+    mbucket["output_tokens"] += usage.get("output_tokens", 0)
+    mbucket["calls"] += 1
 from lagent_tablets.verification import (
     FORBIDDEN_KEYWORDS_DEFAULT,
     write_scripts,
@@ -128,14 +168,14 @@ def _detect_changes(before: Dict[str, str], after: Dict[str, str]) -> Dict[str, 
 # Permission setup
 # ---------------------------------------------------------------------------
 
-def setup_permissions(config: Config, active_node: str) -> None:
+def setup_permissions(config: Config, active_node: str, *, easy_mode: bool = False) -> None:
     """Set file permissions before a worker burst.
 
     The burst_user runs the agent CLI. File permissions control what it can write:
     - Active node .lean/.tex: 0o664 (group-writable) -- worker can edit
-    - Preamble.lean: 0o664 -- worker can add imports
+    - Preamble.lean: 0o664 (hard) / 0o644 (easy) -- easy workers cannot add imports
     - Everything else: 0o644 (group-read-only) -- worker CANNOT edit
-    - Tablet/ directory: 0o2775 (group-writable, setgid) -- worker can create new files
+    - Tablet/ directory: 0o2775 (hard) / 0o2755 (easy) -- easy workers cannot create files
     - worker_handoff.json: 0o664 -- worker can write completion marker
 
     The shared group is 'leanagent' (gid from leanagent user).
@@ -155,19 +195,24 @@ def setup_permissions(config: Config, active_node: str) -> None:
     except KeyError:
         return
 
-    # Tablet directory: setgid, group-writable (new files inherit group)
+    # Tablet directory: setgid.
+    # Hard mode: group-writable (0o2775) so worker can create new files.
+    # Easy mode: group-read (0o2755) so worker CANNOT create new files.
+    tdir_mode = 0o2755 if easy_mode else 0o2775
     try:
         os.chown(str(tdir), -1, gid)
-        os.chmod(str(tdir), 0o2775)
+        os.chmod(str(tdir), tdir_mode)
     except PermissionError:
         pass
 
-    # Files the worker may edit
+    # Files the worker may edit.
+    # Easy mode: only active node files + handoff. Preamble is read-only.
     writable_basenames = {
         f"{active_node}.lean",
         f"{active_node}.tex",
-        "Preamble.lean",
     }
+    if not easy_mode:
+        writable_basenames.add("Preamble.lean")
 
     for path in tdir.iterdir():
         if not path.is_file():
@@ -217,6 +262,55 @@ def setup_permissions(config: Config, active_node: str) -> None:
         os.chmod(str(repo), 0o2775)
     except PermissionError:
         pass
+
+
+def _setup_theorem_stating_permissions(config: Config) -> None:
+    """Set permissions for theorem_stating: everything in Tablet/ is writable."""
+    import grp
+    import os
+
+    repo = config.repo_path
+    tdir = repo / "Tablet"
+    if not tdir.exists():
+        tdir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        gid = grp.getgrnam("leanagent").gr_gid
+    except KeyError:
+        return
+
+    # Tablet directory: setgid, group-writable
+    try:
+        os.chown(str(tdir), -1, gid)
+        os.chmod(str(tdir), 0o2775)
+    except PermissionError:
+        pass
+
+    # All files in Tablet: group-writable
+    for path in tdir.iterdir():
+        if not path.is_file():
+            continue
+        try:
+            stat = path.stat()
+            if stat.st_uid == os.getuid():
+                if stat.st_gid != gid:
+                    os.chown(str(path), -1, gid)
+                os.chmod(str(path), 0o664)
+            else:
+                import subprocess as sp
+                sp.run(["sudo", "-n", "-u", "lagentworker", "chmod", "664", str(path)],
+                       capture_output=True, timeout=5)
+        except (PermissionError, OSError):
+            pass
+
+    # worker_handoff.json and repo root
+    for p in [repo / "worker_handoff.json", repo]:
+        try:
+            if p.exists():
+                os.chown(str(p), -1, gid)
+                os.chmod(str(p), 0o2775 if p.is_dir() else 0o664)
+        except PermissionError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -640,6 +734,554 @@ def reconcile_tablet_status(config: Config, tablet: TabletState) -> List[str]:
     return reconciled
 
 
+def _run_single_correspondence_agent(
+    config: Config,
+    tablet: TabletState,
+    corr_nodes: List[str],
+    agent_config: Any,  # CorrespondenceAgentConfig
+    *,
+    paper_tex: str,
+    human_input: str,
+    log_dir: Path,
+    agent_index: int,
+) -> Dict[str, Any]:
+    """Run one correspondence agent. Designed to be called from a thread."""
+    from lagent_tablets.burst import _clean_terminal_json
+
+    repo = config.repo_path
+    label = agent_config.label or f"agent-{agent_index}"
+    output_file = f"correspondence_result_{agent_index}.json"
+    port = 3286 + agent_index * 2  # 3286, 3288, 3290, ...
+
+    result_file = repo / output_file
+    result_file.unlink(missing_ok=True)
+
+    prompt = build_correspondence_prompt(
+        config, tablet, node_names=corr_nodes, paper_tex=paper_tex,
+        human_input=human_input, output_file=output_file,
+    )
+
+    agent_provider = ProviderConfig(
+        provider=agent_config.provider,
+        model=agent_config.model,
+        extra_args=agent_config.extra_args,
+        fallback_models=getattr(agent_config, 'fallback_models', []),
+    )
+
+    burst_result = run_reviewer_burst(
+        agent_provider, prompt,
+        session_name=config.tmux.session_name,
+        work_dir=repo, burst_user=config.tmux.burst_user,
+        timeout_seconds=300, log_dir=log_dir, fresh=True,
+        port=port,
+    )
+
+    decision = None
+    if result_file.exists():
+        try:
+            decision = load_json(result_file)
+        except Exception:
+            pass
+    if not isinstance(decision, dict) and burst_result.ok:
+        cleaned = _clean_terminal_json(burst_result.captured_output)
+        decision = extract_json_decision(cleaned)
+
+    result = {
+        "agent": label,
+        "index": agent_index,
+        "ok": burst_result.ok,
+        **(decision if isinstance(decision, dict) else {"overall": "ERROR", "summary": f"Failed to get decision from {label}"}),
+    }
+    if burst_result.usage:
+        result["_usage"] = burst_result.usage
+    return result
+
+
+def _run_multi_correspondence(
+    config: Config,
+    tablet: TabletState,
+    corr_nodes: List[str],
+    agents: List[Any],  # List[CorrespondenceAgentConfig]
+    *,
+    paper_tex: str,
+    human_input: str,
+    log_dir: Path,
+) -> Dict[str, Any]:
+    """Run multiple correspondence agents concurrently and reconcile results.
+
+    If all agents agree, returns a single result.
+    If they disagree, returns all individual results for the reviewer to arbitrate.
+    """
+    import concurrent.futures
+
+    n = len(agents)
+    labels = [a.label or f"{a.provider}/{a.model}" for a in agents]
+    print(f"  Multi-agent correspondence: {n} agents ({', '.join(labels)}) on {len(corr_nodes)} nodes")
+
+    agent_results: List[Dict[str, Any]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n) as pool:
+        futures = {
+            pool.submit(
+                _run_single_correspondence_agent,
+                config, tablet, corr_nodes, agent,
+                paper_tex=paper_tex, human_input=human_input,
+                log_dir=log_dir, agent_index=i,
+            ): i
+            for i, agent in enumerate(agents)
+        }
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                agent_results.append(future.result())
+            except Exception as exc:
+                idx = futures[future]
+                agent_results.append({
+                    "agent": labels[idx], "index": idx,
+                    "overall": "ERROR", "summary": str(exc),
+                })
+
+    agent_results.sort(key=lambda r: r.get("index", 0))
+
+    # Check agreement
+    overalls = [r.get("overall", "ERROR") for r in agent_results]
+    all_approve = all(o == "APPROVE" for o in overalls)
+    all_reject = all(o == "REJECT" for o in overalls)
+    unanimous = all_approve or all_reject
+
+    if unanimous:
+        overall = "APPROVE" if all_approve else "REJECT"
+        summaries = [f"{r['agent']}: {r.get('summary', '?')}" for r in agent_results]
+        print(f"  Correspondence: {overall} (unanimous, {n} agents)")
+        return {
+            "check": "correspondence",
+            "overall": overall,
+            "summary": f"Unanimous {overall} from {n} agents",
+            "agent_results": agent_results,
+        }
+    else:
+        disagree_detail = ", ".join(f"{r.get('agent', '?')}: {o}" for r, o in zip(agent_results, overalls))
+        print(f"  Correspondence: DISAGREE ({disagree_detail})")
+        return {
+            "check": "correspondence",
+            "overall": "DISAGREE",
+            "summary": f"Agents disagree: {disagree_detail}. Reviewer must arbitrate.",
+            "agent_results": agent_results,
+        }
+
+
+def _run_nl_verification(
+    config: Config,
+    tablet: TabletState,
+    node_names: List[str],
+    *,
+    log_dir: Path,
+    nl_cache: Optional[Any] = None,
+    human_input: str = "",
+) -> List[Dict[str, Any]]:
+    """Run correspondence and NL proof verification on the given nodes.
+
+    Uses the NL cache to skip re-verification when content hasn't changed.
+    Returns list of verification result dicts.
+    """
+    from lagent_tablets.burst import _clean_terminal_json
+
+    repo = config.repo_path
+    results: List[Dict[str, Any]] = []
+
+    if not node_names:
+        return results
+
+    paper_tex = ""
+    if config.workflow.paper_tex_path and config.workflow.paper_tex_path.exists():
+        paper_tex = config.workflow.paper_tex_path.read_text(encoding="utf-8", errors="replace")
+
+    verify_config = ProviderConfig(
+        provider=config.verification.provider,
+        model=config.verification.model,
+        extra_args=config.verification.extra_args,
+    )
+
+    # 1. Correspondence check (possibly multi-agent)
+    corr_nodes = node_names
+    if nl_cache:
+        corr_nodes = nl_cache.filter_uncached(repo, node_names, "correspondence")
+    if corr_nodes:
+        corr_agents = config.verification.correspondence_agents
+        if len(corr_agents) >= 2:
+            # Multi-agent correspondence: run agents concurrently, show reviewer disagreements
+            corr_result_entry = _run_multi_correspondence(
+                config, tablet, corr_nodes, corr_agents,
+                paper_tex=paper_tex, human_input=human_input, log_dir=log_dir,
+            )
+            results.append(corr_result_entry)
+            if corr_result_entry.get("overall") == "APPROVE" and nl_cache:
+                nl_cache.record_correspondence_approval(repo, corr_nodes)
+        else:
+            # Single-agent correspondence (default)
+            print(f"  Correspondence check: {len(corr_nodes)} nodes ({len(node_names) - len(corr_nodes)} cached)")
+            corr_file = repo / "correspondence_result.json"
+            corr_file.unlink(missing_ok=True)
+            corr_prompt = build_correspondence_prompt(
+                config, tablet, node_names=corr_nodes, paper_tex=paper_tex,
+                human_input=human_input,
+            )
+            corr_result = run_reviewer_burst(
+                verify_config, corr_prompt,
+                session_name=config.tmux.session_name,
+                work_dir=repo, burst_user=config.tmux.burst_user,
+                timeout_seconds=300, log_dir=log_dir, fresh=True,
+                port=3286,
+            )
+            corr_decision = None
+            if corr_file.exists():
+                try:
+                    corr_decision = load_json(corr_file)
+                except Exception:
+                    pass
+            if not isinstance(corr_decision, dict) and corr_result.ok:
+                cleaned = _clean_terminal_json(corr_result.captured_output)
+                corr_decision = extract_json_decision(cleaned)
+            if corr_decision:
+                entry = {"check": "correspondence", **corr_decision}
+                if corr_result.usage:
+                    entry["_usage"] = corr_result.usage
+                results.append(entry)
+                overall = corr_decision.get("overall", "?")
+                print(f"  Correspondence: {overall}")
+                if overall == "APPROVE" and nl_cache:
+                    nl_cache.record_correspondence_approval(repo, corr_nodes)
+    else:
+        print(f"  Correspondence: all {len(node_names)} nodes cached (APPROVE)")
+        results.append({"check": "correspondence", "overall": "APPROVE", "summary": "cached"})
+
+    # 2. NL proof soundness check
+    proof_nodes = node_names
+    if nl_cache:
+        proof_nodes = nl_cache.filter_uncached(repo, node_names, "soundness")
+    if proof_nodes:
+        print(f"  NL proof check: {len(proof_nodes)} nodes ({len(node_names) - len(proof_nodes)} cached)")
+        proof_file = repo / "nl_proof_result.json"
+        proof_file.unlink(missing_ok=True)
+        proof_prompt = build_nl_proof_prompt(
+            config, tablet, node_names=proof_nodes, paper_tex=paper_tex,
+            human_input=human_input,
+        )
+        proof_result = run_reviewer_burst(
+            verify_config, proof_prompt,
+            session_name=config.tmux.session_name,
+            work_dir=repo, burst_user=config.tmux.burst_user,
+            timeout_seconds=300, log_dir=log_dir, fresh=True,
+            port=3287,  # NL proof verification port
+        )
+        proof_decision = None
+        if proof_file.exists():
+            try:
+                proof_decision = load_json(proof_file)
+            except Exception:
+                pass
+        if not isinstance(proof_decision, dict) and proof_result.ok:
+            cleaned = _clean_terminal_json(proof_result.captured_output)
+            proof_decision = extract_json_decision(cleaned)
+        if proof_decision:
+            entry = {"check": "nl_proof", **proof_decision}
+            if proof_result.usage:
+                entry["_usage"] = proof_result.usage
+            results.append(entry)
+            overall = proof_decision.get("overall", "?")
+            print(f"  NL proof soundness: {overall}")
+            if overall == "APPROVE" and nl_cache:
+                nl_cache.record_soundness_approval(repo, proof_nodes)
+    else:
+        print(f"  NL proof soundness: all {len(node_names)} nodes cached (APPROVE)")
+        results.append({"check": "nl_proof", "overall": "APPROVE", "summary": "cached"})
+
+    return results
+
+
+def run_theorem_stating_cycle(
+    config: Config,
+    state: SupervisorState,
+    tablet: TabletState,
+    policy: Policy,
+    *,
+    previous_outcome: Optional[Dict[str, Any]] = None,
+) -> CycleOutcome:
+    """Run a single theorem_stating cycle.
+
+    The worker creates/refines Tablet nodes (.lean + .tex pairs).
+    The reviewer checks whether the tablet is ready for proof_formalization.
+    """
+    from lagent_tablets.prompts import build_theorem_stating_prompt, build_theorem_stating_reviewer_prompt
+    from lagent_tablets.health import fix_lake_permissions
+    cycle = state.cycle + 1
+    cycle_start = time.monotonic()
+    state.cycle = cycle
+    repo = config.repo_path
+
+    print(f"=== Theorem-stating cycle {cycle} ===")
+
+    # Ensure Tablet directory exists
+    (repo / "Tablet").mkdir(parents=True, exist_ok=True)
+
+    # Fix .lake permissions
+    fix_lake_permissions(repo)
+
+    # In theorem_stating, the worker needs write access to the whole Tablet/ directory
+    _setup_theorem_stating_permissions(config)
+
+    # Build worker prompt
+    worker_prompt = build_theorem_stating_prompt(
+        config, state, tablet, policy, previous_outcome=previous_outcome,
+    )
+
+    log_dir = config.state_dir / "logs" / f"cycle-{cycle:04d}"
+
+    # Run worker burst
+    worker_result = run_worker_burst(
+        config.worker,
+        worker_prompt,
+        session_name=config.tmux.session_name,
+        work_dir=repo,
+        burst_user=config.tmux.burst_user,
+        timeout_seconds=policy.timing.burst_timeout_seconds,
+        startup_timeout_seconds=config.startup_timeout_seconds,
+        log_dir=log_dir,
+    )
+
+    if worker_result.transcript_path:
+        print(f"  Transcript saved: {worker_result.transcript_path}")
+
+    if not worker_result.ok:
+        print(f"  Worker burst failed: {worker_result.error}")
+        save_state(state_path(config), state)
+        return CycleOutcome(outcome="INVALID", detail=f"Worker burst failed: {worker_result.error}")
+
+    fix_lake_permissions(repo)
+
+    # Discover what the worker created/modified
+    tdir = repo / "Tablet"
+    lean_files = {p.stem for p in tdir.glob("*.lean") if p.stem != "Preamble"}
+    tex_files = {p.stem for p in tdir.glob("*.tex") if p.stem not in ("header", "Preamble")}
+    all_node_names = lean_files | tex_files
+    new_nodes = [n for n in all_node_names if n not in tablet.nodes]
+    existing_nodes = [n for n in all_node_names if n in tablet.nodes]
+
+    # Read difficulty hints from worker handoff (if present)
+    difficulty_hints: Dict[str, str] = {}
+    handoff_path = repo / "worker_handoff.json"
+    if handoff_path.exists():
+        try:
+            hf = load_json(handoff_path)
+            if isinstance(hf, dict):
+                hints = hf.get("difficulty_hints", {})
+                if isinstance(hints, dict):
+                    for k, v in hints.items():
+                        if v in ("easy", "hard"):
+                            difficulty_hints[k] = v
+        except Exception:
+            pass
+
+    # Register any new nodes in the tablet
+    for name in new_nodes:
+        lean_path = node_lean_path(repo, name)
+        tex_path = node_tex_path(repo, name)
+        if lean_path.exists():
+            # Determine kind heuristically
+            content = lean_path.read_text(encoding="utf-8")
+            marker = extract_marker_name(content)
+            kind = "paper_main_result" if "main" in name or "theorem" in name else "paper_intermediate"
+            register_new_node(tablet, repo, name=name, kind=kind, cycle=cycle)
+            # Apply difficulty hint from worker
+            if name in difficulty_hints:
+                tablet.nodes[name].difficulty = difficulty_hints[name]
+
+    # Ensure Preamble node exists
+    if PREAMBLE_NAME not in tablet.nodes:
+        preamble_path = repo / "Tablet" / "Preamble.lean"
+        if preamble_path.exists():
+            tablet.nodes[PREAMBLE_NAME] = TabletNode(
+                name=PREAMBLE_NAME, kind="preamble", status="closed",
+                title="Imports", closed_at_cycle=cycle,
+            )
+
+    # Check: no definitions in Preamble (they must be in their own nodes)
+    from lagent_tablets.tablet import scan_preamble_definitions
+    preamble_path = repo / "Tablet" / "Preamble.lean"
+    if preamble_path.exists():
+        preamble_defs = scan_preamble_definitions(preamble_path.read_text(encoding="utf-8"))
+        if preamble_defs:
+            defs_list = [h["text"][:80] for h in preamble_defs]
+            print(f"  INVALID: Preamble has {len(preamble_defs)} definitions (must be in own nodes)")
+            for d in defs_list:
+                print(f"    {d}")
+            save_state(state_path(config), state)
+            return CycleOutcome(
+                outcome="INVALID",
+                detail=f"Preamble.lean contains definitions. All definitions must be in their own node files with .tex counterparts. Found: {', '.join(defs_list[:3])}",
+            )
+
+    # Validate: check if lake build passes
+    build_ok = False
+    build_output = ""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["lake", "build", "Tablet"],
+            capture_output=True, text=True, timeout=300,
+            cwd=str(repo),
+        )
+        build_output = result.stdout + result.stderr
+        build_ok = result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        build_output = str(e)
+
+    if not build_ok:
+        print(f"  lake build failed")
+        outcome = CycleOutcome(
+            outcome="INVALID",
+            detail=f"lake build Tablet failed",
+            build_output=build_output,
+        )
+    elif new_nodes:
+        print(f"  Created {len(new_nodes)} new nodes: {new_nodes}")
+        outcome = CycleOutcome(
+            outcome="PROGRESS",
+            detail=f"Created nodes: {', '.join(new_nodes)}",
+            nodes_created=new_nodes,
+        )
+    else:
+        print(f"  No new nodes created (modified existing: {existing_nodes})")
+        outcome = CycleOutcome(outcome="PROGRESS", detail="Modified existing nodes")
+
+    # Update tablet state
+    regenerate_support_files(tablet, repo)
+    save_tablet(tablet_path(config), tablet)
+    save_state(state_path(config), state)
+
+    # Run NL verification on all non-preamble nodes
+    from lagent_tablets.nl_cache import NLCache
+    nl_cache = NLCache(config.state_dir / "nl_cache.json")
+    all_check_nodes = [n for n in tablet.nodes if tablet.nodes[n].kind != "preamble"]
+    print(f"  Running NL verification for {len(all_check_nodes)} nodes...")
+    nl_verification_results = _run_nl_verification(
+        config, tablet, all_check_nodes, log_dir=log_dir, nl_cache=nl_cache,
+        human_input=state.human_input,
+    )
+
+    # Reviewer burst
+    handoff_path = repo / "worker_handoff.json"
+    worker_handoff = None
+    if handoff_path.exists():
+        try:
+            worker_handoff = load_json(handoff_path)
+        except Exception:
+            # Worker may write invalid JSON (e.g., LaTeX backslashes)
+            try:
+                raw = handoff_path.read_text(encoding="utf-8", errors="replace")
+                # Escape bare backslashes and retry
+                import re
+                fixed = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', raw)
+                worker_handoff = json.loads(fixed)
+            except Exception:
+                worker_handoff = {"summary": raw[:500] if raw else "could not parse", "status": "UNKNOWN"}
+
+    reviewer_prompt = build_theorem_stating_reviewer_prompt(
+        config, state, tablet, policy,
+        worker_handoff=worker_handoff,
+        worker_output=worker_result.captured_output[-15000:] if worker_result.captured_output else "",
+        nl_verification=nl_verification_results if nl_verification_results else None,
+    )
+
+    # Clean up decision file before burst
+    decision_path = repo / "reviewer_decision.json"
+    decision_path.unlink(missing_ok=True)
+
+    reviewer_result = run_reviewer_burst(
+        config.reviewer,
+        reviewer_prompt,
+        session_name=config.tmux.session_name,
+        work_dir=repo,
+        burst_user=config.tmux.burst_user,
+        timeout_seconds=min(policy.timing.burst_timeout_seconds, 300),
+        log_dir=log_dir,
+    )
+
+    # Read decision from file (primary), fall back to output parsing
+    decision = None
+    if decision_path.exists():
+        try:
+            decision = load_json(decision_path)
+        except Exception:
+            pass
+    if not isinstance(decision, dict):
+        from lagent_tablets.burst import _clean_terminal_json
+        cleaned = _clean_terminal_json(reviewer_result.captured_output)
+        decision = extract_json_decision(cleaned)
+    if isinstance(decision, dict):
+        state.last_review = decision
+        state.review_log.append({"cycle": cycle, **decision})
+        print(f"  Reviewer: {decision.get('decision', '?')} -- {decision.get('reason', '')[:100]}")
+
+        # If ADVANCE_PHASE, run both verification checks on all nodes first
+        if decision.get("decision") == "ADVANCE_PHASE":
+            all_nodes = [n for n in tablet.nodes if tablet.nodes[n].kind != "preamble"]
+            if all_nodes:
+                print(f"  Running verification before phase advance: {all_nodes}")
+                paper_tex = ""
+                if config.workflow.paper_tex_path and config.workflow.paper_tex_path.exists():
+                    paper_tex = config.workflow.paper_tex_path.read_text(encoding="utf-8", errors="replace")
+                from lagent_tablets.nl_cache import NLCache
+                nl_cache = NLCache(config.state_dir / "nl_cache.json")
+                gate_results = _run_nl_verification(
+                    config, tablet, all_nodes, log_dir=log_dir, nl_cache=nl_cache,
+                    human_input=state.human_input,
+                )
+                rejection_reasons = []
+                for r in gate_results:
+                    if r.get("overall") == "REJECT":
+                        rejection_reasons.append(f"{r.get('check', '?')}: {r.get('summary', '')}")
+
+                if rejection_reasons:
+                    print(f"  Verification REJECTED -- blocking ADVANCE_PHASE")
+                    state.last_review["decision"] = "CONTINUE"
+                    state.last_review["reason"] = "Verification rejected: " + "; ".join(rejection_reasons)
+                else:
+                    # Verification passed — set the initial active node for proof_formalization
+                    next_node = decision.get("next_active_node", "")
+                    if next_node and next_node in tablet.nodes and tablet.nodes[next_node].status == "open":
+                        state.active_node = next_node
+                        tablet.active_node = next_node
+                        print(f"  Initial proof node: {next_node}")
+                    else:
+                        open_nodes = [n for n, nd in sorted(tablet.nodes.items())
+                                      if nd.status == "open" and nd.kind != "preamble"]
+                        if open_nodes:
+                            state.active_node = open_nodes[0]
+                            tablet.active_node = open_nodes[0]
+                            print(f"  Initial proof node (auto): {open_nodes[0]}")
+    else:
+        print(f"  Reviewer: could not parse decision")
+
+    save_tablet(tablet_path(config), tablet)
+    save_state(state_path(config), state)
+
+    # Git commit
+    from lagent_tablets.git_ops import commit_cycle as git_commit
+    git_commit(
+        repo, cycle,
+        phase="theorem_stating",
+        outcome=outcome.outcome,
+        active_node=state.active_node,
+        detail=outcome.detail,
+        meta={
+            "duration_seconds": round(time.monotonic() - cycle_start, 1),
+            "reviewer_decision": state.last_review,
+            "verification_results": nl_verification_results if nl_verification_results else None,
+        },
+    )
+
+    return outcome
+
+
 def run_cycle(
     config: Config,
     state: SupervisorState,
@@ -650,11 +1292,25 @@ def run_cycle(
 ) -> CycleOutcome:
     """Run a single supervisor cycle."""
     cycle = state.cycle + 1
+    cycle_start = time.monotonic()
     state.cycle = cycle
     active_node = state.active_node or tablet.active_node
     repo = config.repo_path
 
-    print(f"=== Cycle {cycle} | Active: {active_node} ===")
+    # Determine node difficulty and select the right worker config
+    node_meta = tablet.nodes.get(active_node)
+    node_difficulty = node_meta.difficulty if node_meta else "hard"
+    easy_mode = node_difficulty == "easy"
+
+    # Select worker config based on difficulty
+    if easy_mode and config.easy_worker:
+        effective_worker = config.easy_worker
+    elif not easy_mode and config.hard_worker:
+        effective_worker = config.hard_worker
+    else:
+        effective_worker = config.worker
+
+    print(f"=== Cycle {cycle} | Active: {active_node} | Difficulty: {node_difficulty} | Worker: {effective_worker.provider}/{effective_worker.model} ===")
 
     # Regenerate scripts each cycle (hot-reloadable)
     forbidden = [kw for kw in FORBIDDEN_KEYWORDS_DEFAULT if kw not in config.workflow.forbidden_keyword_allowlist]
@@ -668,20 +1324,31 @@ def run_cycle(
     _ensure_lake_build(repo)
 
     # Set file permissions (active node writable, others read-only)
-    setup_permissions(config, active_node)
+    # Easy mode: Tablet/ dir not group-writable, Preamble read-only
+    setup_permissions(config, active_node, easy_mode=easy_mode)
 
-    # Record the active node's hash BEFORE the burst
+    # Record state BEFORE the burst for easy-mode validation
     active_lean = node_lean_path(repo, active_node)
     hash_before = hashlib.sha256(active_lean.read_bytes()).hexdigest() if active_lean.exists() else ""
+    imports_before: Set[str] = set()
+    if easy_mode and active_lean.exists():
+        imports_before = set(extract_tablet_imports(active_lean.read_text(encoding="utf-8")))
+    tablet_files_before: Set[str] = set()
+    if easy_mode and (repo / "Tablet").is_dir():
+        tablet_files_before = {p.name for p in (repo / "Tablet").iterdir() if p.is_file()}
 
     # Build worker prompt
-    worker_prompt = build_worker_prompt(config, state, tablet, policy, previous_outcome=previous_outcome)
+    worker_prompt = build_worker_prompt(
+        config, state, tablet, policy,
+        previous_outcome=previous_outcome,
+        difficulty=node_difficulty,
+    )
 
     # Run worker burst
     log_dir = config.state_dir / "logs" / f"cycle-{cycle:04d}"
 
     worker_result = run_worker_burst(
-        config.worker,
+        effective_worker,
         worker_prompt,
         session_name=config.tmux.session_name,
         work_dir=repo,
@@ -691,8 +1358,14 @@ def run_cycle(
         log_dir=log_dir,
     )
 
+    if worker_result.transcript_path:
+        print(f"  Transcript saved: {worker_result.transcript_path}")
+
+    _accumulate_usage(state, "worker", worker_result.usage)
+
     if not worker_result.ok:
         print(f"  Worker burst failed: {worker_result.error}")
+        save_state(state_path(config), state)
         return CycleOutcome(outcome="INVALID", detail=f"Worker burst failed: {worker_result.error}")
 
     # Fix .lake permissions after burst (worker may have created oleans)
@@ -706,6 +1379,54 @@ def run_cycle(
     current_files = {p.name for p in (repo / "Tablet").iterdir() if p.is_file()} if (repo / "Tablet").is_dir() else set()
     known_files = {f"{name}.lean" for name in tablet.nodes} | {f"{name}.tex" for name in tablet.nodes} | {"INDEX.md", "README.md", "header.tex"}
     new_files = current_files - known_files
+
+    # Easy-mode enforcement (layer 2: supervisor-side, in addition to filesystem)
+    if easy_mode:
+        # Reject new files
+        new_content_files = {f for f in (current_files - tablet_files_before)
+                            if f.endswith(".lean") or f.endswith(".tex")}
+        if new_content_files:
+            print(f"  Easy-mode violation: new files created: {new_content_files}")
+            # Clean up the new files
+            for fname in new_content_files:
+                try:
+                    (repo / "Tablet" / fname).unlink()
+                except OSError:
+                    pass
+            outcome = CycleOutcome(
+                outcome="INVALID",
+                detail=f"Easy-mode node cannot create new files. Created: {sorted(new_content_files)}",
+            )
+            # Track easy attempt and possibly auto-elevate
+            if node_meta:
+                node_meta.easy_attempts += 1
+                if node_meta.easy_attempts >= policy.difficulty.easy_max_retries:
+                    node_meta.difficulty = "hard"
+                    node_meta.easy_attempts = 0
+                    print(f"  Auto-elevating {active_node} to hard (after {policy.difficulty.easy_max_retries} easy attempts)")
+            save_state(state_path(config), state)
+            save_tablet(tablet_path(config), tablet)
+            return outcome
+
+        # Reject new imports
+        if active_lean.exists():
+            imports_after = set(extract_tablet_imports(active_lean.read_text(encoding="utf-8")))
+            new_imports = imports_after - imports_before
+            if new_imports:
+                print(f"  Easy-mode violation: new imports added: {new_imports}")
+                outcome = CycleOutcome(
+                    outcome="INVALID",
+                    detail=f"Easy-mode node cannot add new imports. Added: {sorted(new_imports)}",
+                )
+                if node_meta:
+                    node_meta.easy_attempts += 1
+                    if node_meta.easy_attempts >= policy.difficulty.easy_max_retries:
+                        node_meta.difficulty = "hard"
+                        node_meta.easy_attempts = 0
+                        print(f"  Auto-elevating {active_node} to hard (after {policy.difficulty.easy_max_retries} easy attempts)")
+                save_state(state_path(config), state)
+                save_tablet(tablet_path(config), tablet)
+                return outcome
 
     # Validate
     outcome = validate_worker_cycle_v2(
@@ -722,6 +1443,14 @@ def run_cycle(
     else:
         state.validation_summary = {"consecutive_invalids": 0, "last_outcome": outcome.outcome}
 
+    # Easy-mode auto-elevation on non-progress outcomes
+    if easy_mode and outcome.outcome in ("INVALID", "NO_PROGRESS") and node_meta:
+        node_meta.easy_attempts += 1
+        if node_meta.easy_attempts >= policy.difficulty.easy_max_retries:
+            node_meta.difficulty = "hard"
+            node_meta.easy_attempts = 0
+            print(f"  Auto-elevating {active_node} to hard (after {policy.difficulty.easy_max_retries} easy attempts)")
+
     if outcome.outcome == "NO_PROGRESS":
         # Still go to reviewer for guidance
         pass
@@ -731,18 +1460,36 @@ def run_cycle(
     # The reviewer is always the final arbiter for NL soundness.
     nl_verification_results: List[Dict[str, Any]] = []
     needs_nl_review = False
-    if outcome.outcome == "PROGRESS" and outcome.nodes_created:
-        open_new = [n for n in outcome.nodes_created if n not in outcome.nodes_closed]
-        if open_new:
-            print(f"  Running NL verification for new nodes: {open_new}")
-            needs_nl_review = True
 
-            # TODO: invoke verification model(s) via adapter
-            # Run multiple agents for robustness, collect all results.
-            # All results go to the reviewer -- no auto-resolve for NL decisions.
-            #
-            # nl_verification_results = run_nl_verifications(config, tablet, open_new, ...)
-            pass
+    # Run NL verification on: new nodes, and any modified nodes that are still open
+    nodes_to_verify = []
+    if outcome.outcome == "PROGRESS":
+        if outcome.nodes_created:
+            nodes_to_verify.extend([n for n in outcome.nodes_created if n not in outcome.nodes_closed])
+        # Also verify the active node if it changed (even if not closed)
+        if active_changed and active_node not in outcome.nodes_closed:
+            if active_node not in nodes_to_verify:
+                nodes_to_verify.append(active_node)
+
+    if nodes_to_verify:
+        print(f"  Running NL verification for nodes: {nodes_to_verify}")
+        needs_nl_review = True
+        from lagent_tablets.nl_cache import NLCache
+        nl_cache = NLCache(config.state_dir / "nl_cache.json")
+        nl_verification_results = _run_nl_verification(
+            config, tablet, nodes_to_verify, log_dir=log_dir, nl_cache=nl_cache,
+            human_input=state.human_input,
+        )
+
+    # Accumulate verification usage
+    for vr in nl_verification_results:
+        usage = vr.pop("_usage", None)
+        role = "correspondence" if vr.get("check") == "correspondence" else "nl_proof"
+        _accumulate_usage(state, role, usage)
+        # Also accumulate from multi-agent results
+        for ar in vr.get("agent_results", []):
+            agent_usage = ar.pop("_usage", None)
+            _accumulate_usage(state, "correspondence", agent_usage)
 
     # Apply results to tablet state
     if outcome.outcome == "PROGRESS":
@@ -779,7 +1526,18 @@ def run_cycle(
     if needs_reviewer:
         # Read worker handoff
         handoff_path = repo / "worker_handoff.json"
-        worker_handoff = load_json(handoff_path) if handoff_path.exists() else None
+        worker_handoff = None
+        if handoff_path.exists():
+            try:
+                worker_handoff = load_json(handoff_path)
+            except Exception:
+                try:
+                    raw = handoff_path.read_text(encoding="utf-8", errors="replace")
+                    import re as _re
+                    fixed = _re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', raw)
+                    worker_handoff = json.loads(fixed)
+                except Exception:
+                    worker_handoff = {"summary": raw[:500] if raw else "could not parse", "status": "UNKNOWN"}
 
         reviewer_prompt = build_reviewer_prompt(
             config, state, tablet, policy,
@@ -787,7 +1545,7 @@ def run_cycle(
             worker_output=worker_result.captured_output[-20000:] if worker_result.captured_output else "",
             validation_summary={"outcome": outcome.outcome, "detail": outcome.detail,
                                 "consecutive_invalids": state.validation_summary.get("consecutive_invalids", 0) if isinstance(state.validation_summary, dict) else 0},
-            nl_verification=nl_verification_results[0] if nl_verification_results else None,
+            nl_verification=nl_verification_results if nl_verification_results else None,
         )
 
         # Reviewer burst: non-interactive for Claude/Codex, interactive for Gemini
@@ -804,24 +1562,73 @@ def run_cycle(
             log_dir=log_dir,
         )
 
-        # Parse reviewer decision from output (non-interactive) or file (Gemini interactive)
-        if reviewer_result.ok:
-            if decision_path.exists():
+        _accumulate_usage(state, "reviewer", reviewer_result.usage)
+
+        # Read decision from file (primary), fall back to output parsing
+        decision = None
+        if decision_path.exists():
+            try:
                 decision = load_json(decision_path)
-            else:
-                decision = extract_json_decision(reviewer_result.captured_output)
-            if isinstance(decision, dict):
-                state.last_review = decision
-                state.review_log.append({"cycle": cycle, **decision})
-                next_node = decision.get("next_active_node", "")
-                if next_node and next_node in tablet.nodes and tablet.nodes[next_node].status == "open":
-                    state.active_node = next_node
-                    tablet.active_node = next_node
-                print(f"  Reviewer: {decision.get('decision', '?')} -> next: {state.active_node}")
-            else:
-                print(f"  Reviewer: could not parse decision from output")
+            except Exception:
+                pass
+        if not isinstance(decision, dict) and reviewer_result.ok:
+            from lagent_tablets.burst import _clean_terminal_json
+            cleaned = _clean_terminal_json(reviewer_result.captured_output)
+            decision = extract_json_decision(cleaned)
+        if isinstance(decision, dict):
+            state.last_review = decision
+            state.review_log.append({"cycle": cycle, **decision})
+            next_node = decision.get("next_active_node", "")
+            if next_node and next_node in tablet.nodes and tablet.nodes[next_node].status == "open":
+                state.active_node = next_node
+                tablet.active_node = next_node
+
+            # Apply reviewer difficulty assignments
+            for name, diff in decision.get("difficulty_assignments", {}).items():
+                if name in tablet.nodes and diff in ("easy", "hard"):
+                    old_diff = tablet.nodes[name].difficulty
+                    if old_diff != diff:
+                        tablet.nodes[name].difficulty = diff
+                        tablet.nodes[name].easy_attempts = 0
+                        print(f"  Reviewer assigned {name}: {old_diff} -> {diff}")
+
+            # Apply reviewer elevations
+            for name in decision.get("elevate_to_hard", []):
+                if name in tablet.nodes and tablet.nodes[name].difficulty == "easy":
+                    tablet.nodes[name].difficulty = "hard"
+                    tablet.nodes[name].easy_attempts = 0
+                    print(f"  Reviewer elevated {name} to hard")
+
+            print(f"  Reviewer: {decision.get('decision', '?')} -> next: {state.active_node}")
+        else:
+            print(f"  Reviewer: could not parse decision")
 
         save_tablet(tablet_path(config), tablet)
         save_state(state_path(config), state)
+
+    # Git commit
+    from lagent_tablets.git_ops import commit_cycle as git_commit
+    git_commit(
+        repo, cycle,
+        phase=state.phase,
+        outcome=outcome.outcome,
+        active_node=active_node,
+        detail=outcome.detail,
+        meta={
+            "duration_seconds": round(time.monotonic() - cycle_start, 1),
+            "reviewer_decision": state.last_review,
+            "verification_results": nl_verification_results if nl_verification_results else None,
+            "token_usage": state.agent_token_usage,
+        },
+    )
+
+    # Print cycle usage summary
+    if state.agent_token_usage:
+        parts = []
+        for role, data in state.agent_token_usage.items():
+            if isinstance(data, dict) and "calls" in data:
+                parts.append(f"{role}: {data.get('input_tokens',0):,}in/{data.get('output_tokens',0):,}out ({data['calls']} calls)")
+        if parts:
+            print(f"  Token usage (cumulative): {' | '.join(parts)}")
 
     return outcome

@@ -230,12 +230,20 @@ def extract_tablet_imports(lean_content: str) -> List[str]:
 
 
 def validate_imports(lean_content: str, allowed_prefixes: List[str]) -> List[str]:
-    """Check all imports match Tablet.* or allowed prefixes. Return list of violations."""
+    """Check all imports match Tablet.* or allowed prefixes. Return list of violations.
+
+    Bare top-level imports like `import Mathlib` (without a submodule) are
+    always rejected — only specific submodule imports are allowed.
+    """
     violations = []
     for imp in extract_imports(lean_content):
         if imp.startswith("Tablet."):
             continue
-        if any(imp.startswith(prefix + ".") or imp == prefix for prefix in allowed_prefixes):
+        # Reject bare top-level imports (e.g., "Mathlib" without a submodule)
+        if imp in allowed_prefixes:
+            violations.append(f"{imp} (bare import not allowed -- use specific submodules like {imp}.SomeModule)")
+            continue
+        if any(imp.startswith(prefix + ".") for prefix in allowed_prefixes):
             continue
         violations.append(imp)
     return violations
@@ -307,6 +315,56 @@ def mask_comments_and_strings(text: str) -> str:
             i += 1
 
     return "".join(result)
+
+
+def scan_preamble_definitions(preamble_content: str) -> List[Dict[str, Any]]:
+    """Check that Preamble.lean contains no definitions — only imports.
+
+    All definitions must be in their own node files with .tex counterparts.
+    """
+    masked = mask_comments_and_strings(preamble_content)
+    hits = []
+    for lineno, (masked_line, original_line) in enumerate(
+        zip(masked.splitlines(), preamble_content.splitlines()), start=1
+    ):
+        if re.match(r"(noncomputable\s+)?def\b", masked_line.strip()):
+            hits.append({
+                "keyword": "def in Preamble",
+                "line": lineno,
+                "text": original_line.strip(),
+            })
+    return hits
+
+
+def scan_sorry_in_definitions(lean_content: str) -> List[Dict[str, Any]]:
+    """Check for sorry used in definitions (not theorems/lemmas).
+
+    sorry is allowed in theorem/lemma proof bodies but NEVER in definitions,
+    as a sorry'd definition provides no properties and makes downstream proofs impossible.
+    """
+    masked = mask_comments_and_strings(lean_content)
+    hits = []
+    in_def = False
+    for lineno, (masked_line, original_line) in enumerate(
+        zip(masked.splitlines(), lean_content.splitlines()), start=1
+    ):
+        stripped = masked_line.strip()
+        # Track if we're inside a def/noncomputable def body
+        if re.match(r"(noncomputable\s+)?def\b", stripped):
+            in_def = True
+        elif re.match(r"(theorem|lemma|example)\b", stripped):
+            in_def = False
+        # Check for sorry on any line while in a definition (including the def line itself)
+        if in_def and re.search(r"\bsorry\b", masked_line):
+            hits.append({
+                "keyword": "sorry (in definition)",
+                "line": lineno,
+                "text": original_line.strip(),
+            })
+        # Reset on blank lines
+        if not stripped:
+            in_def = False
+    return hits
 
 
 def scan_forbidden_keywords(lean_content: str, forbidden: List[str]) -> List[Dict[str, Any]]:

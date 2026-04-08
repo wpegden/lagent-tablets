@@ -34,6 +34,13 @@ class TmuxConfig:
 
 
 @dataclass
+class PhaseOverride:
+    """Per-phase overrides for provider models."""
+    worker_model: Optional[str] = None
+    reviewer_model: Optional[str] = None
+
+
+@dataclass
 class WorkflowConfig:
     start_phase: str
     paper_tex_path: Optional[Path]
@@ -42,6 +49,7 @@ class WorkflowConfig:
     forbidden_keyword_allowlist: List[str]
     human_input_path: Path
     input_request_path: Path
+    phase_overrides: Dict[str, PhaseOverride] = field(default_factory=dict)
 
 
 @dataclass
@@ -69,6 +77,16 @@ class BranchingConfig:
 
 
 @dataclass
+class CorrespondenceAgentConfig:
+    """Config for one correspondence verification agent."""
+    provider: str = "claude"
+    model: str = "claude-opus-4-6"
+    extra_args: List[str] = field(default_factory=list)
+    fallback_models: List[str] = field(default_factory=list)
+    label: str = ""  # human-readable label for disagreement reporting
+
+
+@dataclass
 class VerificationConfig:
     """Config for the NL verification model (strongest available, with thinking)."""
     provider: str = "claude"
@@ -76,6 +94,7 @@ class VerificationConfig:
     extra_args: List[str] = field(default_factory=list)
     thinking_budget: str = "high"
     max_context_tokens: int = 50000
+    correspondence_agents: List[CorrespondenceAgentConfig] = field(default_factory=list)
 
 
 @dataclass
@@ -95,6 +114,8 @@ class Config:
     startup_timeout_seconds: float
     burst_timeout_seconds: float
     branching: BranchingConfig = field(default_factory=BranchingConfig)
+    easy_worker: Optional[ProviderConfig] = None
+    hard_worker: Optional[ProviderConfig] = None
     policy_path: Optional[Path] = None
     source_path: Optional[Path] = None
 
@@ -141,6 +162,11 @@ class CloseBypassPolicy:
 
 
 @dataclass(frozen=True)
+class DifficultyPolicy:
+    easy_max_retries: int = 2
+
+
+@dataclass(frozen=True)
 class PromptNotesPolicy:
     worker: str = ""
     reviewer: str = ""
@@ -156,6 +182,7 @@ class Policy:
     codex_budget_pause: CodexBudgetPausePolicy = field(default_factory=CodexBudgetPausePolicy)
     close_bypass: CloseBypassPolicy = field(default_factory=CloseBypassPolicy)
     prompt_notes: PromptNotesPolicy = field(default_factory=PromptNotesPolicy)
+    difficulty: DifficultyPolicy = field(default_factory=DifficultyPolicy)
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +203,7 @@ PHASES: Tuple[str, ...] = (
 )
 
 FORBIDDEN_KEYWORDS_DEFAULT: Tuple[str, ...] = (
-    "sorry", "axiom", "constant", "unsafe",
+    "sorry", "axiom", "constant", "unsafe", "opaque",
     "native_decide", "implementedBy", "extern",
 )
 
@@ -232,19 +259,38 @@ def _parse_provider_config(raw: Any, label: str) -> ProviderConfig:
         model=raw.get("model") or None,
         effort=raw.get("effort") or None,
         extra_args=list(raw.get("extra_args", [])),
-        fallback_model=raw.get("fallback_model") or None,
+        fallback_models=list(raw.get("fallback_models", [])),
     )
 
 
 def _parse_verification_config(raw: Any) -> VerificationConfig:
     if not isinstance(raw, dict):
         return VerificationConfig()
+    corr_agents_raw = raw.get("correspondence_agents", [])
+    corr_agents: List[CorrespondenceAgentConfig] = []
+    if isinstance(corr_agents_raw, list):
+        for i, agent_raw in enumerate(corr_agents_raw):
+            if isinstance(agent_raw, dict):
+                provider = str(agent_raw.get("provider", "claude")).strip().lower()
+                if provider not in ("claude", "codex", "gemini"):
+                    continue
+                raw_model = agent_raw.get("model")
+                model = str(raw_model).strip() if raw_model is not None else None
+                model = model or None  # empty string -> None
+                corr_agents.append(CorrespondenceAgentConfig(
+                    provider=provider,
+                    model=model,
+                    extra_args=list(agent_raw.get("extra_args", [])),
+                    fallback_models=list(agent_raw.get("fallback_models", [])),
+                    label=str(agent_raw.get("label", f"{provider}/{model or 'auto'}")),
+                ))
     return VerificationConfig(
         provider=str(raw.get("provider", "claude")).strip().lower(),
         model=str(raw.get("model", "claude-opus-4-6")).strip(),
         extra_args=list(raw.get("extra_args", [])),
         thinking_budget=str(raw.get("thinking_budget", "high")).strip(),
         max_context_tokens=_coerce_int(raw.get("max_context_tokens", 50000), "verification.max_context_tokens", minimum=1000),
+        correspondence_agents=corr_agents,
     )
 
 
@@ -277,6 +323,8 @@ def load_config(path: Path) -> Config:
     worker = _parse_provider_config(_require(raw, "worker", "config"), "config.worker")
     reviewer = _parse_provider_config(_require(raw, "reviewer", "config"), "config.reviewer")
     verification = _parse_verification_config(raw.get("verification", {}))
+    easy_worker = _parse_provider_config(raw["easy_worker"], "config.easy_worker") if "easy_worker" in raw else None
+    hard_worker = _parse_provider_config(raw["hard_worker"], "config.hard_worker") if "hard_worker" in raw else None
 
     # tmux
     tmux_raw = _require(raw, "tmux", "config")
@@ -306,6 +354,16 @@ def load_config(path: Path) -> Config:
         paper_tex_path: Optional[Path] = (repo_path / paper_tex).resolve()
     else:
         paper_tex_path = None
+    # Phase overrides
+    phase_overrides_raw = wf_raw.get("phase_overrides", {})
+    phase_overrides: Dict[str, PhaseOverride] = {}
+    for phase_name, overrides in phase_overrides_raw.items():
+        if isinstance(overrides, dict):
+            phase_overrides[phase_name] = PhaseOverride(
+                worker_model=overrides.get("worker_model"),
+                reviewer_model=overrides.get("reviewer_model"),
+            )
+
     workflow = WorkflowConfig(
         start_phase=start_phase,
         paper_tex_path=paper_tex_path,
@@ -314,6 +372,7 @@ def load_config(path: Path) -> Config:
         forbidden_keyword_allowlist=list(wf_raw.get("forbidden_keyword_allowlist", [])),
         human_input_path=(repo_path / str(wf_raw.get("human_input_path", "HUMAN_INPUT.md"))).resolve(),
         input_request_path=(repo_path / str(wf_raw.get("input_request_path", "INPUT_REQUEST.md"))).resolve(),
+        phase_overrides=phase_overrides,
     )
 
     # chat
@@ -372,6 +431,8 @@ def load_config(path: Path) -> Config:
         startup_timeout_seconds=_coerce_float(raw.get("startup_timeout_seconds", 120.0), "startup_timeout_seconds", strictly_positive=True),
         burst_timeout_seconds=_coerce_float(raw.get("burst_timeout_seconds", 600.0), "burst_timeout_seconds", strictly_positive=True),
         branching=branching,
+        easy_worker=easy_worker,
+        hard_worker=hard_worker,
         policy_path=policy_path,
         source_path=path,
     )
@@ -400,6 +461,7 @@ def _parse_policy(raw: Any, defaults: Policy, *, path: Path) -> Policy:
     cb = _block("codex_budget_pause")
     cl = _block("close_bypass")
     pn = _block("prompt_notes")
+    df = _block("difficulty")
 
     retry_raw = tm.get("agent_retry_delays_seconds", list(defaults.timing.agent_retry_delays_seconds))
     if not isinstance(retry_raw, list):
@@ -447,6 +509,9 @@ def _parse_policy(raw: Any, defaults: Policy, *, path: Path) -> Policy:
             verification=str(pn.get("verification", defaults.prompt_notes.verification)).strip(),
             branching=str(pn.get("branching", defaults.prompt_notes.branching)).strip(),
         ),
+        difficulty=DifficultyPolicy(
+            easy_max_retries=_coerce_int(df.get("easy_max_retries", defaults.difficulty.easy_max_retries), "difficulty.easy_max_retries", minimum=1),
+        ),
     )
 
 
@@ -459,6 +524,7 @@ def policy_to_dict(policy: Policy) -> Dict[str, Any]:
         "codex_budget_pause": {"weekly_percent_left_threshold": policy.codex_budget_pause.weekly_percent_left_threshold, "poll_seconds": policy.codex_budget_pause.poll_seconds},
         "close_bypass": {"reviewer_interval": policy.close_bypass.reviewer_interval},
         "prompt_notes": {"worker": policy.prompt_notes.worker, "reviewer": policy.prompt_notes.reviewer, "verification": policy.prompt_notes.verification, "branching": policy.prompt_notes.branching},
+        "difficulty": {"easy_max_retries": policy.difficulty.easy_max_retries},
     }
 
 

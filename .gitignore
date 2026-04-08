@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+.hypothesis/
+.pytest_cache/
+.agent-supervisor/
+test_results_gemini.json

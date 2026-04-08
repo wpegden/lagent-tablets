@@ -37,6 +37,30 @@ def is_rate_limited(output: str) -> bool:
     return any(p in lowered for p in RATE_LIMIT_PATTERNS)
 
 
+_EXHAUSTED_MODEL_RE = re.compile(
+    r'No capacity available for model (\S+)',
+    re.IGNORECASE,
+)
+_EXHAUSTED_MODEL_JSON_RE = re.compile(
+    r'"model":\s*"([^"]+)"',
+)
+
+
+def extract_exhausted_model(text: str) -> Optional[str]:
+    """Parse the model name from a MODEL_CAPACITY_EXHAUSTED error.
+
+    Returns the model name (e.g., 'gemini-3-flash-preview') or None.
+    """
+    m = _EXHAUSTED_MODEL_RE.search(text)
+    if m:
+        return m.group(1)
+    if "model_capacity_exhausted" in text.lower():
+        m = _EXHAUSTED_MODEL_JSON_RE.search(text)
+        if m:
+            return m.group(1)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Retry wrapper (shared across backends)
 # ---------------------------------------------------------------------------
@@ -48,22 +72,70 @@ def run_with_retry(
     base_delay: float = 60.0,
     max_delay: float = 900.0,
     rate_limit_delay: float = 120.0,
+    config: Optional[ProviderConfig] = None,
+    port: Optional[int] = None,
 ) -> BurstResult:
-    """Retry a burst function with exponential backoff on rate limits."""
+    """Retry a burst function with exponential backoff on rate limits.
+
+    When config has fallback_models and the error identifies a specific
+    exhausted model, attempts to switch to the next available fallback
+    via /model command (no server restart) before retrying.
+    """
+    from lagent_tablets.model_availability import get_availability
+    availability = get_availability()
+
     last_result = None
     for attempt in range(max_retries + 1):
         result = fn()
         last_result = result
         if result.ok:
             return result
-        if is_rate_limited(result.captured_output) or is_rate_limited(result.error):
+
+        combined_output = result.captured_output + " " + result.error
+        rate_limited = is_rate_limited(combined_output)
+
+        # Gemini startup failures (Failed to send message) are often 429s
+        # that happen before agentapi can capture the error text.
+        # Treat as rate-limited if we have fallbacks to try.
+        gemini_startup_fail = (
+            not rate_limited
+            and config
+            and config.provider == "gemini"
+            and "Failed to send message" in result.error
+            and config.fallback_models
+        )
+        if gemini_startup_fail:
+            rate_limited = True
+            # Use current model as the exhausted one
+            if config.model:
+                combined_output += f" No capacity available for model {config.model}"
+
+        if rate_limited:
+            # Try model fallback before sleeping
+            exhausted = extract_exhausted_model(combined_output)
+            if exhausted and config and config.fallback_models:
+                availability.mark_unavailable(exhausted, f"429 capacity exhausted")
+                fallback = availability.pick_available(config.fallback_models)
+                if fallback:
+                    print(f"  Model {exhausted} exhausted, falling back to {fallback}")
+                    config.model = fallback
+                    # Switch model in running session if we have a port
+                    if port and config.provider == "gemini":
+                        from lagent_tablets.agents.agentapi_backend import switch_model
+                        switch_model(port, fallback)
+                    continue  # retry immediately with new model, no backoff
+
             if attempt >= max_retries:
                 result.error = f"Rate limited after {max_retries} retries: {result.error}"
+                blocked = availability.status()
+                if blocked:
+                    result.error += f" Blocked models: {blocked}"
                 return result
             delay = min(rate_limit_delay * (2 ** attempt), max_delay)
             print(f"  Rate limited (attempt {attempt + 1}/{max_retries}), waiting {delay:.0f}s...")
             time.sleep(delay)
             continue
+
         if attempt >= max_retries:
             return result
         delay = min(base_delay * (2 ** attempt), max_delay)
@@ -88,6 +160,7 @@ def run_worker_burst(
     startup_timeout_seconds: float = 120.0,
     max_rate_limit_retries: int = 5,
     log_dir: Optional[Path] = None,
+    port: Optional[int] = None,
     **_kwargs,
 ) -> BurstResult:
     """Run a worker burst -- dispatches to the right backend."""
@@ -100,19 +173,22 @@ def run_worker_burst(
                       startup_timeout=startup_timeout_seconds,
                       burst_timeout=timeout_seconds, log_dir=log_dir)
 
-        if config.provider == "claude":
+        if config.provider in ("claude", "gemini"):
             from lagent_tablets.agents.agentapi_backend import run
             return run(config, prompt, role="worker", work_dir=work_dir,
-                      burst_user=burst_user, timeout=timeout_seconds)
+                      burst_user=burst_user, timeout=timeout_seconds,
+                      port=port,
+                      done_file=work_dir / "worker_handoff.json")
 
-        # Gemini and unknown providers: script-based headless (-p mode)
+        # Unknown providers: script-based headless (-p mode)
         from lagent_tablets.agents.script_headless import run
         return run(config, prompt, role="worker", session_name=session_name,
                   work_dir=work_dir, burst_user=burst_user,
                   startup_timeout=startup_timeout_seconds,
                   burst_timeout=timeout_seconds, log_dir=log_dir)
 
-    return run_with_retry(_run, max_retries=max_rate_limit_retries, rate_limit_delay=120.0)
+    return run_with_retry(_run, max_retries=max_rate_limit_retries, rate_limit_delay=120.0,
+                          config=config, port=port)
 
 
 def run_reviewer_burst(
@@ -126,9 +202,15 @@ def run_reviewer_burst(
     startup_timeout_seconds: float = 60.0,
     max_rate_limit_retries: int = 3,
     log_dir: Optional[Path] = None,
+    port: Optional[int] = None,
+    fresh: bool = False,
     **_kwargs,
 ) -> BurstResult:
-    """Run a reviewer burst -- dispatches to the right backend."""
+    """Run a reviewer burst -- dispatches to the right backend.
+
+    If fresh=True, starts a new agent session (no context from prior cycles).
+    Used for stateless verification agents.
+    """
 
     def _run():
         if config.provider == "codex":
@@ -138,28 +220,58 @@ def run_reviewer_burst(
                       startup_timeout=startup_timeout_seconds,
                       burst_timeout=timeout_seconds, log_dir=log_dir)
 
-        if config.provider == "claude":
+        if config.provider in ("claude", "gemini"):
             from lagent_tablets.agents.agentapi_backend import run
             return run(config, prompt, role="reviewer", work_dir=work_dir,
-                      burst_user=burst_user, timeout=timeout_seconds)
+                      burst_user=burst_user, timeout=timeout_seconds,
+                      port=port, fresh=fresh,
+                      done_file=work_dir / "reviewer_decision.json")
 
-        # Gemini and unknown: script-based headless
+        # Unknown providers: script-based headless
         from lagent_tablets.agents.script_headless import run
         return run(config, prompt, role="reviewer", session_name=session_name,
                   work_dir=work_dir, burst_user=burst_user,
                   startup_timeout=startup_timeout_seconds,
                   burst_timeout=timeout_seconds, log_dir=log_dir)
 
-    return run_with_retry(_run, max_retries=max_rate_limit_retries, rate_limit_delay=60.0)
+    return run_with_retry(_run, max_retries=max_rate_limit_retries, rate_limit_delay=60.0,
+                          config=config, port=port)
 
 
 # ---------------------------------------------------------------------------
 # JSON extraction (shared utility)
 # ---------------------------------------------------------------------------
 
+def _clean_terminal_json(text: str) -> str:
+    """Clean terminal-formatted text for JSON parsing.
+
+    Agent output from agentapi may have trailing whitespace padding
+    on each line (terminal width) and line-wrapping inside string
+    values. Strip trailing spaces and rejoin continuation lines.
+    """
+    # Strip ✦ prefix (Gemini response marker)
+    text = text.strip()
+    if text.startswith("✦"):
+        text = text[1:].strip()
+    # Strip trailing whitespace from each line, rejoin
+    lines = [line.rstrip() for line in text.split("\n")]
+    # Collapse lines that are continuations inside JSON strings:
+    # A line that starts with spaces and doesn't start a new JSON key
+    # is likely a wrapped continuation of the previous line.
+    collapsed = []
+    for line in lines:
+        stripped = line.lstrip()
+        if collapsed and stripped and not stripped.startswith(("{", "}", "[", "]", '"')):
+            # Continuation line -- append to previous
+            collapsed[-1] = collapsed[-1] + " " + stripped
+        else:
+            collapsed.append(line)
+    return "\n".join(collapsed)
+
+
 def extract_json_decision(text: str) -> Optional[Dict[str, Any]]:
     """Extract a JSON decision from agent output."""
-    text = text.strip()
+    text = _clean_terminal_json(text)
     try:
         wrapper = json.loads(text)
         if isinstance(wrapper, dict):

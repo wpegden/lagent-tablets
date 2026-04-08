@@ -1,0 +1,69 @@
+--- INSTRUCTIONS ---
+
+PHASE: theorem_stating
+YOUR GOAL: Create the proof tablet -- a DAG of Lean 4 declarations that decompose the paper's results into provable nodes.
+
+Read the skill file at `{skill_path}` for Loogle usage and Lean tips.
+
+DECOMPOSITION STRATEGY:
+- Start with the paper's main theorem(s) as top-level nodes
+- Work backwards: what intermediate results does each theorem need?
+- Each node should be a single, self-contained mathematical statement
+- Aim for 3-10 nodes depending on the paper's complexity
+- Leaf nodes should be provable directly from Mathlib or basic arguments
+- Think about what order you would prove these in -- the node DAG should reflect this
+
+For each node, create two files:
+
+1. **`Tablet/{{name}}.lean`** -- The Lean declaration with `sorry`:
+   ```lean
+   import Tablet.Preamble
+   -- import Tablet.{{dependency}} for nodes this result depends on
+
+   -- [TABLET NODE: {{name}}]
+   -- Do not rename or remove the declaration below.
+
+   theorem {{name}} (args...) : statement := sorry
+   ```
+
+2. **`Tablet/{{name}}.tex`** -- The NL statement AND a complete NL proof:
+   ```latex
+   \begin{{theorem}}[Title]
+   NL statement matching the Lean declaration.
+   \end{{theorem}}
+
+   \begin{{proof}}
+   By \noderef{{dependency1}} and \noderef{{dependency2}}, ...
+   (Rigorous NL proof from the NL statements of imported nodes.)
+   \end{{proof}}
+   ```
+
+3. **`Tablet/Preamble.lean`** -- Shared imports. Use ONLY specific Mathlib modules:
+   ```lean
+   import Mathlib.Analysis.SpecialFunctions.Log.Basic
+   import Mathlib.Topology.Order.Basic
+   -- NEVER write `import Mathlib`
+   ```
+   Use Loogle at `http://127.0.0.1:8088/json?q=...` to find which module contains each lemma you need.
+
+IMPORTANT RULES:
+- Every `.lean` must have a matching `.tex` with NL statement AND NL proof
+- Imports between nodes define the DAG: if node B uses node A, then B imports A
+- The `-- [TABLET NODE: name]` marker line is MANDATORY in every node .lean file
+- NEVER use `import Mathlib` -- only specific submodule imports
+- `sorry` is expected in this phase -- you are stating theorems, not proving them
+- The NL proof in each .tex must be rigorous, not a sketch or placeholder
+- Use `\noderef{{name}}` to cite other nodes in NL proofs
+- Run `lake build Tablet` to verify everything compiles (sorry warnings are expected)
+- The supervisor auto-generates `Tablet.lean` -- do NOT create or edit it
+
+NODE NAMING: use snake_case names that describe the mathematical content.
+Example: `expected_isolated_vertices`, `threshold_limit`, `first_moment_bound`
+
+WHEN DONE: Write `worker_handoff.json`:
+{{
+  "summary": "Created N tablet nodes covering the paper's main results and key lemmas",
+  "status": "NOT_STUCK | STUCK | DONE | NEED_INPUT",
+  "new_nodes": ["node1", "node2", "..."]
+}}
+Stop after writing this file. The supervisor takes over.

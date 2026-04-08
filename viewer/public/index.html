@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Proof Tablet Viewer</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Menlo', 'Monaco', 'Courier New', monospace; font-size: 13px; background: #1a1a2e; color: #e0e0e0; display: flex; flex-direction: column; height: 100vh; }
+
+header { background: #16213e; padding: 8px 16px; display: flex; align-items: center; gap: 16px; border-bottom: 1px solid #333; }
+header h1 { font-size: 14px; color: #8be9fd; }
+header .status { color: #6272a4; font-size: 12px; }
+
+.main { display: flex; flex: 1; overflow: hidden; }
+
+.dag-pane { flex: 1; overflow: auto; padding: 16px; position: relative; }
+.detail-pane { width: 420px; border-left: 1px solid #333; overflow-y: auto; padding: 16px; background: #0f0f23; }
+.detail-pane h2 { font-size: 14px; color: #8be9fd; margin-bottom: 8px; }
+.detail-pane .field { margin-bottom: 12px; }
+.detail-pane .field-label { color: #6272a4; font-size: 11px; text-transform: uppercase; margin-bottom: 4px; }
+.detail-pane .field-value { white-space: pre-wrap; word-wrap: break-word; font-size: 12px; line-height: 1.5; }
+.detail-pane .collapsible { max-height: 120px; overflow: hidden; position: relative; cursor: pointer; }
+.detail-pane .collapsible.expanded { max-height: none; }
+.detail-pane .collapsible::after { content: '▼ click to expand'; display: block; text-align: center; color: #6272a4; font-size: 10px; padding: 4px; background: linear-gradient(transparent, #0f0f23); position: absolute; bottom: 0; left: 0; right: 0; }
+.detail-pane .collapsible.expanded::after { content: '▲ click to collapse'; position: static; background: none; }
+
+.feedback-panel { background: #1e1e3a; border: 1px solid #f1fa8c; border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+.feedback-panel h3 { color: #f1fa8c; font-size: 13px; margin-bottom: 8px; }
+.feedback-panel textarea { width: 100%; height: 80px; background: #0f0f23; color: #e0e0e0; border: 1px solid #444; border-radius: 4px; padding: 8px; font-family: inherit; font-size: 12px; resize: vertical; }
+.feedback-panel .btn { padding: 6px 16px; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; margin-right: 8px; margin-top: 8px; }
+.feedback-panel .btn-approve { background: #50fa7b; color: #1a1a2e; }
+.feedback-panel .btn-feedback { background: #f1fa8c; color: #1a1a2e; }
+.feedback-panel .btn:hover { opacity: 0.8; }
+.feedback-panel .msg { color: #8be9fd; font-size: 11px; margin-top: 6px; }
+
+.timeline { background: #16213e; padding: 8px 16px; border-top: 1px solid #333; display: flex; align-items: center; gap: 12px; }
+.timeline label { color: #6272a4; font-size: 12px; white-space: nowrap; }
+.timeline input[type=range] { flex: 1; }
+.timeline .cycle-info { color: #f1fa8c; font-size: 12px; min-width: 200px; }
+
+/* DAG nodes */
+svg { width: 100%; height: 100%; }
+.node rect { rx: 6; ry: 6; stroke-width: 2; cursor: pointer; }
+.node text { font-size: 11px; fill: #e0e0e0; pointer-events: none; }
+.node.closed rect { fill: #1e3a5f; stroke: #4a9eff; }
+.node.recursive-closed rect { fill: #1a3d2e; stroke: #50fa7b; }
+.node.active rect { fill: #3d3500; stroke: #f1fa8c; }
+.node.open rect { fill: #2a2a3d; stroke: #6272a4; }
+.node.error rect { fill: #3d1a1a; stroke: #ff5555; }
+.node.selected rect { stroke-width: 3; }
+.edge { fill: none; stroke: #444; stroke-width: 1.5; }
+.edge.to-closed { stroke: #4a9eff; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Proof Tablet Viewer</h1>
+  <div class="status" id="header-status">Loading...</div>
+</header>
+
+<div class="main">
+  <div class="dag-pane" id="dag-pane">
+    <svg id="dag-svg"></svg>
+  </div>
+  <div class="detail-pane" id="detail-pane">
+    <div id="feedback-container"></div>
+    <h2>Select a node</h2>
+    <p style="color:#6272a4">Click a node in the DAG to see details.</p>
+  </div>
+</div>
+
+<div class="timeline">
+  <label>Cycle:</label>
+  <input type="range" id="cycle-slider" min="0" max="0" value="0">
+  <div class="cycle-info" id="cycle-info">Current</div>
+</div>
+
+<script>
+// Dagre-lite: simple topological layered layout
+function layoutDAG(nodes, edges) {
+  // Topological sort (Kahn's)
+  const inDeg = {};
+  const adj = {};
+  for (const n of Object.keys(nodes)) { inDeg[n] = 0; adj[n] = []; }
+  for (const [from, to] of edges) {
+    if (adj[to]) adj[to].push(from);
+    if (inDeg[from] !== undefined) inDeg[from]++;
+  }
+
+  // Assign layers (longest path from leaves)
+  const layer = {};
+  const queue = Object.keys(nodes).filter(n => inDeg[n] === 0);
+  for (const n of queue) layer[n] = 0;
+
+  const visited = new Set();
+  const order = [];
+  const q = [...queue];
+  while (q.length) {
+    const n = q.shift();
+    if (visited.has(n)) continue;
+    visited.add(n);
+    order.push(n);
+    for (const child of (adj[n] || [])) {
+      layer[child] = Math.max(layer[child] || 0, (layer[n] || 0) + 1);
+      inDeg[child]--;
+      if (inDeg[child] <= 0) q.push(child);
+    }
+  }
+
+  // Handle unvisited nodes
+  for (const n of Object.keys(nodes)) {
+    if (!visited.has(n)) { layer[n] = 0; order.push(n); }
+  }
+
+  // Group by layer
+  const layers = {};
+  for (const [n, l] of Object.entries(layer)) {
+    if (!layers[l]) layers[l] = [];
+    layers[l].push(n);
+  }
+
+  // Position
+  const nodeW = 180, nodeH = 40, padX = 40, padY = 60;
+  const positions = {};
+  const maxLayer = Math.max(...Object.keys(layers).map(Number));
+
+  for (let l = 0; l <= maxLayer; l++) {
+    const nodesInLayer = layers[l] || [];
+    const totalW = nodesInLayer.length * (nodeW + padX) - padX;
+    let x = -totalW / 2;
+    for (const n of nodesInLayer) {
+      positions[n] = { x: x + nodeW / 2, y: l * (nodeH + padY) };
+      x += nodeW + padX;
+    }
+  }
+
+  return positions;
+}
+
+let allNodes = {}, allCycles = [], selectedNode = null, currentState = {};
+
+async function fetchData() {
+  const [nodesRes, stateRes, cyclesRes] = await Promise.all([
+    fetch('api/nodes.json').then(r => r.json()),
+    fetch('api/state.json').then(r => r.json()),
+    fetch('api/cycles.json').then(r => r.json()),
+  ]);
+  allNodes = nodesRes;
+  currentState = stateRes;
+  allCycles = cyclesRes;
+
+  document.getElementById('header-status').textContent =
+    `Cycle ${stateRes.state.cycle} | Phase: ${stateRes.state.phase} | ${Object.values(nodesRes).filter(n => n.status === 'closed').length}/${Object.keys(nodesRes).length} closed`;
+
+  // Setup slider
+  const slider = document.getElementById('cycle-slider');
+  slider.max = Math.max(stateRes.state.cycle, allCycles.length);
+  slider.value = slider.max;
+  updateCycleInfo();
+
+  renderDAG();
+  renderFeedbackPanel();
+}
+
+function isRecursivelyClosed(name, nodes) {
+  const node = nodes[name];
+  if (!node || node.status !== 'closed') return false;
+  for (const imp of (node.imports || [])) {
+    if (!isRecursivelyClosed(imp, nodes)) return false;
+  }
+  return true;
+}
+
+function getNodeClass(name, nodes) {
+  const node = nodes[name];
+  if (!node) return 'open';
+  if (currentState.state.active_node === name) return 'active';
+  if (isRecursivelyClosed(name, nodes)) return 'recursive-closed';
+  if (node.status === 'closed') return 'closed';
+  return 'open';
+}
+
+function renderDAG() {
+  const svg = document.getElementById('dag-svg');
+  svg.innerHTML = '';
+
+  const names = Object.keys(allNodes);
+  if (!names.length) return;
+
+  // Build edges: child -> parent (import direction)
+  const edges = [];
+  for (const [name, node] of Object.entries(allNodes)) {
+    for (const imp of (node.imports || [])) {
+      if (allNodes[imp]) edges.push([name, imp]); // name depends on imp
+    }
+  }
+
+  const positions = layoutDAG(allNodes, edges);
+
+  // Shift to positive coordinates
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of Object.values(positions)) {
+    minX = Math.min(minX, p.x); minY = Math.min(minY, p.y);
+    maxX = Math.max(maxX, p.x); maxY = Math.max(maxY, p.y);
+  }
+  const offX = -minX + 120, offY = -minY + 40;
+  for (const p of Object.values(positions)) { p.x += offX; p.y += offY; }
+
+  svg.setAttribute('viewBox', `0 0 ${maxX - minX + 280} ${maxY - minY + 120}`);
+
+  const ns = 'http://www.w3.org/2000/svg';
+
+  // Draw edges
+  for (const [from, to] of edges) {
+    const p1 = positions[from], p2 = positions[to];
+    if (!p1 || !p2) continue;
+    const line = document.createElementNS(ns, 'line');
+    line.setAttribute('x1', p1.x); line.setAttribute('y1', p1.y + 20);
+    line.setAttribute('x2', p2.x); line.setAttribute('y2', p2.y - 20);
+    line.setAttribute('class', 'edge' + (allNodes[to]?.status === 'closed' ? ' to-closed' : ''));
+    line.setAttribute('marker-end', 'url(#arrow)');
+    svg.appendChild(line);
+  }
+
+  // Arrow marker
+  const defs = document.createElementNS(ns, 'defs');
+  const marker = document.createElementNS(ns, 'marker');
+  marker.setAttribute('id', 'arrow'); marker.setAttribute('viewBox', '0 0 10 10');
+  marker.setAttribute('refX', '10'); marker.setAttribute('refY', '5');
+  marker.setAttribute('markerWidth', '8'); marker.setAttribute('markerHeight', '8');
+  marker.setAttribute('orient', 'auto-start-reverse');
+  const arrowPath = document.createElementNS(ns, 'path');
+  arrowPath.setAttribute('d', 'M 0 0 L 10 5 L 0 10 z'); arrowPath.setAttribute('fill', '#444');
+  marker.appendChild(arrowPath); defs.appendChild(marker); svg.appendChild(defs);
+
+  // Draw nodes
+  for (const [name, pos] of Object.entries(positions)) {
+    const node = allNodes[name];
+    if (!node) continue;
+    const cls = getNodeClass(name, allNodes);
+
+    const g = document.createElementNS(ns, 'g');
+    g.setAttribute('class', `node ${cls}` + (selectedNode === name ? ' selected' : ''));
+    g.setAttribute('transform', `translate(${pos.x - 90}, ${pos.y - 20})`);
+    g.style.cursor = 'pointer';
+    g.onclick = () => selectNode(name);
+
+    const rect = document.createElementNS(ns, 'rect');
+    rect.setAttribute('width', 180); rect.setAttribute('height', 40);
+    g.appendChild(rect);
+
+    // Label: title or name, truncated
+    const label = (node.title || name).substring(0, 24);
+    const text = document.createElementNS(ns, 'text');
+    text.setAttribute('x', 90); text.setAttribute('y', 24);
+    text.setAttribute('text-anchor', 'middle');
+    text.textContent = label;
+    g.appendChild(text);
+
+    svg.appendChild(g);
+  }
+}
+
+function selectNode(name) {
+  selectedNode = name;
+  renderDAG();
+  renderDetail(name);
+}
+
+function renderDetail(name) {
+  const pane = document.getElementById('detail-pane');
+  const node = allNodes[name];
+  if (!node) { pane.innerHTML = '<h2>Node not found</h2>'; return; }
+
+  const statusColor = {
+    'closed': '#4a9eff',
+    'open': '#6272a4',
+  }[node.status] || '#6272a4';
+
+  pane.innerHTML = `
+    <h2 style="color:${statusColor}">${node.title || name}</h2>
+    <div class="field">
+      <div class="field-label">Name</div>
+      <div class="field-value">${name}</div>
+    </div>
+    <div class="field">
+      <div class="field-label">Status</div>
+      <div class="field-value" style="color:${statusColor}">${node.status} (${node.kind})</div>
+    </div>
+    <div class="field">
+      <div class="field-label">Imports</div>
+      <div class="field-value">${(node.imports || []).join(', ') || 'none'}</div>
+    </div>
+    <div class="field">
+      <div class="field-label">Sorry</div>
+      <div class="field-value">${node.hasSorry ? '⚠ yes' : '✓ no'}</div>
+    </div>
+    <div class="field">
+      <div class="field-label">Lean Declaration</div>
+      <div class="field-value" style="color:#f8f8f2">${escHtml(node.declaration || '(none)')}</div>
+    </div>
+    <div class="field">
+      <div class="field-label">NL Content (.tex)</div>
+      <div class="field-value collapsible" onclick="this.classList.toggle('expanded')">${escHtml(node.texContent || '(none)')}</div>
+    </div>
+    <div class="field">
+      <div class="field-label">Lean Proof</div>
+      <div class="field-value collapsible" onclick="this.classList.toggle('expanded')">${escHtml(node.leanContent || '(none)')}</div>
+    </div>
+  `;
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function updateCycleInfo() {
+  const slider = document.getElementById('cycle-slider');
+  const val = parseInt(slider.value);
+  const cycle = allCycles.find(c => c.cycle === val);
+  const info = document.getElementById('cycle-info');
+  if (cycle) {
+    info.textContent = `Cycle ${val}: ${cycle.outcome?.outcome || '?'} | ${cycle.tablet_summary?.total_nodes || '?'} nodes | ${cycle.duration_seconds?.toFixed(0) || '?'}s`;
+  } else {
+    info.textContent = val === parseInt(slider.max) ? 'Current' : `Cycle ${val}`;
+  }
+}
+
+document.getElementById('cycle-slider').addEventListener('input', updateCycleInfo);
+
+function renderFeedbackPanel() {
+  const container = document.getElementById('feedback-container');
+  const phase = currentState?.state?.phase || '';
+  const lastReview = currentState?.state?.last_review || {};
+  const decision = lastReview.decision || '';
+  const stopped = !currentState?.state?.cycle; // crude check
+
+  // Show feedback panel when in theorem_stating or when awaiting input
+  if (phase === 'theorem_stating' || decision === 'NEED_INPUT' || decision === 'ADVANCE_PHASE') {
+    container.innerHTML = `
+      <div class="feedback-panel">
+        <h3>Human Review (${phase})</h3>
+        <p style="color:#6272a4; font-size:11px; margin-bottom:8px">
+          ${decision === 'ADVANCE_PHASE' ? 'Reviewer wants to advance. Approve or give feedback.' :
+            decision === 'NEED_INPUT' ? 'Reviewer requested human input.' :
+            'Review the tablet structure and provide feedback.'}
+        </p>
+        <textarea id="feedback-text" placeholder="Enter feedback for the worker (or leave empty to approve)..."></textarea>
+        <div>
+          <button class="btn btn-approve" onclick="submitFeedback('approve')">✓ Approve & Advance</button>
+          <button class="btn btn-feedback" onclick="submitFeedback('feedback')">↩ Send Feedback</button>
+        </div>
+        <div class="msg" id="feedback-msg"></div>
+      </div>
+    `;
+  } else {
+    container.innerHTML = '';
+  }
+}
+
+async function submitFeedback(action) {
+  const text = document.getElementById('feedback-text')?.value || '';
+  const msg = document.getElementById('feedback-msg');
+  try {
+    const resp = await fetch('api/feedback', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ action, feedback: text }),
+    });
+    const data = await resp.json();
+    if (msg) msg.textContent = data.message || data.error || 'Done';
+  } catch (e) {
+    if (msg) msg.textContent = 'Error: ' + e.message;
+  }
+}
+
+// Auto-refresh every 30s
+fetchData();
+setInterval(fetchData, 30000);
+</script>
+</body>
+</html>

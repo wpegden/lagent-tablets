@@ -248,6 +248,14 @@ def check_node(
         errors.append(f"Forbidden keywords: {[h['keyword'] for h in non_sorry]}")
     sorry_in_source = any(h["keyword"] == "sorry" for h in hits)
 
+    # Sorry in definitions (always forbidden, even when sorry is allowed in theorems)
+    from lagent_tablets.tablet import scan_sorry_in_definitions
+    def_sorry_hits = scan_sorry_in_definitions(content)
+    if def_sorry_hits:
+        keyword_clean = False
+        for h in def_sorry_hits:
+            errors.append(f"sorry in definition at line {h['line']}: {h['text']}")
+
     # Compilation
     build = run_lake_env_lean(repo, name, timeout_secs=timeout_secs)
     compiles = build["ok"]

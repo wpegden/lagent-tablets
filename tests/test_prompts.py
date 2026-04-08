@@ -237,7 +237,6 @@ class TestVerificationPrompt(unittest.TestCase):
         self.assertIn("main_thm", prompt)
         self.assertIn("CORRESPONDENCE", prompt.upper())
         self.assertIn("FAITHFULNESS", prompt.upper())
-        self.assertIn("SOUNDNESS", prompt.upper())
         self.assertIn("APPROVE", prompt)
 
     def test_includes_paper(self):

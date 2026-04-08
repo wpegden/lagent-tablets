@@ -1,0 +1,59 @@
+{
+  "repo_path": "/home/leanagent/math/connectivity_gnp_tablets",
+  "goal_file": "GOAL.md",
+  "state_dir": ".agent-supervisor",
+  "max_cycles": 5,
+  "sleep_seconds": 2.0,
+  "startup_timeout_seconds": 120.0,
+  "burst_timeout_seconds": 7200,
+  "worker": {
+    "provider": "gemini",
+    "model": "gemini-3.1-pro-preview",
+    "extra_args": []
+  },
+  "reviewer": {
+    "provider": "claude",
+    "model": "opus",
+    "effort": "high"
+  },
+  "verification": {
+    "provider": "gemini",
+    "model": "gemini-3.1-pro-preview",
+    "effort": null,
+    "thinking_budget": null,
+    "max_context_tokens": 50000
+  },
+  "tmux": {
+    "session_name": "gnp_tablets_gemini_pro",
+    "dashboard_window_name": "dashboard",
+    "kill_windows_after_capture": false,
+    "burst_user": "lagentworker",
+    "burst_group": "leanagent"
+  },
+  "workflow": {
+    "start_phase": "proof_formalization",
+    "paper_tex_path": "paper/connectivity_threshold_gnp.tex",
+    "approved_axioms_path": "APPROVED_AXIOMS.json",
+    "allowed_import_prefixes": [
+      "Mathlib"
+    ],
+    "forbidden_keyword_allowlist": [],
+    "human_input_path": "HUMAN_INPUT.md",
+    "input_request_path": "INPUT_REQUEST.md"
+  },
+  "chat": {
+    "root_dir": "/tmp/lagent-gnp-chats",
+    "repo_name": "connectivity-gnp-gemini-pro",
+    "project_name": "Connectivity Threshold G(n,p) - Gemini Pro"
+  },
+  "git": {
+    "remote_url": null,
+    "remote_name": "origin",
+    "branch": "main",
+    "author_name": "lagent-supervisor",
+    "author_email": "lagent@localhost"
+  },
+  "branching": {
+    "max_current_branches": 1
+  }
+}

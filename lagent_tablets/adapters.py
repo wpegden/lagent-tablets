@@ -18,7 +18,7 @@ class ProviderConfig:
     model: Optional[str] = None
     effort: Optional[str] = None  # claude: low/medium/high/max
     extra_args: List[str] = field(default_factory=list)
-    fallback_model: Optional[str] = None
+    fallback_models: List[str] = field(default_factory=list)  # ordered most→least powerful
 
 
 @dataclass
@@ -32,6 +32,7 @@ class BurstResult:
     usage: Optional[Dict[str, Any]] = None
     error: str = ""
     recovery_log: List[str] = field(default_factory=list)
+    transcript_path: Optional[Path] = None  # path to saved agent chat transcript
 
 
 @dataclass

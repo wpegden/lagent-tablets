@@ -1,0 +1,41 @@
+{
+  "repo_path": "/home/leanagent/math/connectivity_gnp_tablets",
+  "goal_file": "GOAL.md",
+  "state_dir": ".agent-supervisor",
+  "max_cycles": 0,
+  "sleep_seconds": 1.0,
+  "startup_timeout_seconds": 120.0,
+  "burst_timeout_seconds": 300,
+  "worker": {
+    "provider": "gemini",
+    "model": "auto"
+  },
+  "reviewer": {
+    "provider": "claude",
+    "model": "claude-opus-4-6"
+  },
+  "verification": {
+    "provider": "claude",
+    "model": "claude-opus-4-6",
+    "correspondence_agents": [
+      {"provider": "claude", "model": "claude-opus-4-6", "label": "Claude Opus"},
+      {"provider": "gemini", "model": "auto", "label": "Gemini Auto",
+       "fallback_models": ["gemini-3.1-pro-preview", "gemini-3-flash-preview"]}
+    ]
+  },
+  "tmux": {
+    "session_name": "gnp_tablets_full",
+    "burst_user": "lagentworker",
+    "burst_group": "leanagent"
+  },
+  "workflow": {
+    "start_phase": "proof_formalization",
+    "paper_tex_path": "paper/connectivity_threshold_gnp.tex",
+    "allowed_import_prefixes": ["Mathlib"]
+  },
+  "chat": {
+    "root_dir": "/tmp/lagent-gnp-chats",
+    "repo_name": "test-multi-corr"
+  },
+  "git": {}
+}

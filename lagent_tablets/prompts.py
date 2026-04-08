@@ -27,6 +27,17 @@ from lagent_tablets.tablet import (
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
 
+def _human_input_section(state) -> str:
+    """Return a human feedback section if there's active feedback."""
+    if hasattr(state, 'human_input') and state.human_input and state.human_input.strip():
+        at_cycle = getattr(state, 'human_input_at_cycle', 0)
+        current = getattr(state, 'cycle', 0)
+        age = current - at_cycle if at_cycle and current else 0
+        age_str = f", {age} cycle{'s' if age != 1 else ''} ago" if age > 0 else ""
+        return f"--- HUMAN FEEDBACK (received at cycle {at_cycle}{age_str}) ---\n{state.human_input}\n"
+    return ""
+
+
 def _load_template(name: str) -> str:
     """Load a prompt template from the prompts/ directory."""
     path = PROMPTS_DIR / name
@@ -60,8 +71,8 @@ def _tablet_status_text(tablet: TabletState, repo_path: Path) -> str:
     m = tablet.metrics()
     lines.append(f"Tablet: {m['closed_nodes']}/{m['total_nodes']} nodes closed")
     lines.append("")
-    lines.append("| Name | Kind | Status | Title | Imports |")
-    lines.append("|------|------|--------|-------|---------|")
+    lines.append("| Name | Kind | Status | Difficulty | Title | Imports |")
+    lines.append("|------|------|--------|------------|-------|---------|")
 
     for name in sorted(tablet.nodes.keys()):
         node = tablet.nodes[name]
@@ -73,7 +84,10 @@ def _tablet_status_text(tablet: TabletState, repo_path: Path) -> str:
             imports = extract_tablet_imports(lean_path.read_text(encoding="utf-8"))
             imports_str = ", ".join(imports) if imports else "-"
         status_marker = "CLOSED" if node.status == "closed" else "open"
-        lines.append(f"| {name} | {node.kind} | {status_marker} | {node.title} | {imports_str} |")
+        diff_marker = node.difficulty
+        if node.easy_attempts > 0:
+            diff_marker += f" ({node.easy_attempts} attempts)"
+        lines.append(f"| {name} | {node.kind} | {status_marker} | {diff_marker} | {node.title} | {imports_str} |")
 
     return "\n".join(lines)
 
@@ -83,7 +97,9 @@ def _active_node_context(
     tablet: TabletState,
     repo_path: Path,
 ) -> str:
-    """Build detailed context for the active node."""
+    """Build context for the active node: its .lean file, and the .lean
+    declarations of its children. The worker is told to read .tex files
+    from disk as needed."""
     node = tablet.nodes.get(node_name)
     if not node:
         return f"Active node '{node_name}' not found in tablet."
@@ -97,36 +113,28 @@ def _active_node_context(
         lines.append(f"Paper reference: {node.paper_provenance}")
     lines.append("")
 
-    # NL statement and proof from .tex
-    tex_path = node_tex_path(repo_path, node_name)
-    if tex_path.exists():
-        lines.append("--- NL content (.tex) ---")
-        lines.append(_read_file(tex_path))
-        lines.append("")
-
-    # Current Lean file
+    # Current Lean file (the worker needs this to know what to prove)
     lean_path = node_lean_path(repo_path, node_name)
     if lean_path.exists():
-        lines.append("--- Current Lean file (.lean) ---")
+        lines.append(f"--- {node_name}.lean ---")
         lines.append(_read_file(lean_path))
         lines.append("")
 
-    # Imported node declarations (what's available to the proof)
+    # Children's Lean declarations (what's available to import)
     if lean_path.exists():
         imports = extract_tablet_imports(lean_path.read_text(encoding="utf-8"))
         if imports:
-            lines.append("--- Available from imports ---")
+            lines.append("--- Imported nodes ---")
             for imp_name in imports:
-                imp_node = tablet.nodes.get(imp_name)
                 imp_lean = node_lean_path(repo_path, imp_name)
-                if imp_node and imp_lean.exists():
-                    content = imp_lean.read_text(encoding="utf-8")
-                    # Extract just the declaration line
-                    from lagent_tablets.tablet import declaration_line
-                    decl = declaration_line(content)
-                    status = "CLOSED" if imp_node.status == "closed" else "open"
-                    lines.append(f"  {imp_name} ({status}): {decl or '(declaration not found)'}")
+                if imp_lean.exists():
+                    lines.append(f"--- {imp_name}.lean ---")
+                    lines.append(_read_file(imp_lean))
             lines.append("")
+
+    lines.append(f"Read `Tablet/{node_name}.tex` and any other `.tex` files for NL context.")
+    lines.append(f"You have read access to all files in `Tablet/`.")
+    lines.append("")
 
     return "\n".join(lines)
 
@@ -211,6 +219,7 @@ def build_worker_prompt(
     policy: Policy,
     *,
     previous_outcome: Optional[Dict[str, Any]] = None,
+    difficulty: str = "hard",
 ) -> str:
     """Build the complete worker prompt."""
     node_name = state.active_node or tablet.active_node
@@ -218,10 +227,20 @@ def build_worker_prompt(
 
     sections = []
 
-    # 1. Role and goal
-    goal_text = _read_file(config.goal_file, "(No goal file found)")
-    sections.append("You are a Lean 4 formalization worker.\n")
-    sections.append(f"GOAL:\n{goal_text}\n")
+    # 1. Basic model + role
+    sections.append(_load_template("basic_model.md"))
+    if difficulty == "easy":
+        sections.append(f"YOUR ROLE: **Worker** (proof_formalization phase, EASY node). You are proving `{node_name}` using ONLY its existing children. No new imports, no new files.\n")
+    else:
+        sections.append("YOUR ROLE: **Worker** (proof_formalization phase). You are eliminating `sorry` from one node at a time. You do not decide which node to work on -- the reviewer assigns your node.\n")
+    goal_text = _read_file(config.goal_file)
+    if goal_text.strip():
+        sections.append(f"GOAL:\n{goal_text}\n")
+
+    # Human feedback (persistent across cycles)
+    hi = _human_input_section(state)
+    if hi:
+        sections.append(hi)
 
     # 2. Feedback from previous cycle
     feedback = _previous_cycle_feedback(state, previous_outcome)
@@ -234,7 +253,12 @@ def build_worker_prompt(
     # 4. Tablet status
     sections.append(_tablet_status_text(tablet, repo_path))
 
-    # 5. Plan and tasks
+    # 5. Source paper
+    if config.workflow.paper_tex_path and config.workflow.paper_tex_path.exists():
+        paper = _read_file(config.workflow.paper_tex_path)
+        sections.append(f"--- SOURCE PAPER ---\n{_trim(paper, 20000)}\n")
+
+    # 6. Plan and tasks
     plan_text = _read_file(config.repo_path / "PLAN.md")
     if plan_text.strip():
         sections.append(f"--- PLAN.md ---\n{_trim(plan_text, 5000)}\n")
@@ -243,52 +267,206 @@ def build_worker_prompt(
     if tasks_text.strip():
         sections.append(f"--- TASKS.md ---\n{_trim(tasks_text, 5000)}\n")
 
-    # 6. Instructions
+    # 7. Instructions
     check_node = config.state_dir / "scripts" / "check_node.sh"
     check_tablet = config.state_dir / "scripts" / "check_tablet.sh"
 
-    sections.append(f"""--- INSTRUCTIONS ---
+    # Skill file reference
+    skill_path = repo_path / ".agent-supervisor" / "skills" / "LEAN_WORKER.md"
+    if not skill_path.exists():
+        skill_path = Path(__file__).resolve().parent.parent / "skills" / "LEAN_WORKER.md"
 
-YOUR ACTIVE NODE: `{node_name}`
-YOUR SINGLE GOAL: Eliminate the `sorry` in `Tablet/{node_name}.lean`.
-
-IMPORTANT WORKFLOW:
-1. Work ONLY on `Tablet/{node_name}.lean`. Do NOT edit any other node's .lean file.
-2. When you have a result -- whether the proof compiles, you need helpers, or you're stuck -- STOP IMMEDIATELY and write `worker_handoff.json`.
-3. Do NOT move on to other nodes. The reviewer decides what to work on next.
-
-You may:
-- Edit the proof body (everything after `:=`) in `Tablet/{node_name}.lean`
-- Add or remove `import Tablet.*` or `import Mathlib.*` lines in `Tablet/{node_name}.lean`
-- Add `import Mathlib.*` lines to `Tablet/Preamble.lean` (additions only, no removals)
-- Create new helper nodes: write both `Tablet/{{name}}.lean` and `Tablet/{{name}}.tex` files
-- Update `Tablet/{node_name}.tex` to reflect new helpers in your NL proof
-- Update the STRATEGY comment block with your approach, blockers, and failed attempts
-
-You must NOT:
-- Edit any other existing node's `.lean` file (they are read-only)
-- Modify the declaration line (`theorem {node_name} ...` -- this is frozen)
-- Add `axiom`, `constant`, `unsafe`, `native_decide`, or other forbidden keywords
-- Import anything other than `Tablet.*` or `Mathlib.*`
-- Delegate to sub-agents or use web search (work directly, do not delegate)
-
-MANDATORY BEFORE SUBMITTING: Run the self-check and fix any errors:
-  {check_node} {node_name}
-You MUST iterate until check_node.sh reports "Compiles: OK" before writing worker_handoff.json.
-If check_node.sh reports compilation errors, fix them and run it again.
-
-WHEN DONE -- write `worker_handoff.json` IMMEDIATELY with:
-{{
-  "summary": "brief description of what you did",
-  "status": "NOT_STUCK | STUCK | DONE | NEED_INPUT",
-  "new_nodes": ["list", "of", "new", "node", "names"]
-}}
-Do NOT continue working after writing this file. Stop and let the supervisor take over.
-""")
+    template_name = "easy_worker_instructions.md" if difficulty == "easy" else "worker_instructions.md"
+    instructions = _load_template(template_name).format(
+        node_name=node_name,
+        skill_path=skill_path,
+        check_node=check_node,
+    )
+    sections.append(instructions)
 
     # 7. Policy notes
     if policy.prompt_notes.worker:
         sections.append(f"--- ADDITIONAL NOTES ---\n{policy.prompt_notes.worker}\n")
+
+    return "\n".join(sections)
+
+
+# ---------------------------------------------------------------------------
+# Theorem-stating worker prompt
+# ---------------------------------------------------------------------------
+
+def build_theorem_stating_prompt(
+    config: Config,
+    state: SupervisorState,
+    tablet: TabletState,
+    policy: Policy,
+    *,
+    previous_outcome: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Build the worker prompt for the theorem_stating phase.
+
+    The worker must:
+    1. Read the paper and goal
+    2. Create Tablet nodes (.lean + .tex pairs) for each main result and key intermediate step
+    3. Set up Preamble.lean with ONLY the specific Mathlib imports needed (never bare `import Mathlib`)
+    4. Write the Tablet.lean root import file
+    5. Ensure `lake build Tablet` passes (sorry is allowed in this phase)
+    """
+    repo_path = config.repo_path
+    sections = []
+
+    # 1. Basic model + role
+    sections.append(_load_template("basic_model.md"))
+    sections.append("YOUR ROLE: **Worker** (theorem_stating phase). You are creating the tablet structure -- declaring nodes with Lean statements and rigorous NL proofs. You are NOT proving theorems in Lean yet; `sorry` is expected.\n")
+    goal_text = _read_file(config.goal_file)
+    if goal_text.strip():
+        sections.append(f"GOAL:\n{goal_text}\n")
+
+    hi = _human_input_section(state)
+    if hi:
+        sections.append(hi)
+
+    # 2. Paper content
+    if config.workflow.paper_tex_path and config.workflow.paper_tex_path.exists():
+        paper = _read_file(config.workflow.paper_tex_path)
+        sections.append(f"--- SOURCE PAPER ---\n{_trim(paper, 30000)}\n")
+
+    # 3. Feedback from previous cycle
+    if state.last_review:
+        next_prompt = state.last_review.get("next_prompt", "")
+        if next_prompt:
+            sections.append(f"REVIEWER GUIDANCE:\n{next_prompt}\n")
+
+    # 4. Current tablet state (may be empty on first cycle)
+    if tablet.nodes:
+        sections.append(_tablet_status_text(tablet, repo_path))
+        sections.append("")
+        # Show existing files
+        for name in sorted(tablet.nodes.keys()):
+            if name == PREAMBLE_NAME:
+                continue
+            lean_path = node_lean_path(repo_path, name)
+            tex_path = node_tex_path(repo_path, name)
+            if lean_path.exists():
+                sections.append(f"--- {name}.lean ---\n{_read_file(lean_path)}\n")
+            if tex_path.exists():
+                sections.append(f"--- {name}.tex ---\n{_read_file(tex_path)}\n")
+    else:
+        sections.append("The tablet is currently empty. You are creating it from scratch.\n")
+
+    # 5. Preamble
+    preamble_path = repo_path / "Tablet" / "Preamble.lean"
+    if preamble_path.exists():
+        sections.append(f"--- Current Preamble.lean ---\n{_read_file(preamble_path)}\n")
+
+    # Skill file reference (theorem_stating uses its own skill file)
+    skill_path = repo_path / ".agent-supervisor" / "skills" / "LEAN_THEOREM_STATING.md"
+    if not skill_path.exists():
+        skill_path = Path(__file__).resolve().parent.parent / "skills" / "LEAN_THEOREM_STATING.md"
+
+    # 6. Instructions
+    instructions = _load_template("theorem_stating_instructions.md").format(
+        skill_path=skill_path,
+    )
+    sections.append(instructions)
+
+    if policy.prompt_notes.worker:
+        sections.append(f"--- ADDITIONAL NOTES ---\n{policy.prompt_notes.worker}\n")
+
+    return "\n".join(sections)
+
+
+# ---------------------------------------------------------------------------
+# Theorem-stating reviewer prompt
+# ---------------------------------------------------------------------------
+
+def build_theorem_stating_reviewer_prompt(
+    config: Config,
+    state: SupervisorState,
+    tablet: TabletState,
+    policy: Policy,
+    *,
+    worker_handoff: Optional[Dict[str, Any]] = None,
+    worker_output: str = "",
+    nl_verification: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    """Build the reviewer prompt for the theorem_stating phase."""
+    sections = []
+
+    sections.append(_load_template("basic_model.md"))
+    sections.append("YOUR ROLE: **Reviewer** (theorem_stating phase). You evaluate whether the worker's tablet structure is correct and complete. You decide whether to continue refining or advance to proof_formalization. You are the final arbiter on NL verification disputes.\n")
+    goal_text = _read_file(config.goal_file)
+    if goal_text.strip():
+        sections.append(f"GOAL:\n{goal_text}\n")
+
+    hi = _human_input_section(state)
+    if hi:
+        sections.append(hi)
+
+    # Paper
+    if config.workflow.paper_tex_path and config.workflow.paper_tex_path.exists():
+        paper = _read_file(config.workflow.paper_tex_path)
+        sections.append(f"--- SOURCE PAPER ---\n{_trim(paper, 20000)}\n")
+
+    # Current tablet
+    if tablet.nodes:
+        sections.append(_tablet_status_text(tablet, config.repo_path))
+        sections.append("")
+        for name in sorted(tablet.nodes.keys()):
+            if name == PREAMBLE_NAME:
+                continue
+            lean_path = node_lean_path(config.repo_path, name)
+            tex_path = node_tex_path(config.repo_path, name)
+            if lean_path.exists():
+                sections.append(f"--- {name}.lean ---\n{_read_file(lean_path)}\n")
+            if tex_path.exists():
+                sections.append(f"--- {name}.tex ---\n{_read_file(tex_path)}\n")
+
+    # Worker handoff
+    if worker_handoff:
+        sections.append(f"--- WORKER HANDOFF ---\n{json.dumps(worker_handoff, indent=2)}\n")
+
+    # Worker output
+    if worker_output:
+        sections.append(f"--- WORKER OUTPUT (trimmed) ---\n{_trim(worker_output, 15000)}\n")
+
+    # NL verification results
+    if nl_verification:
+        sections.append("--- NL VERIFICATION RESULTS ---")
+        for result in nl_verification:
+            check_type = result.get("check", "verification")
+            overall = result.get("overall", "?")
+            summary = result.get("summary", "")
+            sections.append(f"  {check_type}: {overall}")
+            if summary:
+                sections.append(f"    {summary}")
+            for key in ("correspondence", "paper_faithfulness", "soundness"):
+                sub = result.get(key, {})
+                if isinstance(sub, dict) and sub.get("issues"):
+                    for issue in sub["issues"]:
+                        sections.append(f"    [{key}] {issue.get('node', '?')}: {issue.get('description', '')}")
+        sections.append("")
+
+    # Skill file reference
+    skill_path = config.repo_path / ".agent-supervisor" / "skills" / "LEAN_REVIEWER.md"
+    if not skill_path.exists():
+        skill_path = Path(__file__).resolve().parent.parent / "skills" / "LEAN_REVIEWER.md"
+
+    # Recent reviews
+    if state.review_log:
+        recent = state.review_log[-5:]
+        sections.append("--- RECENT REVIEWS ---")
+        for entry in recent:
+            sections.append(f"  Cycle {entry.get('cycle', '?')}: {entry.get('decision', '?')} -- {entry.get('reason', '')[:100]}")
+        sections.append("")
+
+    instructions = _load_template("theorem_stating_reviewer_instructions.md").format(
+        skill_path=skill_path,
+    )
+    sections.append(instructions)
+
+    if policy.prompt_notes.reviewer:
+        sections.append(f"--- ADDITIONAL NOTES ---\n{policy.prompt_notes.reviewer}\n")
 
     return "\n".join(sections)
 
@@ -311,13 +489,24 @@ def build_reviewer_prompt(
     """Build the complete reviewer prompt."""
     sections = []
 
-    goal_text = _read_file(config.goal_file, "(No goal file found)")
-    sections.append("You are the reviewer supervising a Lean formalization project.\n")
-    sections.append(f"GOAL:\n{goal_text}\n")
+    sections.append(_load_template("basic_model.md"))
+    sections.append("YOUR ROLE: **Reviewer** (proof_formalization phase). You evaluate the worker's proof attempts, choose which node to assign next, and provide specific mathematical guidance. You are the final arbiter on NL verification disputes.\n")
+    goal_text = _read_file(config.goal_file)
+    if goal_text.strip():
+        sections.append(f"GOAL:\n{goal_text}\n")
+
+    hi = _human_input_section(state)
+    if hi:
+        sections.append(hi)
+
+    # Paper
+    if config.workflow.paper_tex_path and config.workflow.paper_tex_path.exists():
+        paper = _read_file(config.workflow.paper_tex_path)
+        sections.append(f"--- SOURCE PAPER ---\n{_trim(paper, 20000)}\n")
 
     # Tablet status
     sections.append(_tablet_status_text(tablet, config.repo_path))
-    sections.append("")
+    sections.append(f"\nYou have read access to all tablet files in `Tablet/`.\n")
 
     # Worker handoff
     if worker_handoff:
@@ -351,22 +540,50 @@ def build_reviewer_prompt(
     if nl_verification:
         sections.append("--- NL VERIFICATION RESULTS ---")
         if isinstance(nl_verification, list):
-            # Multiple verification agents were consulted
-            sections.append(f"{len(nl_verification)} verification agent(s) were consulted:")
+            sections.append(f"{len(nl_verification)} verification check(s) were run:")
             for i, result in enumerate(nl_verification, 1):
-                sections.append(f"\n  Agent {i}: {result.get('overall', '?')}")
+                check_name = result.get("check", f"check-{i}")
+                overall = result.get("overall", "?")
                 summary = result.get("summary", "")
-                if summary:
-                    sections.append(f"  Summary: {summary}")
-                for phase in ("correspondence", "paper_faithfulness", "soundness"):
-                    phase_result = result.get(phase, {})
-                    if isinstance(phase_result, dict):
-                        decision = phase_result.get("decision", "?")
-                        issues = phase_result.get("issues", [])
-                        if issues:
-                            sections.append(f"  {phase}: {decision}")
-                            for issue in issues:
-                                sections.append(f"    - {issue.get('node', '?')}: {issue.get('description', '')}")
+
+                # Multi-agent correspondence results
+                agent_results = result.get("agent_results")
+                if agent_results and overall == "DISAGREE":
+                    sections.append(f"\n  {check_name}: **AGENTS DISAGREE** -- you must arbitrate")
+                    if summary:
+                        sections.append(f"  {summary}")
+                    for ar in agent_results:
+                        agent_label = ar.get("agent", "?")
+                        agent_overall = ar.get("overall", "?")
+                        agent_summary = ar.get("summary", "")
+                        sections.append(f"\n    [{agent_label}] -> {agent_overall}")
+                        if agent_summary:
+                            sections.append(f"      Summary: {agent_summary}")
+                        for phase in ("correspondence", "paper_faithfulness"):
+                            phase_result = ar.get(phase, {})
+                            if isinstance(phase_result, dict):
+                                issues = phase_result.get("issues", [])
+                                if issues:
+                                    sections.append(f"      {phase}: {phase_result.get('decision', '?')}")
+                                    for issue in issues:
+                                        sections.append(f"        - {issue.get('node', '?')}: {issue.get('description', '')}")
+                elif agent_results:
+                    sections.append(f"\n  {check_name}: {overall} (unanimous from {len(agent_results)} agents)")
+                    if summary:
+                        sections.append(f"  {summary}")
+                else:
+                    sections.append(f"\n  {check_name}: {overall}")
+                    if summary:
+                        sections.append(f"  Summary: {summary}")
+                    for phase in ("correspondence", "paper_faithfulness", "soundness"):
+                        phase_result = result.get(phase, {})
+                        if isinstance(phase_result, dict):
+                            decision = phase_result.get("decision", "?")
+                            issues = phase_result.get("issues", [])
+                            if issues:
+                                sections.append(f"  {phase}: {decision}")
+                                for issue in issues:
+                                    sections.append(f"    - {issue.get('node', '?')}: {issue.get('description', '')}")
             sections.append("\nReview these results and decide whether to accept or reject the changes.")
         else:
             sections.append(json.dumps(nl_verification, indent=2))
@@ -387,35 +604,16 @@ def build_reviewer_prompt(
             sections.append(f"  Cycle {entry.get('cycle', '?')}: {entry.get('decision', '?')} -- {entry.get('reason', '')[:100]}")
         sections.append("")
 
+    # Skill file reference
+    skill_path = config.repo_path / ".agent-supervisor" / "skills" / "LEAN_REVIEWER.md"
+    if not skill_path.exists():
+        skill_path = Path(__file__).resolve().parent.parent / "skills" / "LEAN_REVIEWER.md"
+
     # Instructions
-    sections.append(f"""--- YOUR DECISION ---
-
-Decide what to do next. Return a JSON decision:
-{{
-  "decision": "CONTINUE | ADVANCE_PHASE | STUCK | NEED_INPUT | DONE",
-  "confidence": 0.0,
-  "reason": "brief explanation",
-  "next_prompt": "specific guidance for the worker's next cycle",
-  "next_active_node": "name of the node the worker should focus on next",
-  "suggest_branch": false
-}}
-
-Guidelines:
-- CONTINUE: the worker is making progress. Pick the most impactful node to work on next.
-- ADVANCE_PHASE: all proof_formalization work is done (every node closed). Move to cleanup.
-- STUCK: the worker has tried multiple approaches and is not making progress. This triggers stuck recovery.
-- NEED_INPUT: a human needs to provide mathematical guidance.
-- DONE: the entire project is complete.
-
-For next_active_node: pick the node that is most uncertain, most blocking, or most impactful.
-Focus on nodes whose dependencies are already closed (they can be proved now).
-
-If NL verification results are shown above, review them carefully. Verification agents may
-disagree. You are the final arbiter:
-- If verification agents approve unanimously: accept the changes.
-- If verification agents reject: you may override if you believe the rejection is wrong, but explain why.
-- If agents disagree: weigh their reasoning and make a judgment call.
-""")
+    instructions = _load_template("reviewer_instructions.md").format(
+        skill_path=skill_path,
+    )
+    sections.append(instructions)
 
     if policy.prompt_notes.reviewer:
         sections.append(f"--- ADDITIONAL NOTES ---\n{policy.prompt_notes.reviewer}\n")
@@ -427,48 +625,16 @@ disagree. You are the final arbiter:
 # Verification model prompt
 # ---------------------------------------------------------------------------
 
-def build_verification_prompt(
+def _node_check_list(
     config: Config,
     tablet: TabletState,
-    *,
-    new_nodes: List[str],
-    modified_nodes: List[str],
-    paper_tex: str = "",
-    max_context_tokens: int = 50000,
-) -> str:
-    """Build the NL verification model prompt.
-
-    Combined prompt for correspondence, paper-faithfulness, and soundness checks.
-    """
+    node_names: List[str],
+) -> List[str]:
+    """Build the node listing sections shared by both verification prompts."""
     sections = []
-
-    sections.append("""You are a mathematical verification agent. Your job is to check the natural language
-mathematics of a proof tablet -- a DAG of theorem nodes, each with an NL statement and NL proof.
-
-You must check three things for the nodes listed below:
-
-A) NL/LEAN CORRESPONDENCE: Does the Lean statement fully capture ALL mathematical claims made
-   by the NL statement? The Lean must formalize EVERY claim in the NL -- if the NL mentions
-   graphs, probability, or any mathematical structure that the Lean omits, that is a FAIL.
-   A Lean statement that proves only PART of the NL claim is NOT a valid correspondence.
-   Check: quantifier scope, type constraints, implicit assumptions, domain-specific context.
-
-B) PAPER-FAITHFULNESS: Is each new node a genuine, non-trivial intermediate step toward proving
-   the paper's main results? Does it represent real mathematical progress, or does it merely
-   repackage the difficulty without reducing it?
-
-C) NL PROOF SOUNDNESS: Does each NL proof rigorously establish the stated result from the NL
-   statements of its imported nodes? Check for gaps, circular reasoning, unstated assumptions,
-   and placeholder language ("trivial", "obvious", "left to the reader", etc.).
-
-Think carefully and systematically. Do not accept vague or hand-wavy arguments.
-""")
-
-    # Nodes to check
-    all_check = set(new_nodes) | set(modified_nodes)
-    if all_check:
+    if node_names:
         sections.append("=== NODES TO CHECK ===\n")
-        for name in sorted(all_check):
+        for name in sorted(node_names):
             node = tablet.nodes.get(name)
             if not node:
                 continue
@@ -482,14 +648,14 @@ Think carefully and systematically. Do not accept vague or hand-wavy arguments.
             sections.append(f"Lean file:\n{lean_content}")
             sections.append("")
 
-    # Imported nodes' NL statements (context for soundness check)
+    # Imported nodes' NL statements (context)
     imported_names: set = set()
-    for name in all_check:
+    for name in node_names:
         lean_path = node_lean_path(config.repo_path, name)
         if lean_path.exists():
             imports = extract_tablet_imports(lean_path.read_text(encoding="utf-8"))
             imported_names.update(imports)
-    imported_names -= all_check  # don't repeat nodes we're already checking
+    imported_names -= set(node_names)
     imported_names.discard(PREAMBLE_NAME)
 
     if imported_names:
@@ -501,32 +667,142 @@ Think carefully and systematically. Do not accept vague or hand-wavy arguments.
                 sections.append(_read_file(tex_path))
                 sections.append("")
 
-    # Paper (if available and budget allows)
+    return sections
+
+
+def build_correspondence_prompt(
+    config: Config,
+    tablet: TabletState,
+    *,
+    node_names: List[str],
+    paper_tex: str = "",
+    human_input: str = "",
+    output_file: str = "correspondence_result.json",
+) -> str:
+    """Build the Lean/NL correspondence verification prompt.
+
+    Checks: does each node's Lean statement capture its NL statement?
+    Is each node a faithful intermediate step toward the paper's results?
+
+    The correspondence agent gets full tablet read access because verifying
+    meaning requires following definition chains through transitive imports.
+    """
+    sections = []
+
+    sections.append(_load_template("basic_model.md"))
+    sections.append("YOUR ROLE: **Correspondence Verification Agent**. You check whether each node's Lean statement genuinely captures the same claim as its NL statement. You report your findings; the reviewer makes the final decision.\n")
+    if human_input and human_input.strip():
+        sections.append(f"--- HUMAN FEEDBACK ---\n{human_input}\n")
+    sections.append(_load_template("correspondence_role.md"))
+
+    # Nodes to check — show their .lean and .tex
+    if node_names:
+        sections.append("=== NODES TO CHECK ===\n")
+        for name in sorted(node_names):
+            node = tablet.nodes.get(name)
+            if not node:
+                continue
+            tex_content = _read_file(node_tex_path(config.repo_path, name), "(no .tex file)")
+            lean_content = _read_file(node_lean_path(config.repo_path, name), "(no .lean file)")
+            sections.append(f"--- Node: {name} (kind: {node.kind}) ---")
+            sections.append(f"NL content (.tex):\n{tex_content}")
+            sections.append(f"Lean file:\n{lean_content}")
+            sections.append("")
+
+    sections.append("You have read access to all files in `Tablet/`. Read any imported node's `.lean` or `.tex` to follow definition chains.\n")
+
     if paper_tex:
         sections.append("=== SOURCE PAPER ===\n")
-        sections.append(_trim(paper_tex, max_context_tokens // 3))
+        sections.append(_trim(paper_tex, 15000))
         sections.append("")
 
-    # Output format
-    sections.append("""=== YOUR RESPONSE ===
-
-Return a JSON object:
-{
-  "correspondence": {
-    "decision": "PASS" or "FAIL",
-    "issues": [{"node": "name", "description": "..."}]
-  },
-  "paper_faithfulness": {
-    "decision": "PASS" or "FAIL",
-    "issues": [{"node": "name", "description": "..."}]
-  },
-  "soundness": {
-    "decision": "PASS" or "FAIL",
-    "issues": [{"node": "name", "description": "..."}]
-  },
-  "overall": "APPROVE" or "REJECT",
-  "summary": "brief overall assessment"
-}
-""")
-
+    response_fmt = _load_template("correspondence_response_format.md")
+    if output_file != "correspondence_result.json":
+        response_fmt = response_fmt.replace("correspondence_result.json", output_file)
+    sections.append(response_fmt)
     return "\n".join(sections)
+
+
+def build_nl_proof_prompt(
+    config: Config,
+    tablet: TabletState,
+    *,
+    node_names: List[str],
+    paper_tex: str = "",
+    human_input: str = "",
+) -> str:
+    """Build the NL proof soundness verification prompt.
+
+    Checks: does each node's NL proof rigorously follow from its
+    children's NL statements? This is a purely mathematical check
+    with no Lean involved.
+    """
+    sections = []
+
+    sections.append(_load_template("basic_model.md"))
+    sections.append("YOUR ROLE: **NL Proof Soundness Agent**. You check whether each node's natural-language proof rigorously establishes its result from its children's NL statements. This is a purely mathematical check -- no Lean code is involved. You report your findings; the reviewer makes the final decision.\n")
+    if human_input and human_input.strip():
+        sections.append(f"--- HUMAN FEEDBACK ---\n{human_input}\n")
+    sections.append(_load_template("nl_proof_role.md"))
+
+    # For NL proof checking, only show .tex content (no Lean needed)
+    if node_names:
+        sections.append("=== NODES TO CHECK ===\n")
+        for name in sorted(node_names):
+            node = tablet.nodes.get(name)
+            if not node:
+                continue
+            tex_path = node_tex_path(config.repo_path, name)
+            tex_content = _read_file(tex_path, "(no .tex file)")
+            sections.append(f"--- Node: {name} (kind: {node.kind}) ---")
+            sections.append(f"NL content (.tex):\n{tex_content}")
+            sections.append("")
+
+        # Show children's NL statements for reference
+        imported_names: set = set()
+        for name in node_names:
+            lean_path = node_lean_path(config.repo_path, name)
+            if lean_path.exists():
+                imports = extract_tablet_imports(lean_path.read_text(encoding="utf-8"))
+                imported_names.update(imports)
+        imported_names -= set(node_names)
+        imported_names.discard(PREAMBLE_NAME)
+
+        if imported_names:
+            sections.append("=== CHILD NODES (NL statements the proofs may cite) ===\n")
+            for name in sorted(imported_names):
+                tex_path = node_tex_path(config.repo_path, name)
+                if tex_path.exists():
+                    sections.append(f"--- {name} ---")
+                    sections.append(_read_file(tex_path))
+                    sections.append("")
+
+    sections.append("If a proof references a node not shown above, you can find its NL content at `Tablet/{name}.tex`. All tablet `.tex` files are available for reading.\n")
+
+    if paper_tex:
+        sections.append("=== SOURCE PAPER (for reference) ===\n")
+        sections.append(_trim(paper_tex, 15000))
+        sections.append("")
+
+    sections.append(_load_template("nl_proof_response_format.md"))
+    return "\n".join(sections)
+
+
+def build_verification_prompt(
+    config: Config,
+    tablet: TabletState,
+    *,
+    new_nodes: List[str],
+    modified_nodes: List[str],
+    paper_tex: str = "",
+    max_context_tokens: int = 50000,
+) -> str:
+    """Build a combined verification prompt (backward compatibility).
+
+    Prefer using build_correspondence_prompt and build_nl_proof_prompt
+    separately for clearer separation of concerns.
+    """
+    all_nodes = list(set(new_nodes) | set(modified_nodes))
+    return build_correspondence_prompt(
+        config, tablet, node_names=all_nodes, paper_tex=paper_tex,
+    )

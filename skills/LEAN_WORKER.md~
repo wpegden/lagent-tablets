@@ -1,0 +1,193 @@
+# Lean 4 Worker Skill File
+
+You are proving theorems in a Lean 4 proof tablet. Each node is a single `.lean` file with a frozen declaration. Your job: eliminate the `sorry`.
+
+Toolchain: **Lean 4 v4.20.0** with full **Mathlib**.
+
+---
+
+## 1. Loogle: Find Lemmas Before You Prove
+
+A local Loogle server is running. Use it BEFORE writing proofs to find existing Mathlib lemmas.
+
+**Search by name:**
+```bash
+curl -s "http://127.0.0.1:8088/json?q=Filter.Tendsto" | python3 -m json.tool
+```
+
+**Search by type signature:**
+```bash
+curl -s "http://127.0.0.1:8088/json?q=(_ -> Real) -> Filter _ -> Prop" | python3 -m json.tool
+```
+
+**Response format:**
+```json
+{
+  "count": 1,
+  "hits": [
+    {
+      "name": "Real.exp_neg",
+      "type": " (x : R) : Real.exp (-x) = (Real.exp x)^{-1}",
+      "module": "Mathlib.Analysis.Complex.Exponential",
+      "doc": null
+    }
+  ]
+}
+```
+
+Use the `name` field directly in your proof (e.g., `exact Real.exp_neg x`). The `module` field tells you which import you need.
+
+**When to search:**
+- Before attempting any nontrivial lemma about analysis, topology, or combinatorics
+- When you get "unknown identifier" errors -- the lemma may exist under a different name
+- When a tactic like `simp` fails -- search for the rewrite lemma you need
+- URL-encode special characters: `%E2%84%9D` for `R`, `+` for space
+
+**Useful Loogle queries for this project:**
+- `curl -s "http://127.0.0.1:8088/json?q=Filter.Tendsto _ Filter.atTop (nhds _)"` -- tendsto lemmas
+- `curl -s "http://127.0.0.1:8088/json?q=Real.log"` -- logarithm lemmas
+- `curl -s "http://127.0.0.1:8088/json?q=Real.exp"` -- exponential lemmas
+- `curl -s "http://127.0.0.1:8088/json?q=filter_upwards"` -- filter combinators
+
+---
+
+## 2. Proof Strategies
+
+### Start simple
+Try closing the goal with automation first:
+- `simp`, `norm_num`, `ring`, `omega` -- for algebraic/numeric goals
+- `exact?`, `apply?` -- let Lean search for the right lemma
+- `gcongr` -- for monotonicity/congruence goals
+- `positivity` -- for `0 < ...` or `0 <= ...` goals
+
+### Break complex goals apart
+```lean
+theorem foo : ... := by
+  have h1 : intermediate_claim := by ...
+  have h2 : another_claim := by ...
+  exact final_step h1 h2
+```
+
+### Filter and topology goals
+For goals involving `Filter.Tendsto`, `Filter.Eventually`, or `nhds`:
+- `filter_upwards [h1, h2] with x hx1 hx2` -- the workhorse for eventually-goals
+- `apply Filter.Tendsto.comp` -- compose tendsto results
+- `apply tendsto_nhds_of_tendsto_subseq` -- when working with subsequences
+
+### Calc blocks for chain reasoning
+```lean
+calc (n : R) * (1 - p) ^ (n - 1)
+    = n * (1 - p) ^ (n - 1) := by ring
+  _ <= n * exp(-p * (n - 1)) := by gcongr; exact one_sub_le_exp_neg ...
+  _ = ... := by ...
+```
+
+### Imports: be specific, never `import Mathlib`
+**Do NOT use `import Mathlib`.** Import only the specific modules you need. This is enforced -- a bare `import Mathlib` will be rejected. Use Loogle to find which module contains the lemma you need (the `module` field in the response).
+
+Common imports for analysis proofs:
+```
+import Mathlib.Analysis.SpecialFunctions.Log.Basic
+import Mathlib.Analysis.SpecialFunctions.Pow.Real
+import Mathlib.Analysis.SpecialFunctions.ExpDeriv
+import Mathlib.Topology.Order.Basic
+import Mathlib.Order.Filter.Basic
+import Mathlib.Analysis.Asymptotics.Asymptotics
+```
+If you get "unknown identifier", search Loogle for the name and check which module it lives in.
+
+---
+
+## 3. Workflow: What a Successful Cycle Looks Like
+
+### Step 1: Read your node
+Look at `Tablet/{node_name}.lean` and `Tablet/{node_name}.tex`. The `.tex` has the natural-language proof sketch. The `.lean` has the frozen declaration ending in `sorry`.
+
+### Step 2: Search for relevant lemmas
+```bash
+curl -s "http://127.0.0.1:8088/json?q=Filter.Tendsto" | python3 -m json.tool | head -40
+```
+
+### Step 3: Write the proof
+Edit only the proof body (everything after `:= by` or `:=`). Do NOT touch the declaration line.
+
+### Step 4: Run check_node.sh and iterate
+```bash
+check_node.sh threshold_limit
+```
+Expected passing output:
+```
+=== Checking node: threshold_limit ===
+  .lean file: OK
+  .tex file: OK
+  Imports: OK
+  Declaration hash: OK
+  Compiles: OK
+  Status: CLOSED (sorry-free)
+=== Done ===
+```
+
+If it fails, fix the errors and run it again. Common failures:
+- **Compilation failed**: read the error, fix the Lean code, rerun
+- **Declaration changed**: you accidentally modified the theorem statement -- revert it
+- **Unauthorized imports**: only `Tablet.*` and `Mathlib.*` are allowed
+
+**You MUST iterate until check_node.sh passes before writing the handoff.**
+
+### Step 5: Write the handoff
+```json
+// worker_handoff.json
+{
+  "summary": "Proved threshold_limit using Tendsto.comp and exp asymptotics",
+  "status": "NOT_STUCK",
+  "new_nodes": []
+}
+```
+
+### If you need a helper lemma
+Create both files:
+- `Tablet/exp_asymptotic_bound.lean` -- with the declaration, marker, and sorry
+- `Tablet/exp_asymptotic_bound.tex` -- with NL statement and proof
+
+Then import it in your active node and list it in the handoff:
+```json
+{
+  "summary": "Created helper exp_asymptotic_bound, proved it, used it in threshold_limit",
+  "status": "NOT_STUCK",
+  "new_nodes": ["exp_asymptotic_bound"]
+}
+```
+
+New node `.lean` format:
+```lean
+import Tablet.Preamble
+
+-- [TABLET NODE: exp_asymptotic_bound]
+-- Do not rename or remove the declaration below.
+
+theorem exp_asymptotic_bound (x : R) (hx : 0 <= x) : 1 - x <= Real.exp (-x) := by
+  ...
+```
+
+---
+
+## 4. Common Pitfalls
+
+1. **Modifying the frozen declaration line.** The supervisor hashes it. Any change = instant rejection. Only edit after `:=`.
+2. **Editing other nodes' `.lean` files.** You may only edit your active node. Other files are read-only.
+3. **Forgetting the `.tex` file for new helpers.** Every `.lean` needs a paired `.tex`.
+4. **Missing the `-- [TABLET NODE: name]` marker** in new helper files.
+5. **Spending too long searching.** Make an attempt, test it, iterate. A compilation error with a clear message is more useful than 30 minutes of Loogle queries.
+6. **Forgetting to import Mathlib modules.** If you get "unknown identifier", check whether you need an import. Use Loogle to find the module.
+7. **Not running check_node.sh.** Never write the handoff without a passing check.
+
+---
+
+## 5. Time Management
+
+You have limited time per cycle. Allocate roughly:
+- **2 min**: Read the node, search Loogle for key lemmas
+- **10-15 min**: Write and iterate on the proof
+- **2 min**: Run check_node.sh, fix any issues, write handoff
+
+If you are stuck after several attempts, write the handoff with `"status": "STUCK"` and explain what you tried. A STUCK handoff with good diagnostics is better than spinning forever. The reviewer will give you guidance or reassign you.

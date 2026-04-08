@@ -202,9 +202,25 @@ def run(
 
     tmux_cmd("kill-window", "-t", window_id, check=False)
 
+    # Parse usage from Codex JSON output (turn.completed event)
+    usage = None
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+            if rec.get("type") == "turn.completed" and "usage" in rec:
+                usage = rec["usage"]
+                usage["provider"] = "codex"
+                usage["model"] = config.model or "codex"
+        except (json.JSONDecodeError, ValueError):
+            pass
+
     return BurstResult(
         ok=exit_code == 0,
         exit_code=exit_code,
         captured_output=output,
         duration_seconds=time.monotonic() - start,
+        usage=usage,
     )
