@@ -1572,7 +1572,7 @@ def run_theorem_stating_cycle(
     reviewer_prompt = build_theorem_stating_reviewer_prompt(
         config, state, tablet, policy,
         worker_handoff=worker_handoff,
-        worker_output=worker_result.captured_output[-15000:] if worker_result.captured_output else "",
+        worker_output=(worker_result.captured_output[-15000:] if worker_result.captured_output else "") if not resume_from else "",
         nl_verification=nl_verification_results if nl_verification_results else None,
     )
 
