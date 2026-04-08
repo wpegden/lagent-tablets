@@ -43,6 +43,8 @@ def build_script(
                  "--ephemeral"]
     if config.model:
         cmd_parts.extend(["-m", config.model])
+    if config.effort:
+        cmd_parts.extend(["-c", f"reasoning_effort={shlex.quote(config.effort)}"])
     cmd_parts.extend(config.extra_args or [])
     cmd_parts.append("__PROMPT__")
 

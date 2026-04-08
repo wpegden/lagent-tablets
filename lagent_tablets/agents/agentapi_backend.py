@@ -134,20 +134,23 @@ def _launch_server(
     cmd.extend(agent_cmd)
 
     # Launch detached
-    log_path = work_dir / ".agent-supervisor" / "logs" / f"agentapi-{role}.log"
+    log_path = work_dir / ".agent-supervisor" / "logs" / f"agentapi-{role}-{port}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"  Starting agentapi: {' '.join(cmd[:6])}... (log: {log_path})")
 
-    with open(log_path, "a") as log_file:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            cwd=str(work_dir),
-            start_new_session=True,
-        )
+    # Keep the log file open for the lifetime of the process.
+    # If we close it (e.g., via `with`), agentapi loses its stdout/stderr
+    # and may crash or behave unpredictably.
+    log_file = open(log_path, "a")
+    proc = subprocess.Popen(
+        cmd,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        cwd=str(work_dir),
+        start_new_session=True,
+    )
 
     # Wait for server to be ready, checking if process died
     deadline = time.monotonic() + 60
@@ -215,7 +218,7 @@ def ensure_server(
 
 
 def stop_server(port: int) -> None:
-    """Stop an agentapi server by port."""
+    """Stop an agentapi server by port and wait for the port to be released."""
     try:
         subprocess.run(
             ["fuser", "-k", f"{port}/tcp"],
@@ -223,6 +226,20 @@ def stop_server(port: int) -> None:
         )
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
+    # Wait until the port is actually free
+    for _ in range(10):
+        if not _is_server_running(port):
+            return
+        time.sleep(0.5)
+    # Force kill with -9
+    try:
+        subprocess.run(
+            ["fuser", "-k", "-9", f"{port}/tcp"],
+            capture_output=True, timeout=5,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    time.sleep(1)
 
 
 def get_screen_text(port: int) -> str:
