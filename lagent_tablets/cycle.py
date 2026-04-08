@@ -1109,6 +1109,66 @@ def _run_per_node_soundness(
     }]
 
 
+def _apply_verification_to_tablet(
+    tablet: TabletState,
+    verification_results: List[Dict[str, Any]],
+    cycle: int,
+) -> None:
+    """Update per-node verification status in tablet from cycle results.
+
+    Sets correspondence_status and soundness_status on each TabletNode.
+    Nodes not mentioned in results keep their current status.
+    """
+    # Collect failed nodes from correspondence results
+    corr_failed: Set[str] = set()
+    corr_checked = False
+    for r in verification_results:
+        if r.get("check") != "correspondence":
+            continue
+        corr_checked = True
+        # From multi-agent results
+        for ar in r.get("agent_results", [r]):
+            for phase in ("correspondence", "paper_faithfulness"):
+                for issue in ar.get(phase, {}).get("issues", []) if isinstance(ar.get(phase), dict) else []:
+                    if issue.get("node"):
+                        corr_failed.add(issue["node"])
+
+    # Collect failed/structural nodes from soundness results
+    sound_failed: Set[str] = set()
+    sound_structural: Set[str] = set()
+    sound_checked = False
+    for r in verification_results:
+        if r.get("check") != "nl_proof":
+            continue
+        sound_checked = True
+        for nv in r.get("node_verdicts", []):
+            node = nv.get("node", "")
+            if nv.get("structural"):
+                sound_structural.add(node)
+            elif nv.get("overall") != "APPROVE":
+                sound_failed.add(node)
+        # Legacy single-result format
+        for issue in r.get("soundness", {}).get("issues", []) if isinstance(r.get("soundness"), dict) else []:
+            if issue.get("node"):
+                sound_failed.add(issue["node"])
+
+    # Apply to tablet nodes
+    for name, node in tablet.nodes.items():
+        if name == "Preamble":
+            continue
+        if corr_checked:
+            node.correspondence_status = "fail" if name in corr_failed else "pass"
+            node.verification_at_cycle = cycle
+        if sound_checked:
+            if name in sound_structural:
+                node.soundness_status = "structural"
+            elif name in sound_failed:
+                node.soundness_status = "fail"
+            else:
+                node.soundness_status = "pass"
+            node.verification_at_cycle = cycle
+
+
 def _is_definition_node(repo_path: Path, name: str) -> bool:
     """Check if a node is a definition (no proof to check)."""
     lean_path = node_lean_path(repo_path, name)
@@ -1551,6 +1611,11 @@ def run_theorem_stating_cycle(
         if nl_verification_results:
             overalls = [r.get("overall", "?") for r in nl_verification_results]
             print(f"  Loaded {len(nl_verification_results)} correspondence results: {overalls}")
+
+    # Apply verification results to per-node tablet status
+    if nl_verification_results:
+        _apply_verification_to_tablet(tablet, nl_verification_results, cycle)
+        save_tablet(tablet_path(config), tablet)
 
     # ---- Stage 3: Reviewer ----
     handoff_path = repo / "worker_handoff.json"

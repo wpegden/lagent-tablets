@@ -112,6 +112,9 @@ class TabletNode:
     closed_at_cycle: Optional[int] = None
     invalidated_at_cycle: Optional[int] = None
     easy_attempts: int = 0
+    correspondence_status: str = "?"  # "?", "pass", "fail"
+    soundness_status: str = "?"       # "?", "pass", "fail", "structural"
+    verification_at_cycle: Optional[int] = None  # when status was last set
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -130,6 +133,12 @@ class TabletNode:
             d["invalidated_at_cycle"] = self.invalidated_at_cycle
         if self.easy_attempts > 0:
             d["easy_attempts"] = self.easy_attempts
+        if self.correspondence_status != "?":
+            d["correspondence_status"] = self.correspondence_status
+        if self.soundness_status != "?":
+            d["soundness_status"] = self.soundness_status
+        if self.verification_at_cycle is not None:
+            d["verification_at_cycle"] = self.verification_at_cycle
         return d
 
     @classmethod
@@ -148,6 +157,9 @@ class TabletNode:
             closed_at_cycle=raw.get("closed_at_cycle"),
             invalidated_at_cycle=raw.get("invalidated_at_cycle"),
             easy_attempts=int(raw.get("easy_attempts", 0)),
+            correspondence_status=str(raw.get("correspondence_status", "?")),
+            soundness_status=str(raw.get("soundness_status", "?")),
+            verification_at_cycle=raw.get("verification_at_cycle"),
         )
 
 

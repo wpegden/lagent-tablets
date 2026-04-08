@@ -314,24 +314,32 @@ function renderDAG() {
     text.textContent = label;
     g.appendChild(text);
 
-    // Verification badges below the name
+    // Verification badges below the name — each gets its own color
     const verif = node.verification || {};
-    const badges = [];
-    if (verif.correspondence === 'fail') badges.push('C\u2717');
-    else if (verif.correspondence === 'pass') badges.push('C\u2713');
-    else badges.push('C?');
-    if (verif.nl_proof === 'fail') badges.push('P\u2717');
-    else if (verif.nl_proof === 'pass') badges.push('P\u2713');
-    else badges.push('P?');
-    if (badges.length) {
+    const checks = [
+      { key: 'correspondence', label: 'C' },
+      { key: 'nl_proof', label: 'P' },
+    ];
+    let badgeX = 70;
+    for (const { key, label } of checks) {
+      const val = verif[key] || '?';
       const badge = document.createElementNS(ns, 'text');
-      badge.setAttribute('x', 90); badge.setAttribute('y', 37);
+      badge.setAttribute('x', badgeX); badge.setAttribute('y', 37);
       badge.setAttribute('text-anchor', 'middle');
-      const hasFail = verif.correspondence === 'fail' || verif.nl_proof === 'fail';
-      const allPending = !verif.correspondence && !verif.nl_proof;
-      badge.setAttribute('class', 'verif-badge' + (hasFail ? ' fail' : allPending ? ' pending' : ''));
-      badge.textContent = badges.join(' ');
+      badge.setAttribute('font-size', '9px');
+      if (val === 'fail') {
+        badge.setAttribute('fill', '#ff5555');
+        badge.textContent = label + '\u2717';
+      } else if (val === 'pass') {
+        badge.setAttribute('fill', '#50fa7b');
+        badge.textContent = label + '\u2713';
+      } else {
+        badge.setAttribute('fill', '#6272a4');
+        badge.textContent = label + '?';
+      }
+      badge.setAttribute('pointer-events', 'none');
       g.appendChild(badge);
+      badgeX += 40;
     }
 
     svg.appendChild(g);

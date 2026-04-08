@@ -94,62 +94,17 @@ function writeStatic() {
 }
 
 function getVerificationStatus(tablet) {
-  // Read correspondence results (from any agent) and NL proof results.
-  // Initialize all non-preamble nodes as 'pass', then mark failures.
-  // Only show results when the cycle is not actively running (resume_from is empty).
+  // Read per-node verification status from tablet.json (set by the reviewer cycle).
+  // "?" means never verified in current form.
   const status = {};
-  const nodeNames = Object.keys(tablet.nodes || {}).filter(n => n !== 'Preamble');
-
-  // Don't show partial results mid-cycle
-  try {
-    const state = JSON.parse(fs.readFileSync(path.join(STATE_DIR, 'state.json'), 'utf-8'));
-    if (state.resume_from) return status;  // cycle in progress
-  } catch {}
-
-  // Track which checks have been run
-  let corrChecked = false, proofChecked = false;
-
-  for (const fname of ['correspondence_result.json', 'correspondence_result_0.json', 'correspondence_result_1.json']) {
-    const fpath = path.join(REPO_PATH, fname);
-    try {
-      const data = JSON.parse(fs.readFileSync(fpath, 'utf-8'));
-      corrChecked = true;
-      // Initialize all nodes as pass for correspondence
-      for (const n of nodeNames) {
-        if (!status[n]) status[n] = {};
-        if (!status[n].correspondence) status[n].correspondence = 'pass';
-      }
-      const issues = [
-        ...(data.correspondence?.issues || []),
-        ...(data.paper_faithfulness?.issues || []),
-      ];
-      for (const issue of issues) {
-        if (issue.node && status[issue.node]) {
-          status[issue.node].correspondence = 'fail';
-          status[issue.node].correspondence_issue = (status[issue.node].correspondence_issue || '') +
-            (issue.description || '').substring(0, 200) + '\n';
-        }
-      }
-    } catch {}
+  for (const [name, node] of Object.entries(tablet.nodes || {})) {
+    if (name === 'Preamble') continue;
+    const cs = node.correspondence_status || '?';
+    const ss = node.soundness_status || '?';
+    if (cs !== '?' || ss !== '?') {
+      status[name] = { correspondence: cs, nl_proof: ss };
+    }
   }
-
-  // NL proof results
-  try {
-    const data = JSON.parse(fs.readFileSync(path.join(REPO_PATH, 'nl_proof_result.json'), 'utf-8'));
-    proofChecked = true;
-    for (const n of nodeNames) {
-      if (!status[n]) status[n] = {};
-      if (!status[n].nl_proof) status[n].nl_proof = 'pass';
-    }
-    for (const issue of (data.soundness?.issues || [])) {
-      if (issue.node && status[issue.node]) {
-        status[issue.node].nl_proof = 'fail';
-        status[issue.node].nl_proof_issue = (status[issue.node].nl_proof_issue || '') +
-          (issue.description || '').substring(0, 200) + '\n';
-      }
-    }
-  } catch {}
-
   return status;
 }
 
