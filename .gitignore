@@ -5,3 +5,6 @@ __pycache__/
 .pytest_cache/
 .agent-supervisor/
 test_results_gemini.json
+node_modules/
+*~
+\#*\#
