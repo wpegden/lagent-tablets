@@ -50,9 +50,6 @@ svg { width: 100%; height: 100%; }
 .node.active rect { fill: #3d3500; stroke: #f1fa8c; }
 .node.open rect { fill: #2a2a3d; stroke: #6272a4; }
 .node.error rect { fill: #3d1a1a; stroke: #ff5555; }
-.node .verif-badge { font-size: 9px; fill: #50fa7b; }
-.node .verif-badge.fail { fill: #ff5555; }
-.node .verif-badge.pending { fill: #6272a4; }
 .node.selected rect { stroke-width: 3; }
 .edge { fill: none; stroke: #444; stroke-width: 1.5; }
 .edge.to-closed { stroke: #4a9eff; }
@@ -253,7 +250,7 @@ function renderDAG() {
 
   const ns = 'http://www.w3.org/2000/svg';
 
-  // Draw edges
+  // Draw edges — style encodes soundness status of the importing (from) node
   for (const [from, to] of edges) {
     const p1 = positions[from], p2 = positions[to];
     if (!p1 || !p2) continue;
@@ -262,6 +259,12 @@ function renderDAG() {
     line.setAttribute('x2', p2.x); line.setAttribute('y2', p2.y - 20);
     line.setAttribute('class', 'edge' + (allNodes[from]?.status === 'closed' ? ' to-closed' : ''));
     line.setAttribute('marker-end', 'url(#arrow)');
+    // Soundness status of the importing node determines edge style
+    const fromNode = allNodes[from];
+    const proofStatus = fromNode?.verification?.nl_proof || '?';
+    if (proofStatus === 'fail') line.setAttribute('stroke-dasharray', '2 3');       // dotted
+    else if (proofStatus === '?') line.setAttribute('stroke-dasharray', '8 4');     // dashed
+    // else solid
     svg.appendChild(line);
   }
 
@@ -309,38 +312,17 @@ function renderDAG() {
     // Label: title or name, truncated
     const label = (node.title || name).substring(0, 24);
     const text = document.createElementNS(ns, 'text');
-    text.setAttribute('x', 90); text.setAttribute('y', 26);
+    text.setAttribute('x', 90); text.setAttribute('y', diff ? 28 : 24);
     text.setAttribute('text-anchor', 'middle');
     text.textContent = label;
     g.appendChild(text);
 
-    // Verification badges below the name — each gets its own color
+    // Node border style encodes correspondence status
     const verif = node.verification || {};
-    const checks = [
-      { key: 'correspondence', label: 'C' },
-      { key: 'nl_proof', label: 'P' },
-    ];
-    let badgeX = 75;
-    for (const { key, label } of checks) {
-      const val = verif[key] || '?';
-      const badge = document.createElementNS(ns, 'text');
-      badge.setAttribute('x', badgeX); badge.setAttribute('y', 37);
-      badge.setAttribute('text-anchor', 'middle');
-      badge.setAttribute('font-size', '9px');
-      if (val === 'fail') {
-        badge.setAttribute('fill', '#ff5555');
-        badge.textContent = label + '\u2717';
-      } else if (val === 'pass') {
-        badge.setAttribute('fill', '#50fa7b');
-        badge.textContent = label + '\u2713';
-      } else {
-        badge.setAttribute('fill', '#6272a4');
-        badge.textContent = label + '?';
-      }
-      badge.setAttribute('pointer-events', 'none');
-      g.appendChild(badge);
-      badgeX += 30;
-    }
+    const corrStatus = verif.correspondence || '?';
+    if (corrStatus === 'fail') rect.setAttribute('stroke-dasharray', '2 3');       // dotted
+    else if (corrStatus === '?') rect.setAttribute('stroke-dasharray', '8 4');     // dashed
+    // else solid (no dasharray)
 
     svg.appendChild(g);
   }

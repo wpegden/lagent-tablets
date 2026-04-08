@@ -116,10 +116,10 @@ function getVerificationStatus(tablet) {
     const contentChanged = savedHash && currentHash !== savedHash;
 
     const cs = contentChanged ? '?' : (node.correspondence_status || '?');
-    const ss = contentChanged ? '?' : (node.soundness_status || '?');
-    if (cs !== '?' || ss !== '?') {
-      status[name] = { correspondence: cs, nl_proof: ss };
-    }
+    let ss = contentChanged ? '?' : (node.soundness_status || '?');
+    // Closed nodes (Lean proof complete) automatically pass soundness
+    if (node.status === 'closed') ss = 'pass';
+    status[name] = { correspondence: cs, nl_proof: ss };
   }
   return status;
 }
