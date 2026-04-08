@@ -87,7 +87,7 @@ def build_script(
         "done",
         "",
         f'LOG_FILE={shlex.quote(str(start_file.parent / f"{log_prefix}-output.log"))}',
-        f'timeout --signal=TERM --kill-after=30 {agent_timeout_seconds} "${{real_cmd[@]}}" > "$LOG_FILE" 2>&1',
+        '"${real_cmd[@]}" > "$LOG_FILE" 2>&1',
         "ec=$?",
         'exit "$ec"',
     ]
