@@ -74,8 +74,12 @@ function writeStatic() {
     const cycles = getCyclesFromGit();
     fs.writeFileSync(path.join(STATIC_OUT, 'api', 'cycles.json'), JSON.stringify(cycles));
 
-    // Nodes
+    // Nodes (with verification status)
     const nodes = buildNodes(tablet);
+    const verif = getVerificationStatus(tablet);
+    for (const [name, vs] of Object.entries(verif)) {
+      if (nodes[name]) nodes[name].verification = vs;
+    }
     fs.writeFileSync(path.join(STATIC_OUT, 'api', 'nodes.json'), JSON.stringify(nodes));
 
     // Copy index.html
@@ -87,6 +91,59 @@ function writeStatic() {
   } catch (e) {
     console.error('Static write error:', e.message);
   }
+}
+
+function getVerificationStatus(tablet) {
+  // Read correspondence results (from any agent) and NL proof results.
+  // Initialize all non-preamble nodes as 'pass', then mark failures.
+  const status = {};
+  const nodeNames = Object.keys(tablet.nodes || {}).filter(n => n !== 'Preamble');
+
+  // Track which checks have been run
+  let corrChecked = false, proofChecked = false;
+
+  for (const fname of ['correspondence_result.json', 'correspondence_result_0.json', 'correspondence_result_1.json']) {
+    const fpath = path.join(REPO_PATH, fname);
+    try {
+      const data = JSON.parse(fs.readFileSync(fpath, 'utf-8'));
+      corrChecked = true;
+      // Initialize all nodes as pass for correspondence
+      for (const n of nodeNames) {
+        if (!status[n]) status[n] = {};
+        if (!status[n].correspondence) status[n].correspondence = 'pass';
+      }
+      const issues = [
+        ...(data.correspondence?.issues || []),
+        ...(data.paper_faithfulness?.issues || []),
+      ];
+      for (const issue of issues) {
+        if (issue.node && status[issue.node]) {
+          status[issue.node].correspondence = 'fail';
+          status[issue.node].correspondence_issue = (status[issue.node].correspondence_issue || '') +
+            (issue.description || '').substring(0, 200) + '\n';
+        }
+      }
+    } catch {}
+  }
+
+  // NL proof results
+  try {
+    const data = JSON.parse(fs.readFileSync(path.join(REPO_PATH, 'nl_proof_result.json'), 'utf-8'));
+    proofChecked = true;
+    for (const n of nodeNames) {
+      if (!status[n]) status[n] = {};
+      if (!status[n].nl_proof) status[n].nl_proof = 'pass';
+    }
+    for (const issue of (data.soundness?.issues || [])) {
+      if (issue.node && status[issue.node]) {
+        status[issue.node].nl_proof = 'fail';
+        status[issue.node].nl_proof_issue = (status[issue.node].nl_proof_issue || '') +
+          (issue.description || '').substring(0, 200) + '\n';
+      }
+    }
+  } catch {}
+
+  return status;
 }
 
 function buildNodes(tablet) {
@@ -193,7 +250,12 @@ app.get(`${BASE}/api/cycles.json`, (req, res) => {
 app.get(`${BASE}/api/nodes.json`, (req, res) => {
   try {
     const tablet = JSON.parse(fs.readFileSync(path.join(STATE_DIR, 'tablet.json'), 'utf-8'));
-    res.json(buildNodes(tablet));
+    const nodes = buildNodes(tablet);
+    const verif = getVerificationStatus(tablet);
+    for (const [name, vs] of Object.entries(verif)) {
+      if (nodes[name]) nodes[name].verification = vs;
+    }
+    res.json(nodes);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

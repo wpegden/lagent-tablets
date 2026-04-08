@@ -205,6 +205,8 @@ def main(argv: Optional[list] = None) -> int:
                         help="Stop when the phase changes (e.g., theorem_stating -> proof_formalization)")
     parser.add_argument("--rewind-to-cycle", type=int, default=None, metavar="N",
                         help="Rewind repo to cycle N (clears agent sessions) and exit")
+    parser.add_argument("--resume-from", choices=["verification", "reviewer"], default=None,
+                        help="Resume current cycle from a mid-cycle checkpoint (skip earlier stages)")
     args = parser.parse_args(argv)
 
     # Load config
@@ -260,8 +262,15 @@ def main(argv: Optional[list] = None) -> int:
     if state.cycle == 0:
         state.phase = config.workflow.start_phase
 
+    # Apply --resume-from if specified
+    if args.resume_from:
+        state.resume_from = args.resume_from
+        print(f"  resume_from: {args.resume_from} (set via --resume-from)")
+
     print(f"  cycle:     {state.cycle}")
     print(f"  phase:     {state.phase}")
+    if state.resume_from:
+        print(f"  resume:    from {state.resume_from}")
     print(f"  tablet:    {tablet.closed_nodes}/{tablet.total_nodes} closed")
 
     # Policy manager

@@ -250,6 +250,7 @@ class SupervisorState:
     awaiting_human_input: bool = False
     cleanup_last_good_commit: str = ""
     agent_token_usage: Dict[str, Any] = field(default_factory=dict)
+    resume_from: str = ""  # mid-cycle checkpoint: "", "verification", "reviewer"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -266,6 +267,7 @@ class SupervisorState:
             "awaiting_human_input": self.awaiting_human_input,
             "cleanup_last_good_commit": self.cleanup_last_good_commit,
             "agent_token_usage": self.agent_token_usage,
+            "resume_from": self.resume_from,
         }
 
     @classmethod
@@ -286,6 +288,7 @@ class SupervisorState:
             awaiting_human_input=bool(raw.get("awaiting_human_input", False)),
             cleanup_last_good_commit=str(raw.get("cleanup_last_good_commit", "")),
             agent_token_usage=dict(raw.get("agent_token_usage", {})),
+            resume_from=str(raw.get("resume_from", "")),
         )
 
 

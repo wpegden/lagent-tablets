@@ -748,6 +748,7 @@ def _run_single_correspondence_agent(
     """Run one correspondence agent. Designed to be called from a thread."""
     from lagent_tablets.burst import _clean_terminal_json
 
+    agent_start = time.monotonic()
     repo = config.repo_path
     label = agent_config.label or f"agent-{agent_index}"
     output_file = f"correspondence_result_{agent_index}.json"
@@ -790,11 +791,146 @@ def _run_single_correspondence_agent(
         "agent": label,
         "index": agent_index,
         "ok": burst_result.ok,
+        "walltime_seconds": round(time.monotonic() - agent_start, 1),
         **(decision if isinstance(decision, dict) else {"overall": "ERROR", "summary": f"Failed to get decision from {label}"}),
     }
     if burst_result.usage:
         result["_usage"] = burst_result.usage
     return result
+
+
+def _run_single_soundness_agent(
+    config: Config,
+    tablet: TabletState,
+    proof_nodes: List[str],
+    agent_config: Any,  # CorrespondenceAgentConfig
+    *,
+    paper_tex: str,
+    human_input: str,
+    log_dir: Path,
+    agent_index: int,
+) -> Dict[str, Any]:
+    """Run one NL proof soundness agent. Designed to be called from a thread."""
+    from lagent_tablets.burst import _clean_terminal_json
+
+    agent_start = time.monotonic()
+    repo = config.repo_path
+    label = agent_config.label or f"soundness-{agent_index}"
+    output_file = f"nl_proof_result_{agent_index}.json"
+    # Soundness agents use ports 3310, 3312, 3314, ... (separate from correspondence 3286+ and viewer 3300)
+    port = 3310 + agent_index * 2
+
+    result_file = repo / output_file
+    result_file.unlink(missing_ok=True)
+
+    prompt = build_nl_proof_prompt(
+        config, tablet, node_names=proof_nodes, paper_tex=paper_tex,
+        human_input=human_input,
+    )
+    # Replace the output filename in the prompt
+    if output_file != "nl_proof_result.json":
+        prompt = prompt.replace("nl_proof_result.json", output_file)
+
+    agent_provider = ProviderConfig(
+        provider=agent_config.provider,
+        model=agent_config.model,
+        extra_args=agent_config.extra_args,
+        fallback_models=getattr(agent_config, 'fallback_models', []),
+    )
+
+    burst_result = run_reviewer_burst(
+        agent_provider, prompt,
+        session_name=config.tmux.session_name,
+        work_dir=repo, burst_user=config.tmux.burst_user,
+        timeout_seconds=300, log_dir=log_dir, fresh=True,
+        port=port,
+    )
+
+    decision = None
+    if result_file.exists():
+        try:
+            decision = load_json(result_file)
+        except Exception:
+            pass
+    if not isinstance(decision, dict) and burst_result.ok:
+        cleaned = _clean_terminal_json(burst_result.captured_output)
+        decision = extract_json_decision(cleaned)
+
+    result = {
+        "agent": label,
+        "index": agent_index,
+        "ok": burst_result.ok,
+        "walltime_seconds": round(time.monotonic() - agent_start, 1),
+        **(decision if isinstance(decision, dict) else {"overall": "ERROR", "summary": f"Failed to get decision from {label}"}),
+    }
+    if burst_result.usage:
+        result["_usage"] = burst_result.usage
+    return result
+
+
+def _run_multi_soundness(
+    config: Config,
+    tablet: TabletState,
+    proof_nodes: List[str],
+    agents: List[Any],
+    *,
+    paper_tex: str,
+    human_input: str,
+    log_dir: Path,
+) -> Dict[str, Any]:
+    """Run multiple NL proof soundness agents concurrently and reconcile."""
+    import concurrent.futures
+
+    n = len(agents)
+    labels = [a.label or f"{a.provider}/{a.model}" for a in agents]
+    print(f"  Multi-agent NL proof: {n} agents ({', '.join(labels)}) on {len(proof_nodes)} nodes")
+
+    agent_results: List[Dict[str, Any]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n) as pool:
+        futures = {
+            pool.submit(
+                _run_single_soundness_agent,
+                config, tablet, proof_nodes, agent,
+                paper_tex=paper_tex, human_input=human_input,
+                log_dir=log_dir, agent_index=i,
+            ): i
+            for i, agent in enumerate(agents)
+        }
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                agent_results.append(future.result())
+            except Exception as exc:
+                idx = futures[future]
+                agent_results.append({
+                    "agent": labels[idx], "index": idx,
+                    "overall": "ERROR", "summary": str(exc),
+                })
+
+    agent_results.sort(key=lambda r: r.get("index", 0))
+
+    overalls = [r.get("overall", "ERROR") for r in agent_results]
+    all_approve = all(o == "APPROVE" for o in overalls)
+    all_reject = all(o == "REJECT" for o in overalls)
+    unanimous = all_approve or all_reject
+
+    if unanimous:
+        overall = "APPROVE" if all_approve else "REJECT"
+        print(f"  NL proof soundness: {overall} (unanimous, {n} agents)")
+        return {
+            "check": "nl_proof",
+            "overall": overall,
+            "summary": f"Unanimous {overall} from {n} agents",
+            "agent_results": agent_results,
+        }
+    else:
+        disagree_detail = ", ".join(f"{r.get('agent', '?')}: {o}" for r, o in zip(agent_results, overalls))
+        print(f"  NL proof soundness: DISAGREE ({disagree_detail})")
+        return {
+            "check": "nl_proof",
+            "overall": "DISAGREE",
+            "summary": f"Agents disagree: {disagree_detail}. Reviewer must arbitrate.",
+            "agent_results": agent_results,
+        }
 
 
 def _run_multi_correspondence(
@@ -953,43 +1089,54 @@ def _run_nl_verification(
         print(f"  Correspondence: all {len(node_names)} nodes cached (APPROVE)")
         results.append({"check": "correspondence", "overall": "APPROVE", "summary": "cached"})
 
-    # 2. NL proof soundness check
+    # 2. NL proof soundness check (possibly multi-agent)
     proof_nodes = node_names
     if nl_cache:
         proof_nodes = nl_cache.filter_uncached(repo, node_names, "soundness")
     if proof_nodes:
-        print(f"  NL proof check: {len(proof_nodes)} nodes ({len(node_names) - len(proof_nodes)} cached)")
-        proof_file = repo / "nl_proof_result.json"
-        proof_file.unlink(missing_ok=True)
-        proof_prompt = build_nl_proof_prompt(
-            config, tablet, node_names=proof_nodes, paper_tex=paper_tex,
-            human_input=human_input,
-        )
-        proof_result = run_reviewer_burst(
-            verify_config, proof_prompt,
-            session_name=config.tmux.session_name,
-            work_dir=repo, burst_user=config.tmux.burst_user,
-            timeout_seconds=300, log_dir=log_dir, fresh=True,
-            port=3287,  # NL proof verification port
-        )
-        proof_decision = None
-        if proof_file.exists():
-            try:
-                proof_decision = load_json(proof_file)
-            except Exception:
-                pass
-        if not isinstance(proof_decision, dict) and proof_result.ok:
-            cleaned = _clean_terminal_json(proof_result.captured_output)
-            proof_decision = extract_json_decision(cleaned)
-        if proof_decision:
-            entry = {"check": "nl_proof", **proof_decision}
-            if proof_result.usage:
-                entry["_usage"] = proof_result.usage
-            results.append(entry)
-            overall = proof_decision.get("overall", "?")
-            print(f"  NL proof soundness: {overall}")
-            if overall == "APPROVE" and nl_cache:
+        soundness_agents = config.verification.soundness_agents
+        if len(soundness_agents) >= 2:
+            proof_result_entry = _run_multi_soundness(
+                config, tablet, proof_nodes, soundness_agents,
+                paper_tex=paper_tex, human_input=human_input, log_dir=log_dir,
+            )
+            results.append(proof_result_entry)
+            if proof_result_entry.get("overall") == "APPROVE" and nl_cache:
                 nl_cache.record_soundness_approval(repo, proof_nodes)
+        else:
+            # Single-agent soundness (default)
+            print(f"  NL proof check: {len(proof_nodes)} nodes ({len(node_names) - len(proof_nodes)} cached)")
+            proof_file = repo / "nl_proof_result.json"
+            proof_file.unlink(missing_ok=True)
+            proof_prompt = build_nl_proof_prompt(
+                config, tablet, node_names=proof_nodes, paper_tex=paper_tex,
+                human_input=human_input,
+            )
+            proof_result = run_reviewer_burst(
+                verify_config, proof_prompt,
+                session_name=config.tmux.session_name,
+                work_dir=repo, burst_user=config.tmux.burst_user,
+                timeout_seconds=300, log_dir=log_dir, fresh=True,
+                port=3287,
+            )
+            proof_decision = None
+            if proof_file.exists():
+                try:
+                    proof_decision = load_json(proof_file)
+                except Exception:
+                    pass
+            if not isinstance(proof_decision, dict) and proof_result.ok:
+                cleaned = _clean_terminal_json(proof_result.captured_output)
+                proof_decision = extract_json_decision(cleaned)
+            if proof_decision:
+                entry = {"check": "nl_proof", **proof_decision}
+                if proof_result.usage:
+                    entry["_usage"] = proof_result.usage
+                results.append(entry)
+                overall = proof_decision.get("overall", "?")
+                print(f"  NL proof soundness: {overall}")
+                if overall == "APPROVE" and nl_cache:
+                    nl_cache.record_soundness_approval(repo, proof_nodes)
     else:
         print(f"  NL proof soundness: all {len(node_names)} nodes cached (APPROVE)")
         results.append({"check": "nl_proof", "overall": "APPROVE", "summary": "cached"})
@@ -1012,162 +1159,178 @@ def run_theorem_stating_cycle(
     """
     from lagent_tablets.prompts import build_theorem_stating_prompt, build_theorem_stating_reviewer_prompt
     from lagent_tablets.health import fix_lake_permissions
-    cycle = state.cycle + 1
-    cycle_start = time.monotonic()
-    state.cycle = cycle
+
+    resume_from = state.resume_from or ""
     repo = config.repo_path
 
-    print(f"=== Theorem-stating cycle {cycle} ===")
+    if not resume_from:
+        # Fresh cycle — increment and run worker
+        cycle = state.cycle + 1
+        state.cycle = cycle
+    else:
+        cycle = state.cycle
+        print(f"=== Resuming theorem-stating cycle {cycle} from {resume_from} ===")
 
-    # Ensure Tablet directory exists
-    (repo / "Tablet").mkdir(parents=True, exist_ok=True)
-
-    # Fix .lake permissions
-    fix_lake_permissions(repo)
-
-    # In theorem_stating, the worker needs write access to the whole Tablet/ directory
-    _setup_theorem_stating_permissions(config)
-
-    # Build worker prompt
-    worker_prompt = build_theorem_stating_prompt(
-        config, state, tablet, policy, previous_outcome=previous_outcome,
-    )
-
+    cycle_start = time.monotonic()
     log_dir = config.state_dir / "logs" / f"cycle-{cycle:04d}"
 
-    # Run worker burst
-    worker_result = run_worker_burst(
-        config.worker,
-        worker_prompt,
-        session_name=config.tmux.session_name,
-        work_dir=repo,
-        burst_user=config.tmux.burst_user,
-        timeout_seconds=policy.timing.burst_timeout_seconds,
-        startup_timeout_seconds=config.startup_timeout_seconds,
-        log_dir=log_dir,
-    )
+    # ---- Stage 1: Worker ----
+    if not resume_from:
+        print(f"=== Theorem-stating cycle {cycle} ===")
 
-    if worker_result.transcript_path:
-        print(f"  Transcript saved: {worker_result.transcript_path}")
+        (repo / "Tablet").mkdir(parents=True, exist_ok=True)
+        fix_lake_permissions(repo)
+        _setup_theorem_stating_permissions(config)
 
-    if not worker_result.ok:
-        print(f"  Worker burst failed: {worker_result.error}")
-        save_state(state_path(config), state)
-        return CycleOutcome(outcome="INVALID", detail=f"Worker burst failed: {worker_result.error}")
+        worker_prompt = build_theorem_stating_prompt(
+            config, state, tablet, policy, previous_outcome=previous_outcome,
+        )
 
-    fix_lake_permissions(repo)
+        worker_result = run_worker_burst(
+            config.worker,
+            worker_prompt,
+            session_name=config.tmux.session_name,
+            work_dir=repo,
+            burst_user=config.tmux.burst_user,
+            timeout_seconds=policy.timing.burst_timeout_seconds,
+            startup_timeout_seconds=config.startup_timeout_seconds,
+            log_dir=log_dir,
+        )
 
-    # Discover what the worker created/modified
-    tdir = repo / "Tablet"
-    lean_files = {p.stem for p in tdir.glob("*.lean") if p.stem != "Preamble"}
-    tex_files = {p.stem for p in tdir.glob("*.tex") if p.stem not in ("header", "Preamble")}
-    all_node_names = lean_files | tex_files
-    new_nodes = [n for n in all_node_names if n not in tablet.nodes]
-    existing_nodes = [n for n in all_node_names if n in tablet.nodes]
+        if worker_result.transcript_path:
+            print(f"  Transcript saved: {worker_result.transcript_path}")
 
-    # Read difficulty hints from worker handoff (if present)
-    difficulty_hints: Dict[str, str] = {}
-    handoff_path = repo / "worker_handoff.json"
-    if handoff_path.exists():
-        try:
-            hf = load_json(handoff_path)
-            if isinstance(hf, dict):
-                hints = hf.get("difficulty_hints", {})
-                if isinstance(hints, dict):
-                    for k, v in hints.items():
-                        if v in ("easy", "hard"):
-                            difficulty_hints[k] = v
-        except Exception:
-            pass
+        if not worker_result.ok:
+            print(f"  Worker burst failed: {worker_result.error}")
+            save_state(state_path(config), state)
+            return CycleOutcome(outcome="INVALID", detail=f"Worker burst failed: {worker_result.error}")
 
-    # Register any new nodes in the tablet
-    for name in new_nodes:
-        lean_path = node_lean_path(repo, name)
-        tex_path = node_tex_path(repo, name)
-        if lean_path.exists():
-            # Determine kind heuristically
-            content = lean_path.read_text(encoding="utf-8")
-            marker = extract_marker_name(content)
-            kind = "paper_main_result" if "main" in name or "theorem" in name else "paper_intermediate"
-            register_new_node(tablet, repo, name=name, kind=kind, cycle=cycle)
-            # Apply difficulty hint from worker
-            if name in difficulty_hints:
-                tablet.nodes[name].difficulty = difficulty_hints[name]
+        fix_lake_permissions(repo)
 
-    # Ensure Preamble node exists
-    if PREAMBLE_NAME not in tablet.nodes:
+        # Discover what the worker created/modified
+        tdir = repo / "Tablet"
+        lean_files = {p.stem for p in tdir.glob("*.lean") if p.stem != "Preamble"}
+        tex_files = {p.stem for p in tdir.glob("*.tex") if p.stem not in ("header", "Preamble")}
+        all_node_names = lean_files | tex_files
+        new_nodes = [n for n in all_node_names if n not in tablet.nodes]
+        existing_nodes = [n for n in all_node_names if n in tablet.nodes]
+
+        # Read difficulty hints from worker handoff (if present)
+        difficulty_hints: Dict[str, str] = {}
+        handoff_path = repo / "worker_handoff.json"
+        if handoff_path.exists():
+            try:
+                hf = load_json(handoff_path)
+                if isinstance(hf, dict):
+                    hints = hf.get("difficulty_hints", {})
+                    if isinstance(hints, dict):
+                        for k, v in hints.items():
+                            if v in ("easy", "hard"):
+                                difficulty_hints[k] = v
+            except Exception:
+                pass
+
+        # Register any new nodes in the tablet
+        for name in new_nodes:
+            lean_path = node_lean_path(repo, name)
+            tex_path = node_tex_path(repo, name)
+            if lean_path.exists():
+                content = lean_path.read_text(encoding="utf-8")
+                marker = extract_marker_name(content)
+                kind = "paper_main_result" if "main" in name or "theorem" in name else "paper_intermediate"
+                register_new_node(tablet, repo, name=name, kind=kind, cycle=cycle)
+                if name in difficulty_hints:
+                    tablet.nodes[name].difficulty = difficulty_hints[name]
+
+        # Ensure Preamble node exists
+        if PREAMBLE_NAME not in tablet.nodes:
+            preamble_path = repo / "Tablet" / "Preamble.lean"
+            if preamble_path.exists():
+                tablet.nodes[PREAMBLE_NAME] = TabletNode(
+                    name=PREAMBLE_NAME, kind="preamble", status="closed",
+                    title="Imports", closed_at_cycle=cycle,
+                )
+
+        # Check: no definitions in Preamble
+        from lagent_tablets.tablet import scan_preamble_definitions
         preamble_path = repo / "Tablet" / "Preamble.lean"
         if preamble_path.exists():
-            tablet.nodes[PREAMBLE_NAME] = TabletNode(
-                name=PREAMBLE_NAME, kind="preamble", status="closed",
-                title="Imports", closed_at_cycle=cycle,
-            )
+            preamble_defs = scan_preamble_definitions(preamble_path.read_text(encoding="utf-8"))
+            if preamble_defs:
+                defs_list = [h["text"][:80] for h in preamble_defs]
+                print(f"  INVALID: Preamble has {len(preamble_defs)} definitions (must be in own nodes)")
+                for d in defs_list:
+                    print(f"    {d}")
+                save_state(state_path(config), state)
+                return CycleOutcome(
+                    outcome="INVALID",
+                    detail=f"Preamble.lean contains definitions. All definitions must be in their own node files with .tex counterparts. Found: {', '.join(defs_list[:3])}",
+                )
 
-    # Check: no definitions in Preamble (they must be in their own nodes)
-    from lagent_tablets.tablet import scan_preamble_definitions
-    preamble_path = repo / "Tablet" / "Preamble.lean"
-    if preamble_path.exists():
-        preamble_defs = scan_preamble_definitions(preamble_path.read_text(encoding="utf-8"))
-        if preamble_defs:
-            defs_list = [h["text"][:80] for h in preamble_defs]
-            print(f"  INVALID: Preamble has {len(preamble_defs)} definitions (must be in own nodes)")
-            for d in defs_list:
-                print(f"    {d}")
-            save_state(state_path(config), state)
-            return CycleOutcome(
+        # Validate: lake build
+        build_ok = False
+        build_output = ""
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["lake", "build", "Tablet"],
+                capture_output=True, text=True, timeout=300,
+                cwd=str(repo),
+            )
+            build_output = result.stdout + result.stderr
+            build_ok = result.returncode == 0
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            build_output = str(e)
+
+        if not build_ok:
+            print(f"  lake build failed")
+            outcome = CycleOutcome(
                 outcome="INVALID",
-                detail=f"Preamble.lean contains definitions. All definitions must be in their own node files with .tex counterparts. Found: {', '.join(defs_list[:3])}",
+                detail=f"lake build Tablet failed",
+                build_output=build_output,
             )
+        elif new_nodes:
+            print(f"  Created {len(new_nodes)} new nodes: {new_nodes}")
+            outcome = CycleOutcome(
+                outcome="PROGRESS",
+                detail=f"Created nodes: {', '.join(new_nodes)}",
+                nodes_created=new_nodes,
+            )
+        else:
+            print(f"  No new nodes created (modified existing: {existing_nodes})")
+            outcome = CycleOutcome(outcome="PROGRESS", detail="Modified existing nodes")
 
-    # Validate: check if lake build passes
-    build_ok = False
-    build_output = ""
-    try:
-        import subprocess
-        result = subprocess.run(
-            ["lake", "build", "Tablet"],
-            capture_output=True, text=True, timeout=300,
-            cwd=str(repo),
-        )
-        build_output = result.stdout + result.stderr
-        build_ok = result.returncode == 0
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-        build_output = str(e)
-
-    if not build_ok:
-        print(f"  lake build failed")
-        outcome = CycleOutcome(
-            outcome="INVALID",
-            detail=f"lake build Tablet failed",
-            build_output=build_output,
-        )
-    elif new_nodes:
-        print(f"  Created {len(new_nodes)} new nodes: {new_nodes}")
+        # Save checkpoint: worker done
+        regenerate_support_files(tablet, repo)
+        save_tablet(tablet_path(config), tablet)
+        state.resume_from = "verification"
+        save_state(state_path(config), state)
+    else:
+        # Resuming — reconstruct outcome from current state
+        all_node_names = [n for n in tablet.nodes if tablet.nodes[n].kind != "preamble"]
         outcome = CycleOutcome(
             outcome="PROGRESS",
-            detail=f"Created nodes: {', '.join(new_nodes)}",
-            nodes_created=new_nodes,
+            detail=f"Resumed with {len(all_node_names)} existing nodes",
         )
+
+    # ---- Stage 2: NL Verification ----
+    nl_verification_results: List[Dict[str, Any]] = []
+    if resume_from in ("", "verification"):
+        from lagent_tablets.nl_cache import NLCache
+        nl_cache = NLCache(config.state_dir / "nl_cache.json")
+        all_check_nodes = [n for n in tablet.nodes if tablet.nodes[n].kind != "preamble"]
+        print(f"  Running NL verification for {len(all_check_nodes)} nodes...")
+        nl_verification_results = _run_nl_verification(
+            config, tablet, all_check_nodes, log_dir=log_dir, nl_cache=nl_cache,
+            human_input=state.human_input,
+        )
+        # Save checkpoint: verification done
+        state.resume_from = "reviewer"
+        save_state(state_path(config), state)
     else:
-        print(f"  No new nodes created (modified existing: {existing_nodes})")
-        outcome = CycleOutcome(outcome="PROGRESS", detail="Modified existing nodes")
+        print(f"  Skipping NL verification (resuming from {resume_from})")
 
-    # Update tablet state
-    regenerate_support_files(tablet, repo)
-    save_tablet(tablet_path(config), tablet)
-    save_state(state_path(config), state)
-
-    # Run NL verification on all non-preamble nodes
-    from lagent_tablets.nl_cache import NLCache
-    nl_cache = NLCache(config.state_dir / "nl_cache.json")
-    all_check_nodes = [n for n in tablet.nodes if tablet.nodes[n].kind != "preamble"]
-    print(f"  Running NL verification for {len(all_check_nodes)} nodes...")
-    nl_verification_results = _run_nl_verification(
-        config, tablet, all_check_nodes, log_dir=log_dir, nl_cache=nl_cache,
-        human_input=state.human_input,
-    )
-
-    # Reviewer burst
+    # ---- Stage 3: Reviewer ----
     handoff_path = repo / "worker_handoff.json"
     worker_handoff = None
     if handoff_path.exists():
@@ -1261,6 +1424,8 @@ def run_theorem_stating_cycle(
     else:
         print(f"  Reviewer: could not parse decision")
 
+    # Clear resume checkpoint — cycle is complete
+    state.resume_from = ""
     save_tablet(tablet_path(config), tablet)
     save_state(state_path(config), state)
 

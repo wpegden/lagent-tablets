@@ -95,6 +95,7 @@ class VerificationConfig:
     thinking_budget: str = "high"
     max_context_tokens: int = 50000
     correspondence_agents: List[CorrespondenceAgentConfig] = field(default_factory=list)
+    soundness_agents: List[CorrespondenceAgentConfig] = field(default_factory=list)
 
 
 @dataclass
@@ -284,6 +285,26 @@ def _parse_verification_config(raw: Any) -> VerificationConfig:
                     fallback_models=list(agent_raw.get("fallback_models", [])),
                     label=str(agent_raw.get("label", f"{provider}/{model or 'auto'}")),
                 ))
+    # Soundness agents (same format as correspondence)
+    sound_agents_raw = raw.get("soundness_agents", [])
+    sound_agents: List[CorrespondenceAgentConfig] = []
+    if isinstance(sound_agents_raw, list):
+        for i, agent_raw in enumerate(sound_agents_raw):
+            if isinstance(agent_raw, dict):
+                provider = str(agent_raw.get("provider", "claude")).strip().lower()
+                if provider not in ("claude", "codex", "gemini"):
+                    continue
+                raw_model = agent_raw.get("model")
+                model = str(raw_model).strip() if raw_model is not None else None
+                model = model or None
+                sound_agents.append(CorrespondenceAgentConfig(
+                    provider=provider,
+                    model=model,
+                    extra_args=list(agent_raw.get("extra_args", [])),
+                    fallback_models=list(agent_raw.get("fallback_models", [])),
+                    label=str(agent_raw.get("label", f"{provider}/{model or 'auto'}")),
+                ))
+
     return VerificationConfig(
         provider=str(raw.get("provider", "claude")).strip().lower(),
         model=str(raw.get("model", "claude-opus-4-6")).strip(),
@@ -291,6 +312,7 @@ def _parse_verification_config(raw: Any) -> VerificationConfig:
         thinking_budget=str(raw.get("thinking_budget", "high")).strip(),
         max_context_tokens=_coerce_int(raw.get("max_context_tokens", 50000), "verification.max_context_tokens", minimum=1000),
         correspondence_agents=corr_agents,
+        soundness_agents=sound_agents,
     )
 
 

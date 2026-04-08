@@ -40,13 +40,17 @@ header .status { color: #6272a4; font-size: 12px; }
 
 /* DAG nodes */
 svg { width: 100%; height: 100%; }
-.node rect { rx: 6; ry: 6; stroke-width: 2; cursor: pointer; }
+.node rect { stroke-width: 2; cursor: pointer; }
+.node.easy rect { rx: 12; ry: 12; }
+.node.hard rect { rx: 0; ry: 0; }
 .node text { font-size: 11px; fill: #e0e0e0; pointer-events: none; }
 .node.closed rect { fill: #1e3a5f; stroke: #4a9eff; }
 .node.recursive-closed rect { fill: #1a3d2e; stroke: #50fa7b; }
 .node.active rect { fill: #3d3500; stroke: #f1fa8c; }
 .node.open rect { fill: #2a2a3d; stroke: #6272a4; }
 .node.error rect { fill: #3d1a1a; stroke: #ff5555; }
+.node .verif-badge { font-size: 9px; fill: #50fa7b; }
+.node .verif-badge.fail { fill: #ff5555; }
 .node.selected rect { stroke-width: 3; }
 .edge { fill: none; stroke: #444; stroke-width: 1.5; }
 .edge.to-closed { stroke: #4a9eff; }
@@ -241,7 +245,8 @@ function renderDAG() {
     const cls = getNodeClass(name, allNodes);
 
     const g = document.createElementNS(ns, 'g');
-    g.setAttribute('class', `node ${cls}` + (selectedNode === name ? ' selected' : ''));
+    const diffCls = (node.difficulty === 'easy') ? 'easy' : 'hard';
+    g.setAttribute('class', `node ${cls} ${diffCls}` + (selectedNode === name ? ' selected' : ''));
     g.setAttribute('transform', `translate(${pos.x - 90}, ${pos.y - 20})`);
     g.style.cursor = 'pointer';
     g.onclick = () => selectNode(name);
@@ -253,10 +258,28 @@ function renderDAG() {
     // Label: title or name, truncated
     const label = (node.title || name).substring(0, 24);
     const text = document.createElementNS(ns, 'text');
-    text.setAttribute('x', 90); text.setAttribute('y', 24);
+    text.setAttribute('x', 90); text.setAttribute('y', 18);
     text.setAttribute('text-anchor', 'middle');
     text.textContent = label;
     g.appendChild(text);
+
+    // Difficulty + verification badges
+    const diff = node.difficulty || '';
+    const verif = node.verification || {};
+    const badges = [];
+    if (diff) badges.push(diff === 'easy' ? 'E' : 'H');
+    if (verif.correspondence === 'fail') badges.push('C\u2717');
+    else if (verif.correspondence === 'pass') badges.push('C\u2713');
+    if (verif.nl_proof === 'fail') badges.push('P\u2717');
+    else if (verif.nl_proof === 'pass') badges.push('P\u2713');
+    if (badges.length) {
+      const badge = document.createElementNS(ns, 'text');
+      badge.setAttribute('x', 90); badge.setAttribute('y', 34);
+      badge.setAttribute('text-anchor', 'middle');
+      badge.setAttribute('class', 'verif-badge' + (verif.correspondence === 'fail' || verif.nl_proof === 'fail' ? ' fail' : ''));
+      badge.textContent = badges.join(' ');
+      g.appendChild(badge);
+    }
 
     svg.appendChild(g);
   }
@@ -293,9 +316,25 @@ function renderDetail(name) {
       <div class="field-value">${(node.imports || []).join(', ') || 'none'}</div>
     </div>
     <div class="field">
+      <div class="field-label">Difficulty</div>
+      <div class="field-value">${node.difficulty || '?'}</div>
+    </div>
+    <div class="field">
       <div class="field-label">Sorry</div>
       <div class="field-value">${node.hasSorry ? '⚠ yes' : '✓ no'}</div>
     </div>
+    ${node.verification ? `<div class="field">
+      <div class="field-label">Verification</div>
+      <div class="field-value">${
+        (node.verification.correspondence === 'fail' ? '<span style="color:#ff5555">Correspondence: FAIL</span>' :
+         node.verification.correspondence === 'pass' ? '<span style="color:#50fa7b">Correspondence: PASS</span>' : 'Correspondence: ?') +
+        '<br>' +
+        (node.verification.nl_proof === 'fail' ? '<span style="color:#ff5555">NL Proof: FAIL</span>' :
+         node.verification.nl_proof === 'pass' ? '<span style="color:#50fa7b">NL Proof: PASS</span>' : 'NL Proof: ?')
+      }</div>
+      ${node.verification.correspondence_issue ? `<div class="field-value collapsible" onclick="this.classList.toggle('expanded')" style="color:#ff5555;font-size:11px;margin-top:4px">${escHtml(node.verification.correspondence_issue)}</div>` : ''}
+      ${node.verification.nl_proof_issue ? `<div class="field-value collapsible" onclick="this.classList.toggle('expanded')" style="color:#ff5555;font-size:11px;margin-top:4px">${escHtml(node.verification.nl_proof_issue)}</div>` : ''}
+    </div>` : ''}
     <div class="field">
       <div class="field-label">Lean Declaration</div>
       <div class="field-value" style="color:#f8f8f2">${escHtml(node.declaration || '(none)')}</div>
@@ -336,8 +375,9 @@ function renderFeedbackPanel() {
   const decision = lastReview.decision || '';
   const stopped = !currentState?.state?.cycle; // crude check
 
-  // Show feedback panel when in theorem_stating or when awaiting input
-  if (phase === 'theorem_stating' || decision === 'NEED_INPUT' || decision === 'ADVANCE_PHASE') {
+  // Show feedback panel only when the supervisor is awaiting human input
+  const awaiting = currentState?.state?.awaiting_human_input || false;
+  if (awaiting || decision === 'NEED_INPUT' || decision === 'ADVANCE_PHASE') {
     container.innerHTML = `
       <div class="feedback-panel">
         <h3>Human Review (${phase})</h3>
