@@ -204,6 +204,106 @@ app.get(`${BASE}/api/diff/:cycle`, (req, res) => {
   res.type('text/plain').send(diff);
 });
 
+// API: download tablet snapshot as zip
+app.get(`${BASE}/api/download-tablet`, (req, res) => {
+  try {
+    const tablet = JSON.parse(fs.readFileSync(path.join(STATE_DIR, 'tablet.json'), 'utf-8'));
+    const state = JSON.parse(fs.readFileSync(path.join(STATE_DIR, 'state.json'), 'utf-8'));
+    const tabletDir = path.join(REPO_PATH, 'Tablet');
+    const paperDir = path.join(REPO_PATH, 'paper');
+
+    // Build README
+    const nodeNames = Object.keys(tablet.nodes || {}).filter(n => n !== 'Preamble');
+    const closedCount = nodeNames.filter(n => (tablet.nodes[n] || {}).status === 'closed').length;
+    const nodeList = nodeNames.map(n => {
+      const nd = tablet.nodes[n];
+      return `  - ${n}: ${nd.status} (${nd.kind})${nd.difficulty ? ', ' + nd.difficulty : ''}${nd.title ? ' -- ' + nd.title : ''}`;
+    }).join('\n');
+
+    const readme = `# Proof Tablet Snapshot
+
+This is a snapshot of a formalization-in-progress produced by the lagent-tablets supervisor.
+
+## What is this?
+
+Each .lean file in Tablet/ contains a Lean 4 theorem/lemma/definition with its formal statement.
+Each .tex file contains the corresponding natural-language statement and proof.
+Together they form a DAG (directed acyclic graph) of mathematical results that decompose the
+source paper into individually provable nodes.
+
+## Status
+
+- Phase: ${state.phase || '?'}
+- Cycle: ${state.cycle || '?'}
+- Nodes: ${closedCount}/${nodeNames.length} closed
+- Generated: ${new Date().toISOString()}
+
+## Nodes
+
+${nodeList}
+
+## Structure
+
+- \`Tablet/Preamble.lean\` — shared imports (no definitions here)
+- \`Tablet/<name>.lean\` — Lean 4 declaration (theorem/lemma/def)
+- \`Tablet/<name>.tex\` — natural-language statement + proof
+- \`paper/\` — source paper being formalized
+- \`tablet.json\` — machine-readable tablet state (node metadata, DAG structure)
+
+## How to use
+
+1. Open any .lean file to see the formal statement
+2. Read the matching .tex file for the mathematical context
+3. Nodes import each other via \`import Tablet.<name>\` — this defines the proof DAG
+4. A node with \`sorry\` still needs its proof completed
+5. Run \`lake build Tablet\` to check compilation (requires Lean 4 + mathlib)
+`;
+
+    // Create temp dir and assemble the zip contents
+    const tmpDir = fs.mkdtempSync('/tmp/tablet-snapshot-');
+    const snapDir = path.join(tmpDir, 'tablet-snapshot');
+    fs.mkdirSync(path.join(snapDir, 'Tablet'), { recursive: true });
+    fs.mkdirSync(path.join(snapDir, 'paper'), { recursive: true });
+
+    // Copy Tablet/ files
+    if (fs.existsSync(tabletDir)) {
+      for (const f of fs.readdirSync(tabletDir)) {
+        if (f.endsWith('.lean') || f.endsWith('.tex')) {
+          fs.copyFileSync(path.join(tabletDir, f), path.join(snapDir, 'Tablet', f));
+        }
+      }
+    }
+
+    // Copy paper/ files
+    if (fs.existsSync(paperDir)) {
+      for (const f of fs.readdirSync(paperDir)) {
+        fs.copyFileSync(path.join(paperDir, f), path.join(snapDir, 'paper', f));
+      }
+    }
+
+    // Write README and tablet.json
+    fs.writeFileSync(path.join(snapDir, 'README.md'), readme);
+    fs.writeFileSync(path.join(snapDir, 'tablet.json'), JSON.stringify(tablet, null, 2));
+
+    // Create zip
+    const zipPath = path.join(tmpDir, 'tablet-snapshot.zip');
+    execSync(`cd "${tmpDir}" && zip -r "${zipPath}" tablet-snapshot/`, { timeout: 10000 });
+
+    // Send zip
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="tablet-snapshot-cycle${state.cycle || 0}.zip"`);
+    const zipStream = fs.createReadStream(zipPath);
+    zipStream.pipe(res);
+    zipStream.on('end', () => {
+      // Cleanup temp dir
+      execSync(`rm -rf "${tmpDir}"`);
+    });
+
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Write static files on startup and every 30s
 writeStatic();
 setInterval(writeStatic, 30000);

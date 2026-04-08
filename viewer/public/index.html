@@ -346,6 +346,7 @@ function renderFeedbackPanel() {
             decision === 'NEED_INPUT' ? 'Reviewer requested human input.' :
             'Review the tablet structure and provide feedback.'}
         </p>
+        <p style="margin-bottom:8px"><a href="api/download-tablet" style="color:#8be9fd; font-size:12px">Download tablet snapshot (.zip)</a></p>
         <textarea id="feedback-text" placeholder="Enter feedback for the worker (or leave empty to approve)..."></textarea>
         <div>
           <button class="btn btn-approve" onclick="submitFeedback('approve')">✓ Approve & Advance</button>
