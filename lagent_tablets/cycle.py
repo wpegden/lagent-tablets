@@ -933,6 +933,196 @@ def _run_multi_soundness(
         }
 
 
+def _run_single_node_soundness(
+    config: Config,
+    tablet: TabletState,
+    node_name: str,
+    agent_config: Any,
+    *,
+    paper_tex: str,
+    human_input: str,
+    log_dir: Path,
+    agent_index: int,
+    node_index: int,
+) -> Dict[str, Any]:
+    """Check one node's NL proof with one agent. Thread-safe."""
+    from lagent_tablets.burst import _clean_terminal_json
+    from lagent_tablets.prompts import build_node_soundness_prompt
+
+    agent_start = time.monotonic()
+    repo = config.repo_path
+    label = agent_config.label or f"soundness-{agent_index}"
+    output_file = f"nl_proof_{node_name}_{agent_index}.json"
+    # Ports: 3310 + (node_index * 10) + (agent_index * 2) — spread to avoid collisions
+    port = 3310 + (node_index % 5) * 10 + agent_index * 2
+
+    result_file = repo / output_file
+    result_file.unlink(missing_ok=True)
+
+    prompt = build_node_soundness_prompt(
+        config, tablet, node_name=node_name, paper_tex=paper_tex,
+        human_input=human_input, output_file=output_file,
+    )
+
+    agent_provider = ProviderConfig(
+        provider=agent_config.provider,
+        model=agent_config.model,
+        extra_args=agent_config.extra_args,
+        fallback_models=getattr(agent_config, 'fallback_models', []),
+    )
+
+    burst_result = run_reviewer_burst(
+        agent_provider, prompt,
+        session_name=config.tmux.session_name,
+        work_dir=repo, burst_user=config.tmux.burst_user,
+        timeout_seconds=120, log_dir=log_dir, fresh=True,
+        port=port,
+    )
+
+    decision = None
+    if result_file.exists():
+        try:
+            decision = load_json(result_file)
+        except Exception:
+            pass
+    if not isinstance(decision, dict) and burst_result.ok:
+        cleaned = _clean_terminal_json(burst_result.captured_output)
+        decision = extract_json_decision(cleaned)
+
+    result = {
+        "agent": label,
+        "node": node_name,
+        "index": agent_index,
+        "ok": burst_result.ok,
+        "walltime_seconds": round(time.monotonic() - agent_start, 1),
+        **(decision if isinstance(decision, dict) else {"overall": "ERROR", "summary": f"Failed to get decision from {label}"}),
+    }
+    if burst_result.usage:
+        result["_usage"] = burst_result.usage
+    return result
+
+
+def _run_per_node_soundness(
+    config: Config,
+    tablet: TabletState,
+    node_names: List[str],
+    agents: List[Any],
+    *,
+    paper_tex: str,
+    human_input: str,
+    log_dir: Path,
+    batch_size: int = 3,
+) -> List[Dict[str, Any]]:
+    """Run per-node soundness checks with multiple agents.
+
+    Each node is checked independently by all agents. Nodes are batched
+    to limit concurrent agent processes.
+    """
+    import concurrent.futures
+
+    n_agents = len(agents)
+    labels = [a.label or f"{a.provider}/{a.model}" for a in agents]
+    # Skip definition nodes (they don't have proofs)
+    check_nodes = [n for n in node_names
+                   if n in tablet.nodes and tablet.nodes[n].kind != "preamble"
+                   and not _is_definition_node(config.repo_path, n)]
+    print(f"  Per-node soundness: {len(check_nodes)} nodes × {n_agents} agents ({', '.join(labels)})")
+
+    all_results: List[Dict[str, Any]] = []
+
+    # Process in batches to limit concurrency
+    for batch_start in range(0, len(check_nodes), batch_size):
+        batch = check_nodes[batch_start:batch_start + batch_size]
+        print(f"  Soundness batch {batch_start // batch_size + 1}: {batch}")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_agents * len(batch)) as pool:
+            futures = {}
+            for ni, node_name in enumerate(batch):
+                for ai, agent in enumerate(agents):
+                    f = pool.submit(
+                        _run_single_node_soundness,
+                        config, tablet, node_name, agent,
+                        paper_tex=paper_tex, human_input=human_input,
+                        log_dir=log_dir, agent_index=ai,
+                        node_index=batch_start + ni,
+                    )
+                    futures[f] = (node_name, ai)
+
+            for future in concurrent.futures.as_completed(futures):
+                node_name, ai = futures[future]
+                try:
+                    all_results.append(future.result())
+                except Exception as exc:
+                    all_results.append({
+                        "agent": labels[ai], "node": node_name, "index": ai,
+                        "overall": "ERROR", "summary": str(exc),
+                    })
+
+    # Reconcile per-node: group by node, check agreement
+    from collections import defaultdict
+    by_node: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for r in all_results:
+        by_node[r.get("node", "?")].append(r)
+
+    node_verdicts = []
+    structural_issues = []
+    for node_name in check_nodes:
+        node_results = sorted(by_node.get(node_name, []), key=lambda r: r.get("index", 0))
+        overalls = [r.get("overall", "ERROR") for r in node_results]
+        soundness_decisions = [r.get("soundness", {}).get("decision", "?") if isinstance(r.get("soundness"), dict) else "?" for r in node_results]
+
+        # Check for STRUCTURAL flags
+        has_structural = any(d == "STRUCTURAL" for d in soundness_decisions)
+        all_approve = all(o == "APPROVE" for o in overalls)
+
+        verdict = {
+            "node": node_name,
+            "agent_results": node_results,
+            "overall": "APPROVE" if all_approve else "REJECT",
+        }
+        if has_structural:
+            verdict["structural"] = True
+            structural_issues.append(node_name)
+            print(f"    {node_name}: STRUCTURAL (DAG needs restructuring)")
+        elif all_approve:
+            print(f"    {node_name}: SOUND (unanimous)")
+        else:
+            detail = ", ".join(f"{r.get('agent','?')}: {o}" for r, o in zip(node_results, overalls))
+            print(f"    {node_name}: {detail}")
+
+        node_verdicts.append(verdict)
+
+    all_approve = all(v["overall"] == "APPROVE" for v in node_verdicts)
+    summary_parts = []
+    if structural_issues:
+        summary_parts.append(f"STRUCTURAL issues in: {structural_issues}")
+    failed_nodes = [v["node"] for v in node_verdicts if v["overall"] != "APPROVE"]
+    if failed_nodes:
+        summary_parts.append(f"Failed: {failed_nodes}")
+
+    return [{
+        "check": "nl_proof",
+        "overall": "APPROVE" if all_approve else "REJECT",
+        "summary": "; ".join(summary_parts) if summary_parts else f"All {len(check_nodes)} nodes sound",
+        "structural_issues": structural_issues,
+        "node_verdicts": node_verdicts,
+    }]
+
+
+def _is_definition_node(repo_path: Path, name: str) -> bool:
+    """Check if a node is a definition (no proof to check)."""
+    lean_path = node_lean_path(repo_path, name)
+    if not lean_path.exists():
+        return False
+    content = lean_path.read_text(encoding="utf-8")
+    # Definitions have no sorry — they're complete at creation
+    for line in content.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("def ") or stripped.startswith("noncomputable def "):
+            return True
+    return False
+
+
 def _run_multi_correspondence(
     config: Config,
     tablet: TabletState,
@@ -1089,22 +1279,32 @@ def _run_nl_verification(
         print(f"  Correspondence: all {len(node_names)} nodes cached (APPROVE)")
         results.append({"check": "correspondence", "overall": "APPROVE", "summary": "cached"})
 
-    # 2. NL proof soundness check (possibly multi-agent)
+    # 2. NL proof soundness check — only if correspondence passed (it's a gate)
+    corr_overall = "APPROVE"
+    for r in results:
+        if r.get("check") == "correspondence":
+            corr_overall = r.get("overall", "?")
+    if corr_overall != "APPROVE":
+        print(f"  Skipping NL proof soundness (correspondence {corr_overall} — must pass first)")
+        return results
+
     proof_nodes = node_names
     if nl_cache:
         proof_nodes = nl_cache.filter_uncached(repo, node_names, "soundness")
     if proof_nodes:
         soundness_agents = config.verification.soundness_agents
         if len(soundness_agents) >= 2:
-            proof_result_entry = _run_multi_soundness(
+            # Per-node soundness with multiple agents
+            proof_results = _run_per_node_soundness(
                 config, tablet, proof_nodes, soundness_agents,
                 paper_tex=paper_tex, human_input=human_input, log_dir=log_dir,
             )
-            results.append(proof_result_entry)
-            if proof_result_entry.get("overall") == "APPROVE" and nl_cache:
-                nl_cache.record_soundness_approval(repo, proof_nodes)
+            results.extend(proof_results)
+            for pr in proof_results:
+                if pr.get("overall") == "APPROVE" and nl_cache:
+                    nl_cache.record_soundness_approval(repo, proof_nodes)
         else:
-            # Single-agent soundness (default)
+            # Single-agent, all-at-once soundness (fallback)
             print(f"  NL proof check: {len(proof_nodes)} nodes ({len(node_names) - len(proof_nodes)} cached)")
             proof_file = repo / "nl_proof_result.json"
             proof_file.unlink(missing_ok=True)

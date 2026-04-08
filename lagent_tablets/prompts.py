@@ -788,6 +788,92 @@ def build_nl_proof_prompt(
     return "\n".join(sections)
 
 
+def build_node_soundness_prompt(
+    config: Config,
+    tablet: TabletState,
+    *,
+    node_name: str,
+    paper_tex: str = "",
+    human_input: str = "",
+    output_file: str = "nl_proof_result.json",
+) -> str:
+    """Build a per-node NL proof soundness prompt.
+
+    Focused check: does this ONE node's NL proof rigorously establish
+    its result from its children's NL statements?
+    Can also flag STRUCTURAL issues (children don't provide what's needed).
+    """
+    sections = []
+    sections.append(_load_template("basic_model.md"))
+    sections.append(
+        "YOUR ROLE: **NL Proof Soundness Agent**. You check whether one node's "
+        "natural-language proof rigorously establishes its result from its children's "
+        "NL statements. This is a purely mathematical check.\n"
+    )
+    if human_input and human_input.strip():
+        sections.append(f"--- HUMAN FEEDBACK ---\n{human_input}\n")
+    sections.append(_load_template("nl_proof_role.md"))
+
+    node = tablet.nodes.get(node_name)
+    if not node:
+        sections.append(f"ERROR: Node {node_name} not found.\n")
+        return "\n".join(sections)
+
+    # The node being checked
+    tex_content = _read_file(node_tex_path(config.repo_path, node_name), "(no .tex file)")
+    sections.append(f"=== NODE TO CHECK: {node_name} (kind: {node.kind}) ===\n")
+    sections.append(f"NL content (.tex):\n{tex_content}\n")
+
+    # Its children (the NL statements it may cite)
+    lean_path = node_lean_path(config.repo_path, node_name)
+    children = []
+    if lean_path.exists():
+        children = extract_tablet_imports(lean_path.read_text(encoding="utf-8"))
+
+    if children:
+        sections.append("=== CHILDREN (NL statements this proof may cite) ===\n")
+        for child in sorted(children):
+            if child == PREAMBLE_NAME:
+                continue
+            child_tex = node_tex_path(config.repo_path, child)
+            if child_tex.exists():
+                sections.append(f"--- {child} ---")
+                sections.append(_read_file(child_tex))
+                sections.append("")
+            else:
+                sections.append(f"--- {child} --- (WARNING: .tex file missing)\n")
+    else:
+        sections.append("This node has NO children (leaf node). Its proof must be self-contained.\n")
+
+    if paper_tex:
+        sections.append("=== SOURCE PAPER (for reference) ===\n")
+        sections.append(_trim(paper_tex, 15000))
+        sections.append("")
+
+    sections.append(f"""=== YOUR RESPONSE ===
+
+Evaluate this node's NL proof. Write your assessment as JSON to `{output_file}`:
+
+{{
+  "node": "{node_name}",
+  "soundness": {{
+    "decision": "SOUND" or "UNSOUND" or "STRUCTURAL",
+    "explanation": "detailed assessment"
+  }},
+  "overall": "APPROVE" or "REJECT",
+  "summary": "brief assessment"
+}}
+
+Verdicts:
+- **SOUND**: The NL proof rigorously establishes the result from the children's statements.
+- **UNSOUND**: The proof has gaps or errors but the DAG structure is reasonable. The proof text needs fixing.
+- **STRUCTURAL**: The children do NOT provide what is needed to prove this node. The DAG needs restructuring — new intermediate nodes or different dependencies are required.
+
+MANDATORY: Write the JSON to `{output_file}` then stop.
+""")
+    return "\n".join(sections)
+
+
 def build_verification_prompt(
     config: Config,
     tablet: TabletState,
