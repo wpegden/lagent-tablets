@@ -376,16 +376,19 @@ def wait_for_stable(port: int, *, timeout: float = 3600, poll_interval: float = 
     for that file to appear — this is the agent's explicit "I'm done" signal.
 
     Fallback: wait for agentapi status to become 'stable' with new messages.
-    After seeing stable, we wait an additional grace period to ensure the
-    agent isn't just between tool calls.
+
+    The timeout is an INACTIVITY timeout, not a wall-clock limit. As long as
+    the agent is actively working (status "running"), we keep waiting.
+    The timeout only applies to consecutive idle/stable time.
     """
     import urllib.request
-    deadline = time.monotonic() + timeout
+    last_activity = time.monotonic()
+    idle_timeout = timeout  # how long we tolerate consecutive inactivity
 
     # If we have a done_file, that's the primary completion signal
     if done_file:
         stable_count = 0
-        while time.monotonic() < deadline:
+        while True:
             if done_file.exists():
                 return True
             try:
@@ -394,18 +397,19 @@ def wait_for_stable(port: int, *, timeout: float = 3600, poll_interval: float = 
                 data = json.loads(resp.read().decode("utf-8"))
                 if data.get("status") == "stable":
                     stable_count += 1
-                    # Agent may go stable between tool calls. Only give up
-                    # after seeing stable multiple times in a row with no
-                    # activity (no done_file appearing, no status change).
                     if stable_count >= 6:  # ~30s of consecutive stable
                         return True
                 else:
-                    stable_count = 0  # Agent is active again
+                    stable_count = 0
+                    last_activity = time.monotonic()  # agent is active
             except Exception:
                 # Server down — agent crashed or exited
                 return done_file.exists()
+            # Only time out on inactivity
+            if time.monotonic() - last_activity > idle_timeout:
+                print(f"  wait_for_stable: idle timeout after {idle_timeout:.0f}s")
+                return False
             time.sleep(poll_interval)
-        return False
 
     # No done_file — use the message-count-based approach
     initial_msg_count = len(get_messages(port))
@@ -420,13 +424,14 @@ def wait_for_stable(port: int, *, timeout: float = 3600, poll_interval: float = 
             data = json.loads(resp.read().decode("utf-8"))
             if data.get("status") != "stable":
                 saw_non_stable = True
+                last_activity = time.monotonic()
                 break
         except Exception:
             pass
         time.sleep(1)
 
     # Phase 2: wait for status to return to 'stable'
-    while time.monotonic() < deadline:
+    while True:
         try:
             req = urllib.request.Request(f"http://localhost:{port}/status")
             resp = urllib.request.urlopen(req, timeout=5)
@@ -436,15 +441,18 @@ def wait_for_stable(port: int, *, timeout: float = 3600, poll_interval: float = 
                 current_msg_count = len(get_messages(port))
                 if current_msg_count > initial_msg_count:
                     return True
-                # Status is stable but no new messages — agent may not have
-                # started yet. Keep waiting briefly.
                 if not saw_non_stable:
                     time.sleep(2)
                     continue
                 return True
-            saw_non_stable = True
+            else:
+                saw_non_stable = True
+                last_activity = time.monotonic()  # agent is active
         except Exception:
             pass
+        if time.monotonic() - last_activity > idle_timeout:
+            print(f"  wait_for_stable: idle timeout after {idle_timeout:.0f}s")
+            return False
         time.sleep(poll_interval)
     return False
 
