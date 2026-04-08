@@ -96,8 +96,15 @@ function writeStatic() {
 function getVerificationStatus(tablet) {
   // Read correspondence results (from any agent) and NL proof results.
   // Initialize all non-preamble nodes as 'pass', then mark failures.
+  // Only show results when the cycle is not actively running (resume_from is empty).
   const status = {};
   const nodeNames = Object.keys(tablet.nodes || {}).filter(n => n !== 'Preamble');
+
+  // Don't show partial results mid-cycle
+  try {
+    const state = JSON.parse(fs.readFileSync(path.join(STATE_DIR, 'state.json'), 'utf-8'));
+    if (state.resume_from) return status;  // cycle in progress
+  } catch {}
 
   // Track which checks have been run
   let corrChecked = false, proofChecked = false;

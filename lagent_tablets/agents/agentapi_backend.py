@@ -717,6 +717,29 @@ def run(
     # Rate limit buffer
     time.sleep(10)
 
+    # Quick health check: verify the agent is actually alive after startup.
+    # If the PTY subprocess died (3-second screen death), the status will be
+    # "stable" with no messages, or the server won't respond at all.
+    try:
+        import urllib.request as _ur
+        _req = _ur.Request(f"http://localhost:{port}/status")
+        _resp = _ur.urlopen(_req, timeout=5)
+        _data = json.loads(_resp.read().decode())
+        if _data.get("status") == "stable":
+            # Server is up but agent might be dead. Check if there are any messages
+            # (a healthy agent shows a welcome screen in the messages).
+            msgs = get_messages(port)
+            if not msgs:
+                stop_server(port)
+                return BurstResult(ok=False, exit_code=None, captured_output="",
+                                  duration_seconds=time.monotonic() - start,
+                                  error="Agent died on startup (no messages after init)")
+    except Exception:
+        stop_server(port)
+        return BurstResult(ok=False, exit_code=None, captured_output="",
+                          duration_seconds=time.monotonic() - start,
+                          error="Agent server not responding after startup")
+
     # Send the prompt
     ok = send_message(port, prompt, timeout=timeout)
     if not ok:
@@ -742,6 +765,26 @@ def run(
         return BurstResult(ok=False, exit_code=None, captured_output=output,
                           duration_seconds=time.monotonic() - start,
                           error="Failed to send message")
+
+    # Quick check: did the agent start processing? If status is "stable"
+    # within 10 seconds of sending, the agent likely died without processing.
+    time.sleep(3)
+    try:
+        _req = _ur.Request(f"http://localhost:{port}/status")
+        _resp = _ur.urlopen(_req, timeout=5)
+        _data = json.loads(_resp.read().decode())
+        if _data.get("status") == "stable":
+            # Check if there's a new agent message (response started)
+            msgs = get_messages(port)
+            agent_msgs = [m for m in msgs if m.get("role") == "agent"]
+            if len(agent_msgs) <= 1:  # only welcome screen, no response
+                output = get_last_agent_message(port)
+                stop_server(port)
+                return BurstResult(ok=False, exit_code=None, captured_output=output,
+                                  duration_seconds=time.monotonic() - start,
+                                  error="Agent died immediately after receiving prompt")
+    except Exception:
+        pass
 
     # Wait for agent to finish
     stable = wait_for_stable(port, timeout=timeout, done_file=done_file)
