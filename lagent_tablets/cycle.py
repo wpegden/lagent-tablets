@@ -1519,6 +1519,30 @@ def run_theorem_stating_cycle(
         from lagent_tablets.nl_cache import NLCache
         nl_cache = NLCache(config.state_dir / "nl_cache.json")
         all_check_nodes = [n for n in tablet.nodes if tablet.nodes[n].kind != "preamble"]
+    elif resume_from == "reviewer":
+        # Reconstruct verification results from saved files
+        print(f"  Skipping verification (resuming from reviewer)")
+        for i in range(10):
+            f = repo / f"correspondence_result_{i}.json"
+            if f.exists():
+                try:
+                    data = load_json(f)
+                    if isinstance(data, dict):
+                        nl_verification_results.append({"check": "correspondence", "agent_index": i, **data})
+                except Exception:
+                    pass
+        if not nl_verification_results:
+            f = repo / "correspondence_result.json"
+            if f.exists():
+                try:
+                    data = load_json(f)
+                    if isinstance(data, dict):
+                        nl_verification_results.append({"check": "correspondence", **data})
+                except Exception:
+                    pass
+        if nl_verification_results:
+            overalls = [r.get("overall", "?") for r in nl_verification_results]
+            print(f"  Loaded {len(nl_verification_results)} correspondence results: {overalls}")
         print(f"  Running NL verification for {len(all_check_nodes)} nodes...")
         nl_verification_results = _run_nl_verification(
             config, tablet, all_check_nodes, log_dir=log_dir, nl_cache=nl_cache,
