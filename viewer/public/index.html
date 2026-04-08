@@ -431,7 +431,7 @@ async function updateCycleInfo() {
 
   // Load historical state from git
   try {
-    const resp = await fetch(`api/state-at/${val}`);
+    const resp = await fetch(`api/state-at/${val}.json`);
     if (resp.ok) {
       const data = await resp.json();
       allNodes = data.nodes;

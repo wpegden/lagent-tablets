@@ -82,6 +82,30 @@ function writeStatic() {
     }
     fs.writeFileSync(path.join(STATIC_OUT, 'api', 'nodes.json'), JSON.stringify(nodes));
 
+    // Generate state-at files for each cycle in git
+    const stateAtDir = path.join(STATIC_OUT, 'api', 'state-at');
+    fs.mkdirSync(stateAtDir, { recursive: true });
+    try {
+      const tags = git('tag -l "cycle-*" --sort=version:refname').split('\n').filter(t => t);
+      for (const tag of tags) {
+        const cycleNum = parseInt(tag.replace('cycle-', ''), 10);
+        const outFile = path.join(stateAtDir, `${cycleNum}.json`);
+        if (fs.existsSync(outFile)) continue; // already generated
+        try {
+          const tabletRaw = git(`show ${tag}:.agent-supervisor/tablet.json`);
+          const stateRaw = git(`show ${tag}:.agent-supervisor/state.json`);
+          const histTablet = JSON.parse(tabletRaw);
+          const histState = JSON.parse(stateRaw);
+          const histNodes = buildNodes(histTablet);
+          const histVerif = getVerificationStatus(histTablet);
+          for (const [name, vs] of Object.entries(histVerif)) {
+            if (histNodes[name]) histNodes[name].verification = vs;
+          }
+          fs.writeFileSync(outFile, JSON.stringify({ state: histState, tablet: histTablet, nodes: histNodes }));
+        } catch {}
+      }
+    } catch {}
+
     // Copy index.html
     const htmlSrc = path.join(__dirname, 'public', 'index.html');
     if (fs.existsSync(htmlSrc)) {
