@@ -337,7 +337,8 @@ def send_message(port: int, content: str, *, timeout: float = 3600) -> bool:
     try:
         resp = urllib.request.urlopen(req, timeout=timeout)
         return resp.status == 200
-    except Exception:
+    except Exception as exc:
+        print(f"  send_message failed on port {port}: {exc}")
         return False
 
 
