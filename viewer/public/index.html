@@ -320,7 +320,7 @@ function renderDAG() {
       { key: 'correspondence', label: 'C' },
       { key: 'nl_proof', label: 'P' },
     ];
-    let badgeX = 70;
+    let badgeX = 75;
     for (const { key, label } of checks) {
       const val = verif[key] || '?';
       const badge = document.createElementNS(ns, 'text');
@@ -339,7 +339,7 @@ function renderDAG() {
       }
       badge.setAttribute('pointer-events', 'none');
       g.appendChild(badge);
-      badgeX += 40;
+      badgeX += 30;
     }
 
     svg.appendChild(g);

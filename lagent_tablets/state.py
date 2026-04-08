@@ -115,6 +115,7 @@ class TabletNode:
     correspondence_status: str = "?"  # "?", "pass", "fail"
     soundness_status: str = "?"       # "?", "pass", "fail", "structural"
     verification_at_cycle: Optional[int] = None  # when status was last set
+    verification_content_hash: str = ""  # hash of .lean+.tex when status was set
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -139,6 +140,8 @@ class TabletNode:
             d["soundness_status"] = self.soundness_status
         if self.verification_at_cycle is not None:
             d["verification_at_cycle"] = self.verification_at_cycle
+        if self.verification_content_hash:
+            d["verification_content_hash"] = self.verification_content_hash
         return d
 
     @classmethod
@@ -160,6 +163,7 @@ class TabletNode:
             correspondence_status=str(raw.get("correspondence_status", "?")),
             soundness_status=str(raw.get("soundness_status", "?")),
             verification_at_cycle=raw.get("verification_at_cycle"),
+            verification_content_hash=str(raw.get("verification_content_hash", "")),
         )
 
 

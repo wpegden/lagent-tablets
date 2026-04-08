@@ -93,14 +93,30 @@ function writeStatic() {
   }
 }
 
+function nodeContentHash(name) {
+  // SHA-256 of .lean + .tex, matching _node_content_hash in cycle.py
+  const crypto = require('crypto');
+  const h = crypto.createHash('sha256');
+  const tabletDir = path.join(REPO_PATH, 'Tablet');
+  for (const ext of ['.lean', '.tex']) {
+    const p = path.join(tabletDir, name + ext);
+    try { h.update(fs.readFileSync(p)); } catch {}
+  }
+  return h.digest('hex').substring(0, 16);
+}
+
 function getVerificationStatus(tablet) {
-  // Read per-node verification status from tablet.json (set by the reviewer cycle).
-  // "?" means never verified in current form.
+  // Read per-node verification status from tablet.json.
+  // Status is sticky UNLESS the node's content has changed since verification.
   const status = {};
   for (const [name, node] of Object.entries(tablet.nodes || {})) {
     if (name === 'Preamble') continue;
-    const cs = node.correspondence_status || '?';
-    const ss = node.soundness_status || '?';
+    const savedHash = node.verification_content_hash || '';
+    const currentHash = savedHash ? nodeContentHash(name) : '';
+    const contentChanged = savedHash && currentHash !== savedHash;
+
+    const cs = contentChanged ? '?' : (node.correspondence_status || '?');
+    const ss = contentChanged ? '?' : (node.soundness_status || '?');
     if (cs !== '?' || ss !== '?') {
       status[name] = { correspondence: cs, nl_proof: ss };
     }

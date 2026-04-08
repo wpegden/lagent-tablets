@@ -1109,10 +1109,22 @@ def _run_per_node_soundness(
     }]
 
 
+def _node_content_hash(repo_path: Path, name: str) -> str:
+    """Hash of a node's .lean + .tex content for change detection."""
+    import hashlib
+    h = hashlib.sha256()
+    for suffix in (".lean", ".tex"):
+        p = repo_path / "Tablet" / f"{name}{suffix}"
+        if p.exists():
+            h.update(p.read_bytes())
+    return h.hexdigest()[:16]
+
+
 def _apply_verification_to_tablet(
     tablet: TabletState,
     verification_results: List[Dict[str, Any]],
     cycle: int,
+    repo_path: Optional[Path] = None,
 ) -> None:
     """Update per-node verification status in tablet from cycle results.
 
@@ -1152,7 +1164,8 @@ def _apply_verification_to_tablet(
             if issue.get("node"):
                 sound_failed.add(issue["node"])
 
-    # Apply to tablet nodes
+    # Apply to tablet nodes and store content hash for change detection
+    repo = Path(tablet.nodes[list(tablet.nodes.keys())[0]].name).parent if tablet.nodes else Path(".")
     for name, node in tablet.nodes.items():
         if name == "Preamble":
             continue
@@ -1167,6 +1180,8 @@ def _apply_verification_to_tablet(
             else:
                 node.soundness_status = "pass"
             node.verification_at_cycle = cycle
+        if (corr_checked or sound_checked) and repo_path:
+            node.verification_content_hash = _node_content_hash(repo_path, name)
 
 
 def _is_definition_node(repo_path: Path, name: str) -> bool:
@@ -1614,7 +1629,7 @@ def run_theorem_stating_cycle(
 
     # Apply verification results to per-node tablet status
     if nl_verification_results:
-        _apply_verification_to_tablet(tablet, nl_verification_results, cycle)
+        _apply_verification_to_tablet(tablet, nl_verification_results, cycle, repo_path=repo)
         save_tablet(tablet_path(config), tablet)
 
     # ---- Stage 3: Reviewer ----
