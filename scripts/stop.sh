@@ -17,6 +17,8 @@ sudo -n -u "$BURST_USER" pkill -f "gemini.*yolo" 2>/dev/null
 
 sleep 2
 rm -f "$REPO/.agent-supervisor/pause"
+# Note: result files (correspondence_result_*.json, etc.) are NOT deleted.
+# They are tracked in git and serve as context for the next cycle's verifiers.
 
 remaining=$(ps aux | grep "agentapi\|codex exec\|claude --danger\|gemini.*yolo" | grep -v grep | wc -l)
 if [ "$remaining" -gt 0 ]; then

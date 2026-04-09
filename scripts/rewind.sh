@@ -42,14 +42,12 @@ sleep 2
 echo "2. Resetting git to $TAG..."
 git -C "$REPO" reset --hard "$TAG"
 
-# 3. Clean signal files
-echo "3. Cleaning signal files..."
-rm -f "$REPO"/correspondence_result*.json \
-      "$REPO"/nl_proof_result*.json \
-      "$REPO"/reviewer_decision.json \
-      "$REPO"/worker_handoff.json \
-      "$REPO/.agent-supervisor/nl_cache.json"* \
+# 3. Clean ephemeral signal files (NOT result files — those are tracked in git)
+echo "3. Cleaning ephemeral files..."
+rm -f "$REPO/.agent-supervisor/nl_cache.json"* \
       "$REPO/.agent-supervisor/pause"
+# Result files (correspondence_result_*.json, etc.) are preserved in git history.
+# The git reset --hard already restores the correct versions for this cycle.
 
 # 4. Clean agent sessions (prevent context poisoning)
 echo "4. Clearing agent sessions..."

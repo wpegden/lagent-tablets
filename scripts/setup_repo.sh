@@ -105,13 +105,11 @@ lake-packages/
 .agent-supervisor/nl_cache.json*
 .agent-supervisor/policy.json*
 .agent-supervisor/pause
-worker_handoff.json
-reviewer_decision.json
-correspondence_result*.json
-nl_proof_result*.json
-HUMAN_INPUT.md
+# Signal files (ephemeral)
 human_approve.json
 human_feedback.json
+# Note: correspondence_result*.json, nl_proof_result*.json, reviewer_decision.json,
+# and worker_handoff.json are TRACKED in git for complete history.
 __pycache__/
 *.pyc
 node_modules/
