@@ -114,8 +114,55 @@ class TestCodexNoHardTimeout(unittest.TestCase):
         content = script.read_text()
         self.assertNotIn("timeout --signal", content,
                          "codex script should NOT have hard timeout wrapper")
-        self.assertIn('"${real_cmd[@]}"', content,
-                      "codex script should run command directly")
+        self.assertIn('"${cmd[@]}" < "$PROMPT_FILE"', content,
+                      "codex script should pass the prompt on stdin")
+        self.assertIn('setsid "${cmd[@]}"', content,
+                      "codex script should launch the agent in a dedicated session")
+        self.assertIn('kill -- -"$AGENT_PID"', content,
+                      "codex cleanup should kill the whole process group")
+        self.assertNotIn("PROMPT_CONTENT=$(cat \"$PROMPT_FILE\")", content,
+                         "codex script should not materialize the prompt into argv")
+
+    def test_script_headless_codex_uses_stdin(self):
+        from lagent_tablets.agents.script_headless import build_script
+        config = ProviderConfig(provider="codex", model="gpt-5.4")
+        tmpdir = Path(tempfile.mkdtemp())
+        script = build_script(
+            config,
+            prompt_file=tmpdir / "prompt.txt",
+            start_file=tmpdir / "start",
+            exit_file=tmpdir / "exit",
+            work_dir=tmpdir,
+        )
+        content = script.read_text()
+        self.assertIn('"${cmd[@]}" < "$PROMPT_FILE"', content,
+                      "fallback codex script should pass the prompt on stdin")
+        self.assertIn('setsid "${cmd[@]}"', content,
+                      "fallback codex script should launch the agent in a dedicated session")
+        self.assertIn('kill -- -"$AGENT_PID"', content,
+                      "fallback codex cleanup should kill the whole process group")
+        self.assertNotIn("PROMPT_CONTENT=$(cat \"$PROMPT_FILE\")", content,
+                         "fallback codex script should not materialize the prompt into argv")
+
+    def test_script_headless_noncodex_uses_watchdog_and_process_group_cleanup(self):
+        from lagent_tablets.agents.script_headless import build_script
+        config = ProviderConfig(provider="claude", model="claude-opus-4-6")
+        tmpdir = Path(tempfile.mkdtemp())
+        script = build_script(
+            config,
+            prompt_file=tmpdir / "prompt.txt",
+            start_file=tmpdir / "start",
+            exit_file=tmpdir / "exit",
+            work_dir=tmpdir,
+            agent_timeout_seconds=123,
+        )
+        content = script.read_text()
+        self.assertNotIn("timeout --signal", content,
+                         "script headless should manage timeout via watchdog, not timeout(1)")
+        self.assertIn("AGENT_TIMEOUT_SECONDS=123", content)
+        self.assertIn('WATCHDOG_PID=$!', content)
+        self.assertIn('kill -- -"$AGENT_PID"', content)
+        self.assertIn('setsid "${real_cmd[@]}"', content)
 
 
 class TestCorrespondenceAgentDoneFiles(unittest.TestCase):
@@ -141,6 +188,7 @@ class TestCorrespondenceAgentDoneFiles(unittest.TestCase):
 
         config_mock = MagicMock()
         config_mock.repo_path = repo
+        config_mock.state_dir = repo / ".agent-supervisor"
         config_mock.goal_file = repo / "GOAL.md"
         config_mock.workflow.paper_tex_path = None
         config_mock.tmux.session_name = "test"
@@ -150,15 +198,16 @@ class TestCorrespondenceAgentDoneFiles(unittest.TestCase):
 
         with patch("lagent_tablets.cycle.run_reviewer_burst") as mock_burst:
             mock_burst.return_value = _fake_result()
-            _run_single_correspondence_agent(
-                config_mock, tablet, ["test_node"], agent,
-                paper_tex="", human_input="", log_dir=repo / ".agent-supervisor" / "logs",
-                agent_index=0,
-            )
-            args = mock_burst.call_args
-            done_file = args.kwargs.get("done_file")
-            self.assertIsNotNone(done_file, "done_file must be passed")
-            self.assertEqual(done_file.name, "correspondence_result_0.json")
+            with patch("lagent_tablets.cycle._accept_validated_artifact", return_value=(None, "missing")):
+                _run_single_correspondence_agent(
+                    config_mock, tablet, ["test_node"], agent,
+                    paper_tex="", human_input="", log_dir=repo / ".agent-supervisor" / "logs",
+                    agent_index=0,
+                )
+                args = mock_burst.call_args
+                done_file = args.kwargs.get("done_file")
+                self.assertIsNotNone(done_file, "done_file must be passed")
+                self.assertEqual(done_file.name, "correspondence_result_0.done")
 
     def test_soundness_agent_done_file(self):
         """_run_single_node_soundness passes result_file as done_file."""
@@ -180,6 +229,7 @@ class TestCorrespondenceAgentDoneFiles(unittest.TestCase):
 
         config_mock = MagicMock()
         config_mock.repo_path = repo
+        config_mock.state_dir = repo / ".agent-supervisor"
         config_mock.goal_file = repo / "GOAL.md"
         config_mock.workflow.paper_tex_path = None
         config_mock.tmux.session_name = "test"
@@ -189,15 +239,16 @@ class TestCorrespondenceAgentDoneFiles(unittest.TestCase):
 
         with patch("lagent_tablets.cycle.run_reviewer_burst") as mock_burst:
             mock_burst.return_value = _fake_result()
-            _run_single_node_soundness(
-                config_mock, tablet, "test_node", agent,
-                paper_tex="", human_input="", log_dir=repo / ".agent-supervisor" / "logs",
-                agent_index=0, node_index=0,
-            )
-            args = mock_burst.call_args
-            done_file = args.kwargs.get("done_file")
-            self.assertIsNotNone(done_file, "done_file must be passed")
-            self.assertEqual(done_file.name, "nl_proof_test_node_0.json")
+            with patch("lagent_tablets.cycle._accept_validated_artifact", return_value=(None, "missing")):
+                _run_single_node_soundness(
+                    config_mock, tablet, "test_node", agent,
+                    paper_tex="", human_input="", log_dir=repo / ".agent-supervisor" / "logs",
+                    agent_index=0, node_index=0,
+                )
+                args = mock_burst.call_args
+                done_file = args.kwargs.get("done_file")
+                self.assertIsNotNone(done_file, "done_file must be passed")
+                self.assertEqual(done_file.name, "nl_proof_test_node_0.done")
 
 
 class TestPromptNoInlineContent(unittest.TestCase):
@@ -216,6 +267,7 @@ class TestPromptNoInlineContent(unittest.TestCase):
 
         config_mock = MagicMock()
         config_mock.repo_path = repo
+        config_mock.state_dir = repo / ".agent-supervisor"
         config_mock.goal_file = repo / "GOAL.md"
         config_mock.workflow.paper_tex_path = repo / "paper.tex"
 
@@ -361,6 +413,22 @@ class TestWorkerBurstDoneFile(unittest.TestCase):
                 run_worker_burst(config, "test", session_name="t", work_dir=tmpdir)
             args = mock_run.call_args
             self.assertEqual(args.kwargs["done_file"], tmpdir / "worker_handoff.json")
+
+    def test_worker_clears_stale_handoff_file(self):
+        config = ProviderConfig(provider="claude", model="test")
+        tmpdir = Path(tempfile.mkdtemp())
+        stale = tmpdir / "worker_handoff.json"
+        stale.write_text('{"summary":"stale"}', encoding="utf-8")
+
+        def _check_stale_removed(*args, **kwargs):
+            self.assertFalse(stale.exists(), "stale worker_handoff.json must be removed before launch")
+            return _fake_result()
+
+        with patch("lagent_tablets.agents.agentapi_backend.run", side_effect=_check_stale_removed) as mock_run:
+            from lagent_tablets.burst import run_worker_burst
+            with patch("lagent_tablets.burst.run_with_retry", side_effect=lambda fn, **kw: fn()):
+                run_worker_burst(config, "test", session_name="t", work_dir=tmpdir)
+            self.assertTrue(mock_run.called)
 
 
 if __name__ == "__main__":

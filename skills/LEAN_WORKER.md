@@ -93,18 +93,19 @@ You are creating the tablet structure. For each node:
 2. Write `Tablet/{name}.tex` with rigorous NL statement and proof
 3. Set up imports between nodes to define the DAG
 4. Set up `Tablet/Preamble.lean` with specific Mathlib imports
-5. Run `lake build Tablet` -- sorry warnings are expected, errors are not
-6. The supervisor auto-generates `Tablet.lean` -- do NOT create or edit it
+5. Run `python3 .agent-supervisor/scripts/check.py tablet .` -- sorry warnings are expected, errors are not
+6. Write the raw handoff file to the path given in the prompt, run the same checker on that raw JSON, then write the completion marker from the prompt
+7. The supervisor auto-generates `Tablet.lean` -- do NOT create or edit it
 
 ### During proof_formalization
 You are proving one node at a time:
 1. Read `Tablet/{node}.lean` (declaration) and `Tablet/{node}.tex` (NL proof)
 2. Search Loogle for relevant Mathlib lemmas
 3. Write the proof body (everything after `:=`)
-4. Run `check_node.sh {node}` and iterate until it passes
-5. Write `worker_handoff.json` and stop
+4. Run `python3 .agent-supervisor/scripts/check.py node {node} .` and iterate until it passes
+5. Write the raw handoff file to the path given in the prompt, run the same checker on that raw JSON, then write the completion marker from the prompt
 
-### check_node.sh passing output
+### check.py node passing output
 ```
 === Checking node: {name} ===
   Declaration: OK
@@ -120,7 +121,7 @@ If you need an intermediate result, create a new node:
 - `Tablet/{helper_name}.lean` -- with `-- [TABLET NODE: helper_name]` marker
 - `Tablet/{helper_name}.tex` -- with NL statement and proof
 - Import it in your active node
-- List it in `worker_handoff.json` under `new_nodes`
+- List it in the raw handoff JSON under `new_nodes`
 
 ---
 
@@ -131,5 +132,5 @@ If you need an intermediate result, create a new node:
 3. **Forgetting the `.tex` file** for new helpers. Every `.lean` needs a paired `.tex`.
 4. **Missing the `-- [TABLET NODE: name]` marker** in new node files.
 5. **Using `import Mathlib`** instead of specific imports. Causes 20+ minute rebuilds and will be rejected.
-6. **Not running check_node.sh** before writing the handoff.
+6. **Not running the shared checker** before writing the handoff.
 7. **Spinning without progress.** If stuck after several attempts, write the handoff with `"status": "STUCK"` and explain what you tried. The reviewer will guide you.

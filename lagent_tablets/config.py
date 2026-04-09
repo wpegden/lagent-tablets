@@ -205,8 +205,21 @@ PHASES: Tuple[str, ...] = (
 )
 
 FORBIDDEN_KEYWORDS_DEFAULT: Tuple[str, ...] = (
-    "sorry", "axiom", "constant", "unsafe", "opaque",
-    "native_decide", "implementedBy", "extern",
+    "sorry",
+    "axiom",
+    "constant",
+    "unsafe",
+    "opaque",
+    "partial",
+    "native_decide",
+    "implementedBy",
+    "implemented_by",
+    "extern",
+    "elab",
+    "macro",
+    "syntax",
+    "run_cmd",
+    "#eval",
 )
 
 

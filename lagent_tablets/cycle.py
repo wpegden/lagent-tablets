@@ -19,9 +19,9 @@ from typing import Any, Dict, List, Optional, Set
 
 import hashlib
 
+from lagent_tablets.artifacts import artifact_stem, done_marker_path, raw_json_path
 from lagent_tablets.adapters import BurstResult, ProviderConfig
 from lagent_tablets.burst import (
-    extract_json_decision,
     run_reviewer_burst,
     run_worker_burst,
 )
@@ -38,6 +38,8 @@ from lagent_tablets.state import (
     TabletNode,
     TabletState,
     load_json,
+    normalize_open_rejections,
+    normalize_orphan_resolutions,
     save_json,
     save_state,
     save_tablet,
@@ -66,7 +68,11 @@ from lagent_tablets.tablet import (
     extract_declaration_name,
     scan_forbidden_keywords,
 )
-from lagent_tablets.check import check_node as run_check_node
+from lagent_tablets.check import (
+    check_node as run_check_node,
+    check_tablet as run_check_tablet,
+    validate_json_artifact,
+)
 
 
 def _accumulate_usage(state: SupervisorState, role: str, usage: Optional[Dict[str, Any]]) -> None:
@@ -164,6 +170,282 @@ def _detect_changes(before: Dict[str, str], after: Dict[str, str]) -> Dict[str, 
     return {"created": created, "modified": modified, "deleted": deleted}
 
 
+def _prune_deleted_tablet_nodes(
+    tablet: TabletState,
+    present_nodes: set[str],
+) -> List[str]:
+    """Remove non-preamble tablet nodes whose .lean/.tex pair was deleted from disk."""
+    deleted_nodes: List[str] = []
+    for name in sorted(list(tablet.nodes.keys())):
+        node = tablet.nodes.get(name)
+        if node is None or node.kind == "preamble":
+            continue
+        if name in present_nodes:
+            continue
+        deleted_nodes.append(name)
+        tablet.nodes.pop(name, None)
+    if tablet.active_node in deleted_nodes:
+        tablet.active_node = ""
+    return deleted_nodes
+
+
+def _is_resolved_rejection_reason(description: str) -> bool:
+    """Return True when text is clearly documenting a resolved past issue."""
+    resolved_prefixes = (
+        "previously flagged",
+        "now fixed",
+        "already fixed",
+        "appears fixed",
+        "appears genuinely fixed",
+        "genuinely fixed",
+        "seems fixed",
+        "resolved:",
+        "resolved -",
+        "resolved ",
+        "fixed in this revision",
+        "fixed by this revision",
+    )
+    normalized = " ".join(
+        str(description).lower()
+        .replace("—", " ")
+        .replace("–", " ")
+        .split()
+    )
+    return any(normalized.startswith(prefix) for prefix in resolved_prefixes)
+
+
+def _collect_theorem_stating_rejection_map(
+    nl_verification_results: List[Dict[str, Any]],
+) -> Dict[tuple[str, str], str]:
+    """Collect current correspondence/paper-faithfulness failures by node."""
+    issues_by_key: Dict[tuple[str, str], List[str]] = {}
+
+    def add_phase_issues(phase: str, phase_result: Any) -> None:
+        if not isinstance(phase_result, dict):
+            return
+        if str(phase_result.get("decision", "")).upper() != "FAIL":
+            return
+        issues = phase_result.get("issues", [])
+        if not isinstance(issues, list):
+            return
+        for issue in issues:
+            if not isinstance(issue, dict):
+                continue
+            node = str(issue.get("node", "")).strip() or "(global)"
+            description = str(issue.get("description", "")).strip()
+            if not description:
+                continue
+            if _is_resolved_rejection_reason(description):
+                continue
+            key = (node, phase)
+            bucket = issues_by_key.setdefault(key, [])
+            if description not in bucket:
+                bucket.append(description)
+
+    for result in nl_verification_results:
+        if result.get("check") != "correspondence":
+            continue
+        agent_results = result.get("agent_results")
+        sources = agent_results if isinstance(agent_results, list) else [result]
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            for phase in ("correspondence", "paper_faithfulness"):
+                add_phase_issues(phase, source.get(phase))
+
+    return {
+        key: "; ".join(descriptions)
+        for key, descriptions in sorted(issues_by_key.items())
+    }
+
+
+def _reconcile_theorem_stating_open_rejections(
+    nl_verification_results: List[Dict[str, Any]],
+    preferred_rejections: Any,
+    *,
+    include_preferred_extras: bool = False,
+) -> List[Dict[str, str]]:
+    """Persist the current theorem-stating rejection list with stable keys.
+
+    The reviewer is asked to write the reasons, but we fall back to verifier
+    issue text if the reviewer omits an entry. By default the resulting list
+    matches the currently failing correspondence/paper-faithfulness issues.
+    When `include_preferred_extras` is true, reviewer-authored blockers that
+    are not present in the verifier output are preserved as additional current
+    rejections so the worker sees a single authoritative list.
+    """
+    current_failures = _collect_theorem_stating_rejection_map(nl_verification_results)
+    preferred_entries = [
+        entry for entry in normalize_open_rejections(preferred_rejections)
+        if not _is_resolved_rejection_reason(entry["reason"])
+    ]
+    preferred_map = {
+        (entry["node"], entry["phase"]): entry["reason"]
+        for entry in preferred_entries
+    }
+    all_keys = set(current_failures)
+    if include_preferred_extras:
+        all_keys.update(preferred_map)
+    reconciled: List[Dict[str, str]] = []
+    for node, phase in sorted(all_keys):
+        fallback_reason = current_failures.get((node, phase), "")
+        reason = preferred_map.get((node, phase), fallback_reason)
+        if not reason:
+            continue
+        reconciled.append({
+            "node": node,
+            "phase": phase,
+            "reason": reason,
+        })
+    return reconciled
+
+
+def _default_theorem_stating_next_prompt() -> str:
+    """Fallback worker guidance when the reviewer omits explicit instructions."""
+    return (
+        "Resolve the current open correspondence and paper-faithfulness "
+        "rejections. Theorem-stating continues until the open-rejection list is empty."
+    )
+
+
+def _summarize_open_rejections(open_rejections: List[Dict[str, str]], *, limit: int = 3) -> str:
+    """Short summary of the currently open theorem-stating rejections."""
+    if not open_rejections:
+        return ""
+    parts = [f"{entry['node']} ({entry['phase']})" for entry in open_rejections[:limit]]
+    if len(open_rejections) > limit:
+        parts.append(f"+{len(open_rejections) - limit} more")
+    return ", ".join(parts)
+
+
+def _enforce_theorem_stating_open_rejections(
+    decision: Dict[str, Any],
+    open_rejections: List[Dict[str, str]],
+) -> None:
+    """Block theorem-stating phase advance while open verification rejections remain."""
+    decision["open_rejections"] = open_rejections
+    if open_rejections and not str(decision.get("next_prompt", "")).strip():
+        decision["next_prompt"] = _default_theorem_stating_next_prompt()
+    if decision.get("decision") == "ADVANCE_PHASE" and open_rejections:
+        summary = _summarize_open_rejections(open_rejections)
+        decision["decision"] = "CONTINUE"
+        decision["reason"] = (
+            "Open correspondence/paper-faithfulness rejections remain"
+            + (f": {summary}" if summary else ".")
+        )
+
+
+def _summarize_orphan_candidates(orphan_candidates: List[str], *, limit: int = 3) -> str:
+    """Short summary of current theorem-stating orphan-node candidates."""
+    if not orphan_candidates:
+        return ""
+    parts = orphan_candidates[:limit]
+    if len(orphan_candidates) > limit:
+        parts.append(f"+{len(orphan_candidates) - limit} more")
+    return ", ".join(parts)
+
+
+def _default_orphan_next_prompt(
+    orphan_resolutions: List[Dict[str, Any]],
+    unresolved_candidates: List[str],
+) -> str:
+    """Fallback worker guidance for current orphan-node candidates."""
+    lines = [
+        "Resolve the current orphan-node candidates before treating the tablet structure as complete.",
+    ]
+    for entry in orphan_resolutions:
+        node = entry["node"]
+        if entry["action"] == "remove":
+            lines.append(
+                f"- Remove orphan node `{node}` unless you add a real downstream dependency and citation that justifies keeping it."
+            )
+        else:
+            parents = entry.get("suggested_parents", [])
+            if parents:
+                lines.append(
+                    f"- Keep orphan node `{node}` only by adding a real downstream dependency/citation from: {', '.join(parents)}."
+                )
+            else:
+                lines.append(
+                    f"- Keep orphan node `{node}` only if you add the missing real downstream dependency/citation showing where it is needed."
+                )
+    for node in unresolved_candidates:
+        lines.append(
+            f"- Reviewer must decide whether orphan node `{node}` should be removed or kept via a missing downstream dependency/citation."
+        )
+    return "\n".join(lines)
+
+
+def _enforce_theorem_stating_orphan_candidates(
+    decision: Dict[str, Any],
+    orphan_candidates: List[str],
+) -> None:
+    """Persist reviewer arbitration for orphan candidates and block phase advance."""
+    orphan_candidates = sorted(dict.fromkeys(orphan_candidates))
+    resolutions = normalize_orphan_resolutions(
+        decision.get("orphan_resolutions", []),
+        allowed_nodes=set(orphan_candidates),
+    )
+    decision["orphan_resolutions"] = resolutions
+
+    if not orphan_candidates:
+        return
+
+    resolved_nodes = {entry["node"] for entry in resolutions}
+    unresolved = [name for name in orphan_candidates if name not in resolved_nodes]
+    if not str(decision.get("next_prompt", "")).strip():
+        decision["next_prompt"] = _default_orphan_next_prompt(resolutions, unresolved)
+
+    if decision.get("decision") == "ADVANCE_PHASE":
+        summary = _summarize_orphan_candidates(orphan_candidates)
+        decision["decision"] = "CONTINUE"
+        decision["reason"] = (
+            "Orphan node candidates remain"
+            + (f": {summary}" if summary else ".")
+        )
+
+
+def _artifact_paths(config: Config, canonical_name: str) -> Dict[str, Path]:
+    return {
+        "canonical": config.repo_path / canonical_name,
+        "raw": raw_json_path(config.state_dir, canonical_name),
+        "done": done_marker_path(config.state_dir, canonical_name),
+        "stem": Path(artifact_stem(canonical_name)),
+    }
+
+
+def _clear_artifact_files(config: Config, canonical_name: str) -> Dict[str, Path]:
+    paths = _artifact_paths(config, canonical_name)
+    for key in ("canonical", "raw", "done"):
+        paths[key].unlink(missing_ok=True)
+    return paths
+
+
+def _accept_validated_artifact(
+    config: Config,
+    canonical_name: str,
+    *,
+    kind: str,
+    phase: Optional[str] = None,
+    node_name: Optional[str] = None,
+    repo_for_validation: Optional[Path] = None,
+) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    paths = _artifact_paths(config, canonical_name)
+    validation = validate_json_artifact(
+        kind,
+        paths["raw"],
+        phase=phase,
+        node_name=node_name,
+        repo=repo_for_validation or config.repo_path,
+    )
+    if not validation["ok"]:
+        return None, "; ".join(validation["errors"])
+    data = validation["data"]
+    assert isinstance(data, dict)
+    save_json(paths["canonical"], data)
+    return data, None
+
+
 # ---------------------------------------------------------------------------
 # Permission setup
 # ---------------------------------------------------------------------------
@@ -176,7 +458,8 @@ def setup_permissions(config: Config, active_node: str, *, easy_mode: bool = Fal
     - Preamble.lean: 0o664 (hard) / 0o644 (easy) -- easy workers cannot add imports
     - Everything else: 0o644 (group-read-only) -- worker CANNOT edit
     - Tablet/ directory: 0o2775 (hard) / 0o2755 (easy) -- easy workers cannot create files
-    - worker_handoff.json: 0o664 -- worker can write completion marker
+    - Repo root: 0o2755 -- worker cannot create/delete arbitrary top-level files
+    - Staging dir: 0o2775 -- worker can write raw JSON + done markers only there
 
     The shared group is 'leanagent' (gid from leanagent user).
     The supervisor (leanagent) is the owner; burst_user (lagentworker) is in the group.
@@ -186,6 +469,7 @@ def setup_permissions(config: Config, active_node: str, *, easy_mode: bool = Fal
 
     repo = config.repo_path
     tdir = repo / "Tablet"
+    staging = config.state_dir / "staging"
     if not tdir.exists():
         return
 
@@ -206,7 +490,7 @@ def setup_permissions(config: Config, active_node: str, *, easy_mode: bool = Fal
         pass
 
     # Files the worker may edit.
-    # Easy mode: only active node files + handoff. Preamble is read-only.
+    # Easy mode: only active node files. Preamble is read-only.
     writable_basenames = {
         f"{active_node}.lean",
         f"{active_node}.tex",
@@ -251,15 +535,13 @@ def setup_permissions(config: Config, active_node: str, *, easy_mode: bool = Fal
         except (PermissionError, OSError):
             pass
 
-    # worker_handoff.json: group-writable so the worker can create it
-    handoff = repo / "worker_handoff.json"
     try:
-        if handoff.exists():
-            os.chown(str(handoff), -1, gid)
-            os.chmod(str(handoff), 0o664)
-        # Also ensure the repo dir allows creating new files
+        # Allow raw/done artifacts only in staging, not arbitrary repo-root writes.
         os.chown(str(repo), -1, gid)
-        os.chmod(str(repo), 0o2775)
+        os.chmod(str(repo), 0o2755)
+        staging.mkdir(parents=True, exist_ok=True)
+        os.chown(str(staging), -1, gid)
+        os.chmod(str(staging), 0o2775)
     except PermissionError:
         pass
 
@@ -271,6 +553,7 @@ def _setup_theorem_stating_permissions(config: Config) -> None:
 
     repo = config.repo_path
     tdir = repo / "Tablet"
+    staging = config.state_dir / "staging"
     if not tdir.exists():
         tdir.mkdir(parents=True, exist_ok=True)
 
@@ -303,12 +586,13 @@ def _setup_theorem_stating_permissions(config: Config) -> None:
         except (PermissionError, OSError):
             pass
 
-    # worker_handoff.json and repo root
-    for p in [repo / "worker_handoff.json", repo]:
+    # Staging is writable; repo root is read/execute only to avoid arbitrary top-level writes.
+    staging.mkdir(parents=True, exist_ok=True)
+    for p in [repo, staging]:
         try:
             if p.exists():
                 os.chown(str(p), -1, gid)
-                os.chmod(str(p), 0o2775 if p.is_dir() else 0o664)
+                os.chmod(str(p), 0o2775 if p == staging else 0o2755)
         except PermissionError:
             pass
 
@@ -429,6 +713,7 @@ def validate_worker_cycle(
             allowed_prefixes=allowed_prefixes,
             forbidden_keywords=forbidden,
             expected_declaration_hash=stored_hash,
+            approved_axioms_path=config.workflow.approved_axioms_path,
             timeout_seconds=config.burst_timeout_seconds,
         )
         if not result.compiles:
@@ -499,6 +784,7 @@ def validate_worker_cycle(
             repo, name,
             allowed_prefixes=allowed_prefixes,
             forbidden_keywords=forbidden,
+            approved_axioms_path=config.workflow.approved_axioms_path,
             timeout_seconds=config.burst_timeout_seconds,
         )
         if not result.compiles:
@@ -582,6 +868,7 @@ def validate_worker_cycle_v2(
             allowed_prefixes=config.workflow.allowed_import_prefixes,
             forbidden_keywords=forbidden,
             expected_hash=stored_hash,
+            approved_axioms_path=config.workflow.approved_axioms_path,
         )
         if result["errors"]:
             # Return the first error as the INVALID detail
@@ -712,6 +999,7 @@ def reconcile_tablet_status(config: Config, tablet: TabletState) -> List[str]:
                 repo, name,
                 allowed_prefixes=config.workflow.allowed_import_prefixes,
                 forbidden_keywords=forbidden,
+                approved_axioms_path=config.workflow.approved_axioms_path,
             )
             if result["ok"]:
                 mark_node_closed(tablet, name, 0)
@@ -747,7 +1035,6 @@ def _run_single_correspondence_agent(
     agent_index: int,
 ) -> Dict[str, Any]:
     """Run one correspondence agent. Designed to be called from a thread."""
-    from lagent_tablets.burst import _clean_terminal_json
 
     agent_start = time.monotonic()
     repo = config.repo_path
@@ -755,8 +1042,7 @@ def _run_single_correspondence_agent(
     output_file = f"correspondence_result_{agent_index}.json"
     port = 3286 + agent_index * 2  # 3286, 3288, 3290, ...
 
-    result_file = repo / output_file
-    result_file.unlink(missing_ok=True)
+    artifact_paths = _clear_artifact_files(config, output_file)
 
     prompt = build_correspondence_prompt(
         config, tablet, node_names=corr_nodes, paper_tex=paper_tex,
@@ -778,25 +1064,29 @@ def _run_single_correspondence_agent(
         work_dir=repo, burst_user=config.tmux.burst_user,
         timeout_seconds=1800, log_dir=log_dir, fresh=True,
         port=port,
-        done_file=result_file,
+        done_file=artifact_paths["done"],
+        artifact_prefix=str(artifact_paths["stem"]),
     )
 
     decision = None
-    if result_file.exists():
-        try:
-            decision = load_json(result_file)
-        except Exception:
-            pass
-    if not isinstance(decision, dict) and burst_result.ok:
-        cleaned = _clean_terminal_json(burst_result.captured_output)
-        decision = extract_json_decision(cleaned)
+    artifact_error = None
+    if burst_result.ok:
+        decision, artifact_error = _accept_validated_artifact(
+            config,
+            output_file,
+            kind="correspondence-result",
+        )
 
     result = {
         "agent": label,
         "index": agent_index,
         "ok": burst_result.ok,
         "walltime_seconds": round(time.monotonic() - agent_start, 1),
-        **(decision if isinstance(decision, dict) else {"overall": "ERROR", "summary": f"Failed to get decision from {label}"}),
+        **(
+            decision
+            if isinstance(decision, dict)
+            else {"overall": "ERROR", "summary": artifact_error or f"Failed to get decision from {label}"}
+        ),
     }
     if burst_result.usage:
         result["_usage"] = burst_result.usage
@@ -815,7 +1105,6 @@ def _run_single_soundness_agent(
     agent_index: int,
 ) -> Dict[str, Any]:
     """Run one NL proof soundness agent. Designed to be called from a thread."""
-    from lagent_tablets.burst import _clean_terminal_json
 
     agent_start = time.monotonic()
     repo = config.repo_path
@@ -824,16 +1113,13 @@ def _run_single_soundness_agent(
     # Soundness agents use ports 3310, 3312, 3314, ... (separate from correspondence 3286+ and viewer 3300)
     port = 3310 + agent_index * 2
 
-    result_file = repo / output_file
-    result_file.unlink(missing_ok=True)
+    artifact_paths = _clear_artifact_files(config, output_file)
 
     prompt = build_nl_proof_prompt(
         config, tablet, node_names=proof_nodes, paper_tex=paper_tex,
         human_input=human_input,
+        output_file=output_file,
     )
-    # Replace the output filename in the prompt
-    if output_file != "nl_proof_result.json":
-        prompt = prompt.replace("nl_proof_result.json", output_file)
 
     agent_provider = ProviderConfig(
         provider=agent_config.provider,
@@ -848,25 +1134,30 @@ def _run_single_soundness_agent(
         session_name=config.tmux.session_name,
         work_dir=repo, burst_user=config.tmux.burst_user,
         timeout_seconds=1800, log_dir=log_dir, fresh=True,
+        done_file=artifact_paths["done"],
+        artifact_prefix=str(artifact_paths["stem"]),
         port=port,
     )
 
     decision = None
-    if result_file.exists():
-        try:
-            decision = load_json(result_file)
-        except Exception:
-            pass
-    if not isinstance(decision, dict) and burst_result.ok:
-        cleaned = _clean_terminal_json(burst_result.captured_output)
-        decision = extract_json_decision(cleaned)
+    artifact_error = None
+    if burst_result.ok:
+        decision, artifact_error = _accept_validated_artifact(
+            config,
+            output_file,
+            kind="soundness-batch-result",
+        )
 
     result = {
         "agent": label,
         "index": agent_index,
         "ok": burst_result.ok,
         "walltime_seconds": round(time.monotonic() - agent_start, 1),
-        **(decision if isinstance(decision, dict) else {"overall": "ERROR", "summary": f"Failed to get decision from {label}"}),
+        **(
+            decision
+            if isinstance(decision, dict)
+            else {"overall": "ERROR", "summary": artifact_error or f"Failed to get decision from {label}"}
+        ),
     }
     if burst_result.usage:
         result["_usage"] = burst_result.usage
@@ -951,7 +1242,6 @@ def _run_single_node_soundness(
     node_index: int,
 ) -> Dict[str, Any]:
     """Check one node's NL proof with one agent. Thread-safe."""
-    from lagent_tablets.burst import _clean_terminal_json
     from lagent_tablets.prompts import build_node_soundness_prompt
 
     agent_start = time.monotonic()
@@ -961,8 +1251,7 @@ def _run_single_node_soundness(
     # Ports: 3310 + (node_index * 10) + (agent_index * 2) — spread to avoid collisions
     port = 3310 + (node_index % 5) * 10 + agent_index * 2
 
-    result_file = repo / output_file
-    result_file.unlink(missing_ok=True)
+    artifact_paths = _clear_artifact_files(config, output_file)
 
     prompt = build_node_soundness_prompt(
         config, tablet, node_name=node_name, paper_tex=paper_tex,
@@ -983,18 +1272,19 @@ def _run_single_node_soundness(
         work_dir=repo, burst_user=config.tmux.burst_user,
         timeout_seconds=1800, log_dir=log_dir, fresh=True,
         port=port,
-        done_file=result_file,
+        done_file=artifact_paths["done"],
+        artifact_prefix=str(artifact_paths["stem"]),
     )
 
     decision = None
-    if result_file.exists():
-        try:
-            decision = load_json(result_file)
-        except Exception:
-            pass
-    if not isinstance(decision, dict) and burst_result.ok:
-        cleaned = _clean_terminal_json(burst_result.captured_output)
-        decision = extract_json_decision(cleaned)
+    artifact_error = None
+    if burst_result.ok:
+        decision, artifact_error = _accept_validated_artifact(
+            config,
+            output_file,
+            kind="soundness-result",
+            node_name=node_name,
+        )
 
     result = {
         "agent": label,
@@ -1002,7 +1292,11 @@ def _run_single_node_soundness(
         "index": agent_index,
         "ok": burst_result.ok,
         "walltime_seconds": round(time.monotonic() - agent_start, 1),
-        **(decision if isinstance(decision, dict) else {"overall": "ERROR", "summary": f"Failed to get decision from {label}"}),
+        **(
+            decision
+            if isinstance(decision, dict)
+            else {"overall": "ERROR", "summary": artifact_error or f"Failed to get decision from {label}"}
+        ),
     }
     if burst_result.usage:
         result["_usage"] = burst_result.usage
@@ -1112,6 +1406,7 @@ def _run_per_node_soundness(
         "overall": "APPROVE" if all_approve else "REJECT",
         "summary": "; ".join(summary_parts) if summary_parts else f"All {len(check_nodes)} nodes sound",
         "structural_issues": structural_issues,
+        "node_names": check_nodes,
         "node_verdicts": node_verdicts,
     }]
 
@@ -1138,30 +1433,38 @@ def _apply_verification_to_tablet(
     Sets correspondence_status and soundness_status on each TabletNode.
     Nodes not mentioned in results keep their current status.
     """
-    # Collect failed nodes from correspondence results
+    # Collect checked/failed nodes from correspondence results
+    corr_checked_nodes: Set[str] = set()
     corr_failed: Set[str] = set()
-    corr_checked = False
     for r in verification_results:
         if r.get("check") != "correspondence":
             continue
-        corr_checked = True
+        node_names = r.get("node_names", [])
+        if isinstance(node_names, list):
+            corr_checked_nodes.update(str(name) for name in node_names if isinstance(name, str))
         # From multi-agent results
         for ar in r.get("agent_results", [r]):
             for phase in ("correspondence", "paper_faithfulness"):
                 for issue in ar.get(phase, {}).get("issues", []) if isinstance(ar.get(phase), dict) else []:
                     if issue.get("node"):
-                        corr_failed.add(issue["node"])
+                        node_name = str(issue["node"])
+                        corr_checked_nodes.add(node_name)
+                        corr_failed.add(node_name)
 
-    # Collect failed/structural nodes from soundness results
+    # Collect checked/failed/structural nodes from soundness results
+    sound_checked_nodes: Set[str] = set()
     sound_failed: Set[str] = set()
     sound_structural: Set[str] = set()
-    sound_checked = False
     for r in verification_results:
         if r.get("check") != "nl_proof":
             continue
-        sound_checked = True
+        node_names = r.get("node_names", [])
+        if isinstance(node_names, list):
+            sound_checked_nodes.update(str(name) for name in node_names if isinstance(name, str))
         for nv in r.get("node_verdicts", []):
-            node = nv.get("node", "")
+            node = str(nv.get("node", ""))
+            if node:
+                sound_checked_nodes.add(node)
             if nv.get("structural"):
                 sound_structural.add(node)
             elif nv.get("overall") != "APPROVE":
@@ -1169,7 +1472,9 @@ def _apply_verification_to_tablet(
         # Legacy single-result format
         for issue in r.get("soundness", {}).get("issues", []) if isinstance(r.get("soundness"), dict) else []:
             if issue.get("node"):
-                sound_failed.add(issue["node"])
+                node_name = str(issue["node"])
+                sound_checked_nodes.add(node_name)
+                sound_failed.add(node_name)
 
     # Apply to tablet nodes. Only update if:
     # - Node content changed since last verification (hash mismatch), OR
@@ -1181,7 +1486,7 @@ def _apply_verification_to_tablet(
         current_hash = _node_content_hash(repo_path, name) if repo_path else ""
         content_changed = (node.verification_content_hash != current_hash) if node.verification_content_hash else True
 
-        if corr_checked and (content_changed or node.correspondence_status == "?"):
+        if name in corr_checked_nodes:
             node.correspondence_status = "fail" if name in corr_failed else "pass"
             node.verification_at_cycle = cycle
             if repo_path:
@@ -1190,7 +1495,7 @@ def _apply_verification_to_tablet(
             if content_changed and node.soundness_status != "?":
                 node.soundness_status = "?"
 
-        if sound_checked and (content_changed or node.soundness_status == "?"):
+        if name in sound_checked_nodes:
             if name in sound_structural:
                 node.soundness_status = "structural"
             elif name in sound_failed:
@@ -1200,6 +1505,10 @@ def _apply_verification_to_tablet(
             node.verification_at_cycle = cycle
             if repo_path:
                 node.verification_content_hash = current_hash
+
+
+def _verification_results_checkpoint_path(config: Config) -> Path:
+    return config.state_dir / "checkpoints" / "verification_results.json"
 
 
 def _is_definition_node(repo_path: Path, name: str) -> bool:
@@ -1275,6 +1584,7 @@ def _run_multi_correspondence(
             "check": "correspondence",
             "overall": overall,
             "summary": f"Unanimous {overall} from {n} agents",
+            "node_names": corr_nodes,
             "agent_results": agent_results,
         }
     else:
@@ -1284,6 +1594,7 @@ def _run_multi_correspondence(
             "check": "correspondence",
             "overall": "DISAGREE",
             "summary": f"Agents disagree: {disagree_detail}. Reviewer must arbitrate.",
+            "node_names": corr_nodes,
             "agent_results": agent_results,
         }
 
@@ -1324,6 +1635,7 @@ def _run_nl_verification(
     tablet: TabletState,
     node_names: List[str],
     *,
+    cycle: Optional[int] = None,
     log_dir: Path,
     nl_cache: Optional[Any] = None,
     human_input: str = "",
@@ -1334,8 +1646,6 @@ def _run_nl_verification(
     Passes previous cycle's results to verifiers for context continuity.
     Returns list of verification result dicts.
     """
-    from lagent_tablets.burst import _clean_terminal_json
-
     repo = config.repo_path
     results: List[Dict[str, Any]] = []
 
@@ -1373,8 +1683,7 @@ def _run_nl_verification(
         else:
             # Single-agent correspondence (default)
             print(f"  Correspondence check: {len(corr_nodes)} nodes ({len(node_names) - len(corr_nodes)} cached)")
-            corr_file = repo / "correspondence_result.json"
-            corr_file.unlink(missing_ok=True)
+            corr_artifacts = _clear_artifact_files(config, "correspondence_result.json")
             corr_prompt = build_correspondence_prompt(
                 config, tablet, node_names=corr_nodes, paper_tex=paper_tex,
                 human_input=human_input,
@@ -1384,19 +1693,19 @@ def _run_nl_verification(
                 session_name=config.tmux.session_name,
                 work_dir=repo, burst_user=config.tmux.burst_user,
                 timeout_seconds=1800, log_dir=log_dir, fresh=True,
-                port=3286, done_file=corr_file,
+                port=3286, done_file=corr_artifacts["done"],
+                artifact_prefix=str(corr_artifacts["stem"]),
             )
             corr_decision = None
-            if corr_file.exists():
-                try:
-                    corr_decision = load_json(corr_file)
-                except Exception:
-                    pass
-            if not isinstance(corr_decision, dict) and corr_result.ok:
-                cleaned = _clean_terminal_json(corr_result.captured_output)
-                corr_decision = extract_json_decision(cleaned)
+            artifact_error = None
+            if corr_result.ok:
+                corr_decision, artifact_error = _accept_validated_artifact(
+                    config,
+                    "correspondence_result.json",
+                    kind="correspondence-result",
+                )
             if corr_decision:
-                entry = {"check": "correspondence", **corr_decision}
+                entry = {"check": "correspondence", "node_names": corr_nodes, **corr_decision}
                 if corr_result.usage:
                     entry["_usage"] = corr_result.usage
                 results.append(entry)
@@ -1404,9 +1713,21 @@ def _run_nl_verification(
                 print(f"  Correspondence: {overall}")
                 if overall == "APPROVE" and nl_cache:
                     nl_cache.record_correspondence_approval(repo, corr_nodes)
+            else:
+                results.append({
+                    "check": "correspondence",
+                    "node_names": corr_nodes,
+                    "overall": "ERROR",
+                    "summary": artifact_error or "missing correspondence artifact",
+                })
     else:
         print(f"  Correspondence: all {len(node_names)} nodes cached (APPROVE)")
-        results.append({"check": "correspondence", "overall": "APPROVE", "summary": "cached"})
+        results.append({"check": "correspondence", "overall": "APPROVE", "summary": "cached", "node_names": []})
+
+    corr_results = [r for r in results if r.get("check") == "correspondence"]
+    if corr_results and cycle is not None:
+        _apply_verification_to_tablet(tablet, corr_results, cycle, repo_path=repo)
+        save_tablet(tablet_path(config), tablet)
 
     # 2. NL proof soundness check — only if correspondence passed (it's a gate)
     corr_overall = "APPROVE"
@@ -1435,30 +1756,30 @@ def _run_nl_verification(
         else:
             # Single-agent, all-at-once soundness (fallback)
             print(f"  NL proof check: {len(proof_nodes)} nodes ({len(node_names) - len(proof_nodes)} cached)")
-            proof_file = repo / "nl_proof_result.json"
-            proof_file.unlink(missing_ok=True)
+            proof_artifacts = _clear_artifact_files(config, "nl_proof_result.json")
             proof_prompt = build_nl_proof_prompt(
                 config, tablet, node_names=proof_nodes, paper_tex=paper_tex,
                 human_input=human_input,
+                output_file="nl_proof_result.json",
             )
             proof_result = run_reviewer_burst(
                 verify_config, proof_prompt,
                 session_name=config.tmux.session_name,
                 work_dir=repo, burst_user=config.tmux.burst_user,
                 timeout_seconds=1800, log_dir=log_dir, fresh=True,
-                port=3287, done_file=proof_file,
+                port=3287, done_file=proof_artifacts["done"],
+                artifact_prefix=str(proof_artifacts["stem"]),
             )
             proof_decision = None
-            if proof_file.exists():
-                try:
-                    proof_decision = load_json(proof_file)
-                except Exception:
-                    pass
-            if not isinstance(proof_decision, dict) and proof_result.ok:
-                cleaned = _clean_terminal_json(proof_result.captured_output)
-                proof_decision = extract_json_decision(cleaned)
+            artifact_error = None
+            if proof_result.ok:
+                proof_decision, artifact_error = _accept_validated_artifact(
+                    config,
+                    "nl_proof_result.json",
+                    kind="soundness-batch-result",
+                )
             if proof_decision:
-                entry = {"check": "nl_proof", **proof_decision}
+                entry = {"check": "nl_proof", "node_names": proof_nodes, **proof_decision}
                 if proof_result.usage:
                     entry["_usage"] = proof_result.usage
                 results.append(entry)
@@ -1466,9 +1787,16 @@ def _run_nl_verification(
                 print(f"  NL proof soundness: {overall}")
                 if overall == "APPROVE" and nl_cache:
                     nl_cache.record_soundness_approval(repo, proof_nodes)
+            else:
+                results.append({
+                    "check": "nl_proof",
+                    "node_names": proof_nodes,
+                    "overall": "ERROR",
+                    "summary": artifact_error or "missing NL proof artifact",
+                })
     else:
         print(f"  NL proof soundness: all {len(node_names)} nodes cached (APPROVE)")
-        results.append({"check": "nl_proof", "overall": "APPROVE", "summary": "cached"})
+        results.append({"check": "nl_proof", "overall": "APPROVE", "summary": "cached", "node_names": []})
 
     return results
 
@@ -1502,6 +1830,7 @@ def run_theorem_stating_cycle(
 
     cycle_start = time.monotonic()
     log_dir = config.state_dir / "logs" / f"cycle-{cycle:04d}"
+    worker_handoff: Optional[Dict[str, Any]] = None
 
     # ---- Stage 1: Worker ----
     if not resume_from:
@@ -1514,6 +1843,7 @@ def run_theorem_stating_cycle(
         worker_prompt = build_theorem_stating_prompt(
             config, state, tablet, policy, previous_outcome=previous_outcome,
         )
+        worker_artifacts = _clear_artifact_files(config, "worker_handoff.json")
 
         worker_result = run_worker_burst(
             config.worker,
@@ -1524,6 +1854,8 @@ def run_theorem_stating_cycle(
             timeout_seconds=policy.timing.burst_timeout_seconds,
             startup_timeout_seconds=config.startup_timeout_seconds,
             log_dir=log_dir,
+            done_file=worker_artifacts["done"],
+            artifact_prefix=str(worker_artifacts["stem"]),
         )
 
         if worker_result.transcript_path:
@@ -1534,6 +1866,21 @@ def run_theorem_stating_cycle(
             save_state(state_path(config), state)
             return CycleOutcome(outcome="INVALID", detail=f"Worker burst failed: {worker_result.error}")
 
+        worker_handoff, handoff_error = _accept_validated_artifact(
+            config,
+            "worker_handoff.json",
+            kind="worker-handoff",
+            phase="theorem_stating",
+            repo_for_validation=repo,
+        )
+        if not isinstance(worker_handoff, dict):
+            save_state(state_path(config), state)
+            return CycleOutcome(
+                outcome="INVALID",
+                detail=f"Invalid worker handoff: {handoff_error or 'missing raw/done artifact'}",
+            )
+        state.last_worker_handoff = worker_handoff
+
         fix_lake_permissions(repo)
 
         # Discover what the worker created/modified
@@ -1541,23 +1888,17 @@ def run_theorem_stating_cycle(
         lean_files = {p.stem for p in tdir.glob("*.lean") if p.stem != "Preamble"}
         tex_files = {p.stem for p in tdir.glob("*.tex") if p.stem not in ("header", "Preamble")}
         all_node_names = lean_files | tex_files
+        deleted_nodes = _prune_deleted_tablet_nodes(tablet, all_node_names)
         new_nodes = [n for n in all_node_names if n not in tablet.nodes]
         existing_nodes = [n for n in all_node_names if n in tablet.nodes]
 
         # Read difficulty hints from worker handoff (if present)
         difficulty_hints: Dict[str, str] = {}
-        handoff_path = repo / "worker_handoff.json"
-        if handoff_path.exists():
-            try:
-                hf = load_json(handoff_path)
-                if isinstance(hf, dict):
-                    hints = hf.get("difficulty_hints", {})
-                    if isinstance(hints, dict):
-                        for k, v in hints.items():
-                            if v in ("easy", "hard"):
-                                difficulty_hints[k] = v
-            except Exception:
-                pass
+        hints = worker_handoff.get("difficulty_hints", {}) if isinstance(worker_handoff, dict) else {}
+        if isinstance(hints, dict):
+            for k, v in hints.items():
+                if v in ("easy", "hard"):
+                    difficulty_hints[k] = v
 
         # Register any new nodes in the tablet
         for name in new_nodes:
@@ -1618,11 +1959,20 @@ def run_theorem_stating_cycle(
                 detail=f"lake build Tablet failed",
                 build_output=build_output,
             )
-        elif new_nodes:
-            print(f"  Created {len(new_nodes)} new nodes: {new_nodes}")
+        elif new_nodes or deleted_nodes:
+            if new_nodes:
+                print(f"  Created {len(new_nodes)} new nodes: {new_nodes}")
+            if deleted_nodes:
+                print(f"  Deleted {len(deleted_nodes)} nodes: {deleted_nodes}")
             outcome = CycleOutcome(
                 outcome="PROGRESS",
-                detail=f"Created nodes: {', '.join(new_nodes)}",
+                detail=", ".join(
+                    part for part in [
+                        f"Created nodes: {', '.join(new_nodes)}" if new_nodes else "",
+                        f"Deleted nodes: {', '.join(deleted_nodes)}" if deleted_nodes else "",
+                    ]
+                    if part
+                ),
                 nodes_created=new_nodes,
             )
         else:
@@ -1644,39 +1994,45 @@ def run_theorem_stating_cycle(
 
     # ---- Stage 2: NL Verification ----
     nl_verification_results: List[Dict[str, Any]] = []
+    verification_checkpoint = _verification_results_checkpoint_path(config)
     if resume_from in ("", "verification"):
         from lagent_tablets.nl_cache import NLCache
         nl_cache = NLCache(config.state_dir / "nl_cache.json")
         all_check_nodes = [n for n in tablet.nodes if tablet.nodes[n].kind != "preamble"]
         print(f"  Running NL verification for {len(all_check_nodes)} nodes...")
         nl_verification_results = _run_nl_verification(
-            config, tablet, all_check_nodes, log_dir=log_dir, nl_cache=nl_cache,
+            config, tablet, all_check_nodes, cycle=cycle, log_dir=log_dir, nl_cache=nl_cache,
             human_input=state.human_input,
         )
+        save_json(verification_checkpoint, nl_verification_results)
         # Save checkpoint: verification done
         state.resume_from = "reviewer"
         save_state(state_path(config), state)
     elif resume_from == "reviewer":
         # Reconstruct verification results from saved files for the reviewer
         print(f"  Skipping verification (resuming from reviewer)")
-        for i in range(10):
-            f = repo / f"correspondence_result_{i}.json"
-            if f.exists():
-                try:
-                    data = load_json(f)
-                    if isinstance(data, dict):
-                        nl_verification_results.append({"check": "correspondence", "agent_index": i, **data})
-                except Exception:
-                    pass
-        if not nl_verification_results:
-            f = repo / "correspondence_result.json"
-            if f.exists():
-                try:
-                    data = load_json(f)
-                    if isinstance(data, dict):
-                        nl_verification_results.append({"check": "correspondence", **data})
-                except Exception:
-                    pass
+        checkpointed = load_json(verification_checkpoint, default=None)
+        if isinstance(checkpointed, list):
+            nl_verification_results = checkpointed
+        else:
+            for i in range(10):
+                f = repo / f"correspondence_result_{i}.json"
+                if f.exists():
+                    try:
+                        data = load_json(f)
+                        if isinstance(data, dict):
+                            nl_verification_results.append({"check": "correspondence", "agent_index": i, "node_names": [], **data})
+                    except Exception:
+                        pass
+            if not nl_verification_results:
+                f = repo / "correspondence_result.json"
+                if f.exists():
+                    try:
+                        data = load_json(f)
+                        if isinstance(data, dict):
+                            nl_verification_results.append({"check": "correspondence", "node_names": [], **data})
+                    except Exception:
+                        pass
         if nl_verification_results:
             overalls = [r.get("overall", "?") for r in nl_verification_results]
             print(f"  Loaded {len(nl_verification_results)} correspondence results: {overalls}")
@@ -1687,32 +2043,25 @@ def run_theorem_stating_cycle(
         save_tablet(tablet_path(config), tablet)
 
     # ---- Stage 3: Reviewer ----
-    handoff_path = repo / "worker_handoff.json"
-    worker_handoff = None
-    if handoff_path.exists():
-        try:
-            worker_handoff = load_json(handoff_path)
-        except Exception:
-            # Worker may write invalid JSON (e.g., LaTeX backslashes)
+    if worker_handoff is None:
+        handoff_path = repo / "worker_handoff.json"
+        if handoff_path.exists():
             try:
-                raw = handoff_path.read_text(encoding="utf-8", errors="replace")
-                # Escape bare backslashes and retry
-                import re
-                fixed = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', raw)
-                worker_handoff = json.loads(fixed)
+                worker_handoff = load_json(handoff_path)
             except Exception:
-                worker_handoff = {"summary": raw[:500] if raw else "could not parse", "status": "UNKNOWN"}
+                worker_handoff = None
+
+    orphan_candidates = find_orphan_nodes(tablet, repo)
 
     reviewer_prompt = build_theorem_stating_reviewer_prompt(
         config, state, tablet, policy,
         worker_handoff=worker_handoff,
         worker_output=(worker_result.captured_output[-15000:] if worker_result.captured_output else "") if not resume_from else "",
         nl_verification=nl_verification_results if nl_verification_results else None,
+        orphan_candidates=orphan_candidates,
     )
 
-    # Clean up decision file before burst
-    decision_path = repo / "reviewer_decision.json"
-    decision_path.unlink(missing_ok=True)
+    reviewer_artifacts = _clear_artifact_files(config, "reviewer_decision.json")
 
     reviewer_result = run_reviewer_burst(
         config.reviewer,
@@ -1722,23 +2071,28 @@ def run_theorem_stating_cycle(
         burst_user=config.tmux.burst_user,
         timeout_seconds=min(policy.timing.burst_timeout_seconds, 300),
         log_dir=log_dir,
+        done_file=reviewer_artifacts["done"],
+        artifact_prefix=str(reviewer_artifacts["stem"]),
     )
 
-    # Read decision from file (primary), fall back to output parsing
     decision = None
-    if decision_path.exists():
-        try:
-            decision = load_json(decision_path)
-        except Exception:
-            pass
-    if not isinstance(decision, dict):
-        from lagent_tablets.burst import _clean_terminal_json
-        cleaned = _clean_terminal_json(reviewer_result.captured_output)
-        decision = extract_json_decision(cleaned)
+    decision_error = None
+    if reviewer_result.ok:
+        decision, decision_error = _accept_validated_artifact(
+            config,
+            "reviewer_decision.json",
+            kind="reviewer-decision",
+            phase="theorem_stating",
+        )
     if isinstance(decision, dict):
-        state.last_review = decision
-        state.review_log.append({"cycle": cycle, **decision})
-        print(f"  Reviewer: {decision.get('decision', '?')} -- {decision.get('reason', '')[:100]}")
+        _enforce_theorem_stating_orphan_candidates(decision, orphan_candidates)
+        open_rejections = _reconcile_theorem_stating_open_rejections(
+            nl_verification_results,
+            decision.get("open_rejections", state.open_rejections),
+            include_preferred_extras=True,
+        )
+        _enforce_theorem_stating_open_rejections(decision, open_rejections)
+        state.open_rejections = open_rejections
 
         # If ADVANCE_PHASE, run both verification checks on all nodes first
         if decision.get("decision") == "ADVANCE_PHASE":
@@ -1751,18 +2105,18 @@ def run_theorem_stating_cycle(
                 from lagent_tablets.nl_cache import NLCache
                 nl_cache = NLCache(config.state_dir / "nl_cache.json")
                 gate_results = _run_nl_verification(
-                    config, tablet, all_nodes, log_dir=log_dir, nl_cache=nl_cache,
+                    config, tablet, all_nodes, cycle=cycle, log_dir=log_dir, nl_cache=nl_cache,
                     human_input=state.human_input,
                 )
-                rejection_reasons = []
-                for r in gate_results:
-                    if r.get("overall") == "REJECT":
-                        rejection_reasons.append(f"{r.get('check', '?')}: {r.get('summary', '')}")
+                gate_open_rejections = _reconcile_theorem_stating_open_rejections(
+                    gate_results,
+                    state.open_rejections,
+                )
+                state.open_rejections = gate_open_rejections
+                _enforce_theorem_stating_open_rejections(decision, gate_open_rejections)
 
-                if rejection_reasons:
+                if gate_open_rejections:
                     print(f"  Verification REJECTED -- blocking ADVANCE_PHASE")
-                    state.last_review["decision"] = "CONTINUE"
-                    state.last_review["reason"] = "Verification rejected: " + "; ".join(rejection_reasons)
                 else:
                     # Verification passed — set the initial active node for proof_formalization
                     next_node = decision.get("next_active_node", "")
@@ -1777,8 +2131,11 @@ def run_theorem_stating_cycle(
                             state.active_node = open_nodes[0]
                             tablet.active_node = open_nodes[0]
                             print(f"  Initial proof node (auto): {open_nodes[0]}")
+        state.last_review = decision
+        state.review_log.append({"cycle": cycle, **decision})
+        print(f"  Reviewer: {decision.get('decision', '?')} -- {decision.get('reason', '')[:100]}")
     else:
-        print(f"  Reviewer: could not parse decision")
+        print(f"  Reviewer: could not validate decision ({decision_error or 'missing raw/done artifact'})")
 
     # Clear resume checkpoint — cycle is complete
     state.resume_from = ""
@@ -1867,6 +2224,7 @@ def run_cycle(
 
     # Run worker burst
     log_dir = config.state_dir / "logs" / f"cycle-{cycle:04d}"
+    worker_artifacts = _clear_artifact_files(config, "worker_handoff.json")
 
     worker_result = run_worker_burst(
         effective_worker,
@@ -1877,6 +2235,8 @@ def run_cycle(
         timeout_seconds=policy.timing.burst_timeout_seconds,
         startup_timeout_seconds=config.startup_timeout_seconds,
         log_dir=log_dir,
+        done_file=worker_artifacts["done"],
+        artifact_prefix=str(worker_artifacts["stem"]),
     )
 
     if worker_result.transcript_path:
@@ -1888,6 +2248,21 @@ def run_cycle(
         print(f"  Worker burst failed: {worker_result.error}")
         save_state(state_path(config), state)
         return CycleOutcome(outcome="INVALID", detail=f"Worker burst failed: {worker_result.error}")
+
+    worker_handoff, handoff_error = _accept_validated_artifact(
+        config,
+        "worker_handoff.json",
+        kind="worker-handoff",
+        phase="proof_formalization",
+        repo_for_validation=repo,
+    )
+    if not isinstance(worker_handoff, dict):
+        save_state(state_path(config), state)
+        return CycleOutcome(
+            outcome="INVALID",
+            detail=f"Invalid worker handoff: {handoff_error or 'missing raw/done artifact'}",
+        )
+    state.last_worker_handoff = worker_handoff
 
     # Fix .lake permissions after burst (worker may have created oleans)
     fix_lake_permissions(repo)
@@ -1998,7 +2373,7 @@ def run_cycle(
         from lagent_tablets.nl_cache import NLCache
         nl_cache = NLCache(config.state_dir / "nl_cache.json")
         nl_verification_results = _run_nl_verification(
-            config, tablet, nodes_to_verify, log_dir=log_dir, nl_cache=nl_cache,
+            config, tablet, nodes_to_verify, cycle=cycle, log_dir=log_dir, nl_cache=nl_cache,
             human_input=state.human_input,
         )
 
@@ -2045,21 +2420,6 @@ def run_cycle(
     )
 
     if needs_reviewer:
-        # Read worker handoff
-        handoff_path = repo / "worker_handoff.json"
-        worker_handoff = None
-        if handoff_path.exists():
-            try:
-                worker_handoff = load_json(handoff_path)
-            except Exception:
-                try:
-                    raw = handoff_path.read_text(encoding="utf-8", errors="replace")
-                    import re as _re
-                    fixed = _re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', raw)
-                    worker_handoff = json.loads(fixed)
-                except Exception:
-                    worker_handoff = {"summary": raw[:500] if raw else "could not parse", "status": "UNKNOWN"}
-
         reviewer_prompt = build_reviewer_prompt(
             config, state, tablet, policy,
             worker_handoff=worker_handoff,
@@ -2069,9 +2429,7 @@ def run_cycle(
             nl_verification=nl_verification_results if nl_verification_results else None,
         )
 
-        # Reviewer burst: non-interactive for Claude/Codex, interactive for Gemini
-        decision_path = repo / "reviewer_decision.json"
-        decision_path.unlink(missing_ok=True)
+        reviewer_artifacts = _clear_artifact_files(config, "reviewer_decision.json")
 
         reviewer_result = run_reviewer_burst(
             config.reviewer,
@@ -2081,21 +2439,21 @@ def run_cycle(
             burst_user=config.tmux.burst_user,
             timeout_seconds=min(policy.timing.burst_timeout_seconds, 300),
             log_dir=log_dir,
+            done_file=reviewer_artifacts["done"],
+            artifact_prefix=str(reviewer_artifacts["stem"]),
         )
 
         _accumulate_usage(state, "reviewer", reviewer_result.usage)
 
-        # Read decision from file (primary), fall back to output parsing
         decision = None
-        if decision_path.exists():
-            try:
-                decision = load_json(decision_path)
-            except Exception:
-                pass
-        if not isinstance(decision, dict) and reviewer_result.ok:
-            from lagent_tablets.burst import _clean_terminal_json
-            cleaned = _clean_terminal_json(reviewer_result.captured_output)
-            decision = extract_json_decision(cleaned)
+        decision_error = None
+        if reviewer_result.ok:
+            decision, decision_error = _accept_validated_artifact(
+                config,
+                "reviewer_decision.json",
+                kind="reviewer-decision",
+                phase="proof_formalization",
+            )
         if isinstance(decision, dict):
             state.last_review = decision
             state.review_log.append({"cycle": cycle, **decision})
@@ -2122,7 +2480,7 @@ def run_cycle(
 
             print(f"  Reviewer: {decision.get('decision', '?')} -> next: {state.active_node}")
         else:
-            print(f"  Reviewer: could not parse decision")
+            print(f"  Reviewer: could not validate decision ({decision_error or 'missing raw/done artifact'})")
 
         save_tablet(tablet_path(config), tablet)
         save_state(state_path(config), state)

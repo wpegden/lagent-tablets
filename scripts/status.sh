@@ -38,7 +38,8 @@ codex=$(ps aux | grep "codex exec" | grep -v grep | wc -l)
 [ "$codex" -gt 0 ] && echo "  codex headless: $codex process(es)"
 
 echo ""
-echo "=== Results ==="
+echo "=== Root Result Files ==="
+echo "  note: these files are from the most recent committed/reviewed cycle and may lag an in-flight worker cycle"
 for i in 0 1 2; do
     for check in correspondence nl_proof; do
         f="$REPO/${check}_result_${i}.json"

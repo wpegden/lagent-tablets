@@ -15,6 +15,7 @@ from lagent_tablets.state import (
     load_json,
     load_state,
     load_tablet,
+    normalize_orphan_resolutions,
     save_json,
     save_state,
     save_tablet,
@@ -147,6 +148,7 @@ class TestSupervisorState(unittest.TestCase):
         self.assertEqual(state.cycle, 0)
         self.assertEqual(state.phase, "paper_check")
         self.assertEqual(state.active_node, "")
+        self.assertEqual(state.open_rejections, [])
         self.assertFalse(state.awaiting_human_input)
 
     def test_round_trip(self):
@@ -155,6 +157,7 @@ class TestSupervisorState(unittest.TestCase):
             phase="proof_formalization",
             active_node="uniqueness_thm",
             last_review={"decision": "CONTINUE", "reason": "making progress"},
+            open_rejections=[{"node": "foo", "phase": "correspondence", "reason": "statement mismatch"}],
             review_log=[{"cycle": 41, "decision": "CONTINUE"}],
         )
         d = state.to_dict()
@@ -163,6 +166,7 @@ class TestSupervisorState(unittest.TestCase):
         self.assertEqual(restored.phase, "proof_formalization")
         self.assertEqual(restored.active_node, "uniqueness_thm")
         self.assertEqual(restored.last_review["decision"], "CONTINUE")
+        self.assertEqual(restored.open_rejections[0]["node"], "foo")
         self.assertEqual(len(restored.review_log), 1)
 
     def test_save_and_load(self):
@@ -173,6 +177,55 @@ class TestSupervisorState(unittest.TestCase):
         loaded = load_state(path)
         self.assertEqual(loaded.cycle, 10)
         self.assertEqual(loaded.phase, "planning")
+
+
+class TestNormalizeOrphanResolutions(unittest.TestCase):
+
+    def test_filters_invalid_entries_and_deduplicates(self):
+        normalized = normalize_orphan_resolutions(
+            [
+                {
+                    "node": "orphan_a",
+                    "action": "remove",
+                    "reason": "No downstream node needs it.",
+                },
+                {
+                    "node": "orphan_b",
+                    "action": "keep_and_add_dependency",
+                    "reason": "Needed by the main theorem.",
+                    "suggested_parents": ["main_thm", "main_thm", "orphan_b", ""],
+                },
+                {
+                    "node": "orphan_b",
+                    "action": "remove",
+                    "reason": "duplicate should be ignored",
+                },
+                {
+                    "node": "orphan_c",
+                    "action": "keep",
+                    "reason": "invalid action",
+                },
+            ],
+            allowed_nodes={"orphan_a", "orphan_b"},
+        )
+
+        self.assertEqual(
+            normalized,
+            [
+                {
+                    "node": "orphan_a",
+                    "action": "remove",
+                    "reason": "No downstream node needs it.",
+                    "suggested_parents": [],
+                },
+                {
+                    "node": "orphan_b",
+                    "action": "keep_and_add_dependency",
+                    "reason": "Needed by the main theorem.",
+                    "suggested_parents": ["main_thm"],
+                },
+            ],
+        )
 
 
 class TestTimestamp(unittest.TestCase):

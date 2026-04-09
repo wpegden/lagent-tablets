@@ -81,6 +81,17 @@ PREAMBLE
     echo "  Created Tablet/Preamble.lean"
 fi
 
+# Create APPROVED_AXIOMS.json if it doesn't exist
+if [ ! -f "$REPO/APPROVED_AXIOMS.json" ]; then
+    cat > "$REPO/APPROVED_AXIOMS.json" << 'AXIOMS'
+{
+  "global": [],
+  "nodes": {}
+}
+AXIOMS
+    echo "  Created APPROVED_AXIOMS.json"
+fi
+
 # Set group ownership and permissions
 chgrp -R "$BURST_GROUP" "$REPO" 2>/dev/null || true
 chmod -R g+rw "$REPO" 2>/dev/null || true

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -56,8 +57,29 @@ def ensure_directories(config: Config) -> None:
     config.state_dir.mkdir(parents=True, exist_ok=True)
     (config.state_dir / "logs").mkdir(parents=True, exist_ok=True)
     (config.state_dir / "scripts").mkdir(parents=True, exist_ok=True)
+    (config.state_dir / "staging").mkdir(parents=True, exist_ok=True)
     (config.state_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
     tablet_dir(config.repo_path).mkdir(parents=True, exist_ok=True)
+
+    try:
+        import grp
+        gid = grp.getgrnam("leanagent").gr_gid
+    except (ImportError, KeyError):
+        return
+
+    dir_modes = {
+        config.state_dir: 0o2755,
+        config.state_dir / "logs": 0o2775,
+        config.state_dir / "scripts": 0o2755,
+        config.state_dir / "staging": 0o2775,
+        config.state_dir / "checkpoints": 0o2755,
+    }
+    for path, mode in dir_modes.items():
+        try:
+            os.chown(str(path), -1, gid)
+            os.chmod(str(path), mode)
+        except PermissionError:
+            pass
 
 
 def check_dependencies() -> None:
@@ -136,6 +158,7 @@ def should_stop(
             print(f"Human approved. Advancing phase: {state.phase} -> {next_phase}")
             state.phase = next_phase
             state.last_review = None
+            state.open_rejections = []
             if stop_at_phase_boundary:
                 print("Stopping at phase boundary as requested.")
                 return True

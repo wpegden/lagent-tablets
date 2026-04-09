@@ -4,7 +4,7 @@ You are creating the proof tablet structure for a mathematical paper. Your job i
 
 ## Your Task in One Sentence
 
-Read the paper, create ALL nodes (.lean + .tex pairs) covering every main result with a complete proof, set up the Preamble with concrete definitions, verify with `lake build Tablet`, then write `worker_handoff.json`.
+Read the paper, create ALL nodes (.lean + .tex pairs) covering every main result with a complete proof, set up the Preamble with concrete definitions, verify with the shared checker, then write the raw worker handoff file from the prompt.
 
 ---
 
@@ -105,10 +105,10 @@ It is natural to copy proofs from the paper, then augment with details.
 4. Write `Tablet/Preamble.lean` with concrete definitions and specific imports
 5. Create ALL node .lean files (with sorry proofs)
 6. Create ALL node .tex files (with rigorous NL proofs)
-7. Run `lake build Tablet` — sorry warnings are expected, errors are not
-8. Fix any compilation errors
-9. Write `worker_handoff.json` listing every node
+7. Run `python3 .agent-supervisor/scripts/check.py tablet .` — sorry warnings are expected, errors are not
+8. Fix any deterministic errors
+9. Write the raw worker handoff file from the prompt, run `python3 .agent-supervisor/scripts/check.py worker-handoff ... --phase theorem_stating --repo .`, then write the completion marker from the prompt
 
-Do NOT write the handoff until ALL nodes exist and `lake build` passes.
+Do NOT write the handoff until ALL nodes exist and the checker passes.
 
 The supervisor auto-generates `Tablet.lean` — do NOT create or edit it.

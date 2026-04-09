@@ -372,10 +372,10 @@ def wait_for_stable(port: int, *, timeout: float = 3600, poll_interval: float = 
                     done_file: Optional[Path] = None) -> bool:
     """Wait for agent to finish its task.
 
-    Primary signal: if done_file is set (e.g. worker_handoff.json), we wait
-    for that file to appear — this is the agent's explicit "I'm done" signal.
+    Primary signal: if done_file is set, we wait for that file to appear.
+    This is the agent's explicit "I'm done" signal and is required.
 
-    Fallback: wait for agentapi status to become 'stable' with new messages.
+    Fallback only applies when no done_file is configured.
 
     The timeout is an INACTIVITY timeout, not a wall-clock limit. As long as
     the agent is actively working (status "running"), we keep waiting.
@@ -387,7 +387,6 @@ def wait_for_stable(port: int, *, timeout: float = 3600, poll_interval: float = 
 
     # If we have a done_file, that's the primary completion signal
     if done_file:
-        stable_count = 0
         while True:
             if done_file.exists():
                 return True
@@ -395,12 +394,7 @@ def wait_for_stable(port: int, *, timeout: float = 3600, poll_interval: float = 
                 req = urllib.request.Request(f"http://localhost:{port}/status")
                 resp = urllib.request.urlopen(req, timeout=5)
                 data = json.loads(resp.read().decode("utf-8"))
-                if data.get("status") == "stable":
-                    stable_count += 1
-                    if stable_count >= 6:  # ~30s of consecutive stable
-                        return True
-                else:
-                    stable_count = 0
+                if data.get("status") != "stable":
                     last_activity = time.monotonic()  # agent is active
             except Exception:
                 # Server down — agent crashed or exited

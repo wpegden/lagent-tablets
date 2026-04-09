@@ -79,15 +79,17 @@ Verifiers are stateless (fresh each cycle) but receive their own previous result
 | Backend | Provider | Session | Completion Signal | Timeout |
 |---------|----------|---------|-------------------|---------|
 | `codex_headless.py` | Codex | One-shot in tmux | `.exit` marker file | None (runs until done) |
-| `agentapi_backend.py` | Claude, Gemini | PTY via agentapi HTTP | `done_file` (result JSON) | Liveness-based (inactivity only) |
+| `agentapi_backend.py` | Claude, Gemini | PTY via agentapi HTTP | `done_file` (separate `.done` marker) | Liveness-based (inactivity only) |
 | `script_headless.py` | Fallback | `-p` mode | Process exit | None |
 
 ### Critical Rules (LEARNED THE HARD WAY)
 
-1. **done_file MUST match the actual output file**
-   - Correspondence agent 0 writes `correspondence_result_0.json` → done_file must be that file
-   - Soundness agent writes `nl_proof_{node}_{i}.json` → done_file must be that file
-   - Default `reviewer_decision.json` is ONLY for the actual reviewer
+1. **done_file is a completion marker, not the canonical result file**
+   - Agents now write `*.raw.json`, run the shared checker, then write a matching `*.done`
+   - The supervisor waits on `done_file`, reruns the same checker, and only then writes the canonical tracked JSON
+   - Correspondence agent 0 uses `correspondence_result_0.done`
+   - Per-node soundness uses `nl_proof_{node}_{i}.done`
+   - Default `reviewer_decision.done` is ONLY for the actual reviewer
    - **Regression test**: `TestCorrespondenceAgentDoneFiles`, `TestWorkerBurstDoneFile`
 
 2. **No hard wall-clock timeouts**
@@ -113,9 +115,10 @@ Verifiers are stateless (fresh each cycle) but receive their own previous result
    - Agents read .lean/.tex from disk via tool calls
    - **Regression test**: `TestPromptNoInlineContent`
 
-6. **Result files are tracked in git**
-   - correspondence_result_*.json, nl_proof_result_*.json, reviewer_decision.json, worker_handoff.json
-   - NEVER delete these — they provide verification context continuity
+6. **Canonical result files are tracked in git; raw/done staging artifacts are not**
+   - tracked: `correspondence_result_*.json`, `nl_proof_result_*.json`, `reviewer_decision.json`, `worker_handoff.json`
+   - staging only: `*.raw.json`, `*.done`
+   - NEVER delete the canonical tracked files — they provide verification context continuity
    - `git show cycle-N:correspondence_result_0.json` retrieves any cycle's results
 
 ### Port Allocation
@@ -231,7 +234,7 @@ Dashboard at port 3300 (nginx serves static files from `/home/leanagent/lagent-t
 1. Check `scripts/status.sh` — is it running?
 2. Check the screen: `curl -s "http://localhost:PORT/internal/screen" -H "Accept: text/event-stream" --max-time 3`
 3. Check the agentapi log: `.agent-supervisor/logs/agentapi-reviewer-PORT.log`
-4. Check done_file: is the agent writing to the file wait_for_stable is watching?
+4. Check the completion marker: is the agent writing the expected `*.done` file, and did it leave a matching `*.raw.json` in `.agent-supervisor/staging/`?
 
 ### Verification always rejects
 1. Check the specific issues in `correspondence_result_N.json`

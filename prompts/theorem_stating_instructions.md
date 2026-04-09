@@ -3,7 +3,7 @@
 PHASE: theorem_stating
 YOUR GOAL: Create the COMPLETE proof tablet in this cycle -- a DAG of Lean 4 declarations that decompose ALL of the paper's results into provable nodes.
 
-You must create ALL nodes in a single cycle. Do not stop after creating one node. Read the entire paper, plan the full decomposition, then create every node (.lean + .tex pair) before writing worker_handoff.json.
+You must create ALL nodes in a single cycle. Do not stop after creating one node. Read the entire paper, plan the full decomposition, then create every node (.lean + .tex pair) before writing the raw handoff file `{raw_output_path}`.
 
 Read the skill file at `{skill_path}` for Loogle usage and Lean tips.
 
@@ -62,6 +62,9 @@ For each node, create two files:
    Every definition you need must be its own node with a `.lean` + `.tex` pair, just like theorems and lemmas. The `.tex` for a definition node should state in natural language what the definition means.
 
 IMPORTANT RULES:
+- If the prompt includes a `CURRENT OPEN REJECTIONS` section, theorem-stating is NOT complete yet. Prioritize resolving every listed correspondence and paper-faithfulness rejection before treating the tablet as finished.
+- Theorem-stating continues until the open-rejection list is empty.
+- If the prompt includes an `ORPHAN NODE ACTIONS` section, carry out those reviewer decisions before treating the tablet structure as complete. A non-main orphan should either be removed or given a real downstream dependency/citation.
 - Every `.lean` must have a matching `.tex` with NL statement AND NL proof
 - Imports between nodes define the DAG: if node B uses node A, then B imports A
 - The `-- [TABLET NODE: name]` marker line is MANDATORY in every node .lean file
@@ -70,7 +73,7 @@ IMPORTANT RULES:
 - `sorry` is expected for theorem proofs in this phase -- you are stating theorems, not proving them
 - The NL proof in each .tex must be rigorous, not a sketch or placeholder. Proofs here should be at least as detailed as those in the paper and generally moreso. In this theorem stating phase, it is natural to copy/paste the appropriate proofs from the paper into the node .tex files, carefully check them, and augment them with details.
 - Use `\noderef{{name}}` to cite other nodes in NL proofs
-- Run `lake build Tablet` to verify everything compiles (sorry warnings are expected)
+- Run `python3 {check_script} tablet {repo_path}` to verify the tablet structure and build state (sorry warnings are expected)
 - The supervisor auto-generates `Tablet.lean` -- do NOT create or edit it
 
 NODE NAMING: use snake_case names that describe the mathematical content.
@@ -83,11 +86,16 @@ For each node, classify it as "easy" or "hard":
 
 Include your classification in the handoff file as `difficulty_hints`.
 
-WHEN ALL NODES ARE CREATED: Write `worker_handoff.json` listing every node you created:
+WHEN ALL NODES ARE CREATED: Write the raw handoff JSON to `{raw_output_path}` listing every node you created:
 {{
   "summary": "Created N tablet nodes covering the paper's main results and key lemmas",
   "status": "NOT_STUCK | STUCK | DONE | NEED_INPUT",
   "new_nodes": ["node1", "node2", "...every node you created..."],
   "difficulty_hints": {{"node1": "easy", "node2": "hard", "..."}}
 }}
-Do NOT write this file until you have created ALL nodes. Do not create one node and stop — create the entire tablet structure first, verify with `lake build Tablet`, then write the handoff.
+Then run:
+  python3 {check_script} worker-handoff {raw_output_path} --phase theorem_stating --repo {repo_path}
+If that passes, write the completion marker `{done_path}` and stop.
+
+The supervisor will rerun the same checker and then write the canonical result file `{canonical_output_path}`.
+Do NOT write the raw handoff file until you have created ALL nodes. Do not create one node and stop — create the entire tablet structure first, verify it with the checker, then write the handoff.

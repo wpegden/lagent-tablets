@@ -21,9 +21,10 @@ leanagent ALL=(lagentworker:leanagent) NOPASSWD: ALL
 ### Repo root (`/home/leanagent/math/{project}`)
 ```
 Owner: leanagent:leanagent
-Mode:  2775 (setgid, group-writable)
+Mode:  2755 (setgid, not group-writable)
 ```
-Both users can create files here. New files inherit group `leanagent`.
+Workers can read and traverse the repo root, but cannot create/delete arbitrary
+top-level files there.
 
 ### Tablet directory (`Tablet/`)
 ```
@@ -54,15 +55,19 @@ These are always written by the supervisor (leanagent). If lagentworker somehow 
 ### State directory (`.agent-supervisor/`)
 ```
 Owner: leanagent:leanagent
-Mode:  2775
+Mode:  2755
 ```
 
 | File/Dir | Mode | Written by | Read by |
 |----------|------|-----------|---------|
-| `state.json` | 0640 | supervisor | supervisor |
-| `tablet.json` | 0640 | supervisor | both (worker reads for check.py hash verification) |
-| `scripts/` | 0755 (dir) | supervisor | both |
-| `scripts/*.sh` | 0755 | supervisor | both (executed by lagentworker) |
+| `state.json` | 0600 | supervisor | supervisor |
+| `tablet.json` | 0600 | supervisor | supervisor |
+| `scripts/` | 2755 (dir) | supervisor | both |
+| `scripts/check.py` | 0755 | supervisor | both (executed by lagentworker, not writable) |
+| `scripts/*.sh` | 0755 | supervisor | both |
+| `staging/` | 2775 (dir) | both | both |
+| `staging/*.raw.json` | 0664 | worker/reviewer/verifier | supervisor validates |
+| `staging/*.done` | 0664 | worker/reviewer/verifier | supervisor waits on |
 | `logs/` | 2775 (dir) | supervisor | both |
 | `logs/cycle-NNNN/` | 2775 (dir) | supervisor creates, lagentworker writes into |
 | `logs/cycle-NNNN/*.sh` | 0755 | supervisor | lagentworker executes |
@@ -77,18 +82,19 @@ Mode:  2775
 
 ### Worker handoff (`worker_handoff.json` in repo root)
 ```
-Owner: lagentworker:leanagent (created by worker)
-Mode:  0664
+Owner: leanagent:leanagent (written by supervisor after validation)
+Mode:  0600 or 0644 depending on umask
 ```
-The supervisor deletes this before each cycle, the worker creates it.
-The repo root is 2775 so lagentworker can create files there.
+The worker writes `staging/worker_handoff.raw.json` and then `staging/worker_handoff.done`.
+The supervisor validates the raw JSON with `.agent-supervisor/scripts/check.py`
+and only then writes the canonical `worker_handoff.json`.
 
 ### Reviewer decision (`reviewer_decision.json` in repo root)
 ```
-Owner: lagentworker:leanagent (created by reviewer running as lagentworker)
-Mode:  0664
+Owner: leanagent:leanagent (written by supervisor after validation)
+Mode:  0600 or 0644 depending on umask
 ```
-Same as handoff.
+Same staging-and-validation flow as handoff.
 
 ### `.lake/` directory
 
@@ -130,7 +136,7 @@ lagentworker has read+execute access. Cannot modify.
    │   ├── Preamble.lean     → 0664
    │   ├── All other .lean   → 0644
    │   └── All other .tex    → 0644
-   ├── Delete stale worker_handoff.json
+   ├── Clear stale staging/*.raw.json and staging/*.done
    ├── Write prompt to logs/cycle-NNNN/worker-prompt.txt (0644)
    ├── Write burst script to logs/cycle-NNNN/worker-burst.sh (0755)
    └── Launch: sudo -n -u lagentworker /path/to/worker-burst.sh
@@ -140,13 +146,17 @@ lagentworker has read+execute access. Cannot modify.
    ├── Edits active node .lean (0664 → lagentworker can write)
    ├── May edit Preamble.lean (0664 → lagentworker can write)
    ├── CANNOT edit other .lean (0644 → lagentworker cannot write)
-   ├── Creates worker_handoff.json (repo root is 2775)
+   ├── Writes staging/worker_handoff.raw.json
+   ├── Runs .agent-supervisor/scripts/check.py
+   ├── Writes staging/worker_handoff.done
    ├── May create new Tablet/{name}.lean files (Tablet/ is 2775)
    ├── Writes start marker (logs/ is 2775)
    └── Writes exit marker via trap EXIT
 
 3. Supervisor validates
    ├── Reads modified files (leanagent owns or can read group files)
+   ├── Validates staging/*.raw.json with the shared checker
+   ├── Writes canonical worker_handoff.json/reviewer_decision.json
    ├── Runs lake env lean (as leanagent, reads .lake/build/ which is group-readable)
    └── regenerate_support_files (deletes and recreates supervisor-owned files)
 ```
@@ -155,7 +165,7 @@ lagentworker has read+execute access. Cannot modify.
 
 1. **lagentworker cannot modify non-active node .lean files**: mode 0644, lagentworker is not owner
 2. **lagentworker cannot modify .lake/packages/**: git checkout, lagentworker has no write access
-3. **lagentworker cannot modify state.json/tablet.json**: mode 0640, only leanagent can write
-4. **lagentworker cannot modify the burst script**: mode 0755 owned by leanagent, lagentworker only executes
+3. **lagentworker cannot modify state.json/tablet.json**: mode 0600, only leanagent can read/write
+4. **lagentworker cannot replace the checker or burst scripts**: `.agent-supervisor/` and `scripts/` are not group-writable
 5. **lagentworker CAN create new files in Tablet/**: this is intentional (new helper nodes)
 6. **lagentworker CAN modify Preamble.lean**: intentional (add imports) but supervisor validates changes

@@ -15,12 +15,14 @@ No surprises.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -74,6 +76,34 @@ LEAN_DECL_RE = re.compile(
 TABLET_NODE_MARKER_RE = re.compile(r"^-- \[TABLET NODE: ([A-Za-z_][A-Za-z0-9_]*)\]$", re.MULTILINE)
 NAMESPACE_PREFIXES = ["Filter.", "Real.", "Nat.", "Int.", "Set.", "Finset.",
                       "MeasureTheory.", "Topology.", "ENNReal.", "NNReal."]
+DEFAULT_APPROVED_AXIOMS: Tuple[str, ...] = (
+    "propext",
+    "funext",
+    "Classical.choice",
+    "Quot.sound",
+)
+WORKER_STATUSES: Tuple[str, ...] = ("NOT_STUCK", "STUCK", "DONE", "NEED_INPUT")
+PROOF_REVIEWER_DECISIONS: Tuple[str, ...] = (
+    "CONTINUE",
+    "ADVANCE_PHASE",
+    "STUCK",
+    "NEED_INPUT",
+    "DONE",
+)
+THEOREM_REVIEWER_DECISIONS: Tuple[str, ...] = (
+    "CONTINUE",
+    "ADVANCE_PHASE",
+    "NEED_INPUT",
+)
+CORRESPONDENCE_DECISIONS: Tuple[str, ...] = ("PASS", "FAIL")
+BATCH_SOUNDNESS_DECISIONS: Tuple[str, ...] = ("PASS", "FAIL")
+NODE_SOUNDNESS_DECISIONS: Tuple[str, ...] = ("SOUND", "UNSOUND", "STRUCTURAL")
+
+
+def _keyword_pattern(keyword: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9_']+", keyword):
+        return r"\b" + re.escape(keyword) + r"\b"
+    return r"(?<![A-Za-z0-9_'])" + re.escape(keyword) + r"(?![A-Za-z0-9_'])"
 
 
 def find_declaration(content: str, node_name: str) -> Optional[str]:
@@ -149,9 +179,140 @@ def scan_forbidden(content: str, keywords: List[str]) -> List[Dict[str, Any]]:
         zip(masked.splitlines(), content.splitlines()), start=1
     ):
         for kw in keywords:
-            if re.search(r"\b" + re.escape(kw) + r"\b", masked_line):
+            if re.search(_keyword_pattern(kw), masked_line):
                 hits.append({"keyword": kw, "line": lineno, "text": orig_line.strip()})
     return hits
+
+
+# ---------------------------------------------------------------------------
+# Closed-node axiom audit
+# ---------------------------------------------------------------------------
+
+def load_approved_axioms(
+    approved_axioms_path: Optional[Path],
+    node_name: str,
+) -> Tuple[set[str], Optional[str]]:
+    """Load globally and per-node approved axioms.
+
+    Missing files are tolerated and fall back to a conservative built-in allowlist.
+    Existing but malformed files are treated as configuration errors.
+    """
+    approved = set(DEFAULT_APPROVED_AXIOMS)
+    if approved_axioms_path is None or not approved_axioms_path.exists():
+        return approved, None
+
+    try:
+        raw = json.loads(approved_axioms_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return approved, f"Failed to load approved axioms from {approved_axioms_path}: {exc}"
+
+    if isinstance(raw, list):
+        approved.update(str(x).strip() for x in raw if str(x).strip())
+        return approved, None
+
+    if not isinstance(raw, dict):
+        return approved, (
+            f"Approved axioms file must be a JSON list or object: {approved_axioms_path}"
+        )
+
+    global_axioms = raw.get("global", [])
+    node_axioms = (raw.get("nodes") or {}).get(node_name, [])
+    if not isinstance(global_axioms, list):
+        return approved, f"approved axioms 'global' must be a list: {approved_axioms_path}"
+    if not isinstance(raw.get("nodes", {}), dict):
+        return approved, f"approved axioms 'nodes' must be an object: {approved_axioms_path}"
+    if not isinstance(node_axioms, list):
+        return approved, f"approved axioms nodes.{node_name} must be a list: {approved_axioms_path}"
+
+    approved.update(str(x).strip() for x in global_axioms if str(x).strip())
+    approved.update(str(x).strip() for x in node_axioms if str(x).strip())
+    return approved, None
+
+
+def parse_print_axioms_output(output: str) -> Optional[List[str]]:
+    normalized = " ".join(output.split())
+    if "does not depend on any axioms" in normalized:
+        return []
+    match = re.search(r"depends on axioms:\s*\[(.*?)\]", normalized)
+    if not match:
+        return None
+    body = match.group(1).strip()
+    if not body:
+        return []
+    return [part.strip() for part in body.split(",") if part.strip()]
+
+
+def run_print_axioms(
+    repo: Path,
+    name: str,
+    *,
+    timeout_secs: float = 120.0,
+) -> Dict[str, Any]:
+    """Run `#print axioms <decl>` against a temporary Lean file."""
+    temp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".lean",
+            dir=str(repo),
+            prefix=f"axioms_{name}_",
+            delete=False,
+            encoding="utf-8",
+        ) as handle:
+            handle.write(f"import Tablet.{name}\n#print axioms {name}\n")
+            temp_path = Path(handle.name)
+        proc = subprocess.run(
+            ["lake", "env", "lean", temp_path.name],
+            capture_output=True,
+            text=True,
+            cwd=str(repo),
+            timeout=timeout_secs,
+        )
+        output = (proc.stdout + "\n" + proc.stderr).strip()
+        return {"ok": proc.returncode == 0, "returncode": proc.returncode, "output": output}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "returncode": None, "output": f"Axiom audit timed out after {timeout_secs}s"}
+    except FileNotFoundError:
+        return {"ok": False, "returncode": None, "output": "lake not found for axiom audit"}
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+
+def audit_node_axioms(
+    repo: Path,
+    name: str,
+    *,
+    approved_axioms_path: Optional[Path],
+    timeout_secs: float = 120.0,
+) -> Dict[str, Any]:
+    approved, load_error = load_approved_axioms(approved_axioms_path, name)
+    if load_error:
+        return {"ok": False, "axioms": [], "disallowed": [], "error": load_error}
+
+    result = run_print_axioms(repo, name, timeout_secs=timeout_secs)
+    if not result["ok"]:
+        return {"ok": False, "axioms": [], "disallowed": [], "error": result["output"]}
+
+    axioms = parse_print_axioms_output(result["output"])
+    if axioms is None:
+        return {
+            "ok": False,
+            "axioms": [],
+            "disallowed": [],
+            "error": f"Could not parse `#print axioms` output for {name}: {result['output'][:400]}",
+        }
+
+    disallowed = sorted(ax for ax in axioms if ax not in approved)
+    return {
+        "ok": len(disallowed) == 0,
+        "axioms": axioms,
+        "disallowed": disallowed,
+        "error": "" if not disallowed else f"Unapproved axioms: {disallowed}",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +349,458 @@ def extract_sorry_warnings(output: str) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
+# JSON artifact validation
+# ---------------------------------------------------------------------------
+
+def _load_json_artifact(path: Path) -> Tuple[Optional[Any], List[str]]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8")), []
+    except FileNotFoundError:
+        return None, [f"{path} not found"]
+    except (json.JSONDecodeError, TypeError) as exc:
+        return None, [f"{path} is not valid JSON: {exc}"]
+    except OSError as exc:
+        return None, [f"Could not read {path}: {exc}"]
+
+
+def _expect_string(
+    value: Any,
+    field: str,
+    *,
+    allow_empty: bool = False,
+) -> Tuple[str, List[str]]:
+    if not isinstance(value, str):
+        return "", [f"{field} must be a string"]
+    text = value.strip()
+    if not allow_empty and not text:
+        return "", [f"{field} must be non-empty"]
+    return text, []
+
+
+def _expect_string_list(
+    value: Any,
+    field: str,
+    *,
+    allow_empty: bool = True,
+) -> Tuple[List[str], List[str]]:
+    if not isinstance(value, list):
+        return [], [f"{field} must be a list"]
+    normalized: List[str] = []
+    errors: List[str] = []
+    seen: set[str] = set()
+    for i, item in enumerate(value):
+        if not isinstance(item, str):
+            errors.append(f"{field}[{i}] must be a string")
+            continue
+        text = item.strip()
+        if not text:
+            errors.append(f"{field}[{i}] must be non-empty")
+            continue
+        if text in seen:
+            continue
+        seen.add(text)
+        normalized.append(text)
+    if not allow_empty and not normalized:
+        errors.append(f"{field} must be non-empty")
+    return normalized, errors
+
+
+def _normalize_issue_list(value: Any, field: str) -> Tuple[List[Dict[str, str]], List[str]]:
+    if not isinstance(value, list):
+        return [], [f"{field} must be a list"]
+    normalized: List[Dict[str, str]] = []
+    errors: List[str] = []
+    for i, item in enumerate(value):
+        if not isinstance(item, dict):
+            errors.append(f"{field}[{i}] must be an object")
+            continue
+        node, node_errors = _expect_string(item.get("node", ""), f"{field}[{i}].node")
+        description, desc_errors = _expect_string(item.get("description", ""), f"{field}[{i}].description")
+        errors.extend(node_errors)
+        errors.extend(desc_errors)
+        if node_errors or desc_errors:
+            continue
+        normalized.append({"node": node, "description": description})
+    return normalized, errors
+
+
+def _normalize_string_dict(value: Any, field: str, *, allowed_values: Optional[Sequence[str]] = None) -> Tuple[Dict[str, str], List[str]]:
+    if not isinstance(value, dict):
+        return {}, [f"{field} must be an object"]
+    normalized: Dict[str, str] = {}
+    errors: List[str] = []
+    for key, item in value.items():
+        if not isinstance(key, str) or not key.strip():
+            errors.append(f"{field} has an invalid key")
+            continue
+        if not isinstance(item, str):
+            errors.append(f"{field}.{key} must be a string")
+            continue
+        text = item.strip()
+        if not text:
+            errors.append(f"{field}.{key} must be non-empty")
+            continue
+        if allowed_values is not None and text not in allowed_values:
+            errors.append(f"{field}.{key} must be one of {list(allowed_values)}")
+            continue
+        normalized[key.strip()] = text
+    return normalized, errors
+
+
+def _validate_phase_block(
+    value: Any,
+    field: str,
+) -> Tuple[Dict[str, Any], List[str]]:
+    if not isinstance(value, dict):
+        return {}, [f"{field} must be an object"]
+    decision, errors = _expect_string(value.get("decision", ""), f"{field}.decision")
+    issues, issue_errors = _normalize_issue_list(value.get("issues", []), f"{field}.issues")
+    errors.extend(issue_errors)
+    if decision and decision not in CORRESPONDENCE_DECISIONS:
+        errors.append(f"{field}.decision must be one of {list(CORRESPONDENCE_DECISIONS)}")
+    if decision == "PASS" and issues:
+        errors.append(f"{field}.issues must be [] when {field}.decision is PASS")
+    if decision == "FAIL" and not issues:
+        errors.append(f"{field}.issues must be non-empty when {field}.decision is FAIL")
+    return {"decision": decision, "issues": issues}, errors
+
+
+def validate_correspondence_result_data(data: Any) -> Dict[str, Any]:
+    errors: List[str] = []
+    if not isinstance(data, dict):
+        return {"ok": False, "errors": ["result must be a JSON object"], "data": None}
+    correspondence, corr_errors = _validate_phase_block(data.get("correspondence"), "correspondence")
+    paper, paper_errors = _validate_phase_block(data.get("paper_faithfulness"), "paper_faithfulness")
+    summary, summary_errors = _expect_string(data.get("summary", ""), "summary")
+    overall, overall_errors = _expect_string(data.get("overall", ""), "overall")
+    errors.extend(corr_errors + paper_errors + summary_errors + overall_errors)
+    if overall and overall not in ("APPROVE", "REJECT"):
+        errors.append("overall must be one of ['APPROVE', 'REJECT']")
+    expected_overall = "APPROVE" if correspondence.get("decision") == "PASS" and paper.get("decision") == "PASS" else "REJECT"
+    if overall and not errors and overall != expected_overall:
+        errors.append(f"overall must be {expected_overall} for the supplied phase decisions")
+    normalized = {
+        "correspondence": correspondence,
+        "paper_faithfulness": paper,
+        "overall": overall,
+        "summary": summary,
+    }
+    return {"ok": not errors, "errors": errors, "data": normalized if not errors else None}
+
+
+def validate_batch_soundness_result_data(data: Any) -> Dict[str, Any]:
+    errors: List[str] = []
+    if not isinstance(data, dict):
+        return {"ok": False, "errors": ["result must be a JSON object"], "data": None}
+    if not isinstance(data.get("soundness"), dict):
+        return {"ok": False, "errors": ["soundness must be an object"], "data": None}
+    soundness = data["soundness"]
+    decision, decision_errors = _expect_string(soundness.get("decision", ""), "soundness.decision")
+    issues, issue_errors = _normalize_issue_list(soundness.get("issues", []), "soundness.issues")
+    summary, summary_errors = _expect_string(data.get("summary", ""), "summary")
+    overall, overall_errors = _expect_string(data.get("overall", ""), "overall")
+    errors.extend(decision_errors + issue_errors + summary_errors + overall_errors)
+    if decision and decision not in BATCH_SOUNDNESS_DECISIONS:
+        errors.append(f"soundness.decision must be one of {list(BATCH_SOUNDNESS_DECISIONS)}")
+    if decision == "PASS" and issues:
+        errors.append("soundness.issues must be [] when soundness.decision is PASS")
+    if decision == "FAIL" and not issues:
+        errors.append("soundness.issues must be non-empty when soundness.decision is FAIL")
+    if overall and overall not in ("APPROVE", "REJECT"):
+        errors.append("overall must be one of ['APPROVE', 'REJECT']")
+    expected_overall = "APPROVE" if decision == "PASS" else "REJECT"
+    if overall and not errors and overall != expected_overall:
+        errors.append(f"overall must be {expected_overall} for the supplied soundness decision")
+    normalized = {
+        "soundness": {"decision": decision, "issues": issues},
+        "overall": overall,
+        "summary": summary,
+    }
+    return {"ok": not errors, "errors": errors, "data": normalized if not errors else None}
+
+
+def validate_node_soundness_result_data(data: Any, *, node_name: str) -> Dict[str, Any]:
+    errors: List[str] = []
+    if not isinstance(data, dict):
+        return {"ok": False, "errors": ["result must be a JSON object"], "data": None}
+    node, node_errors = _expect_string(data.get("node", ""), "node")
+    summary, summary_errors = _expect_string(data.get("summary", ""), "summary")
+    overall, overall_errors = _expect_string(data.get("overall", ""), "overall")
+    errors.extend(node_errors + summary_errors + overall_errors)
+    if node and node != node_name:
+        errors.append(f"node must equal {node_name}")
+    if not isinstance(data.get("soundness"), dict):
+        errors.append("soundness must be an object")
+        soundness_block = {}
+    else:
+        soundness_block = data["soundness"]
+    decision, decision_errors = _expect_string(soundness_block.get("decision", ""), "soundness.decision")
+    explanation, explanation_errors = _expect_string(soundness_block.get("explanation", ""), "soundness.explanation")
+    errors.extend(decision_errors + explanation_errors)
+    if decision and decision not in NODE_SOUNDNESS_DECISIONS:
+        errors.append(f"soundness.decision must be one of {list(NODE_SOUNDNESS_DECISIONS)}")
+    if overall and overall not in ("APPROVE", "REJECT"):
+        errors.append("overall must be one of ['APPROVE', 'REJECT']")
+    expected_overall = "APPROVE" if decision == "SOUND" else "REJECT"
+    if overall and decision and overall != expected_overall:
+        errors.append(f"overall must be {expected_overall} when soundness.decision is {decision}")
+    normalized = {
+        "node": node,
+        "soundness": {
+            "decision": decision,
+            "explanation": explanation,
+        },
+        "overall": overall,
+        "summary": summary,
+    }
+    return {"ok": not errors, "errors": errors, "data": normalized if not errors else None}
+
+
+def validate_worker_handoff_data(data: Any, *, phase: str, repo: Optional[Path] = None) -> Dict[str, Any]:
+    errors: List[str] = []
+    if not isinstance(data, dict):
+        return {"ok": False, "errors": ["result must be a JSON object"], "data": None}
+    summary, summary_errors = _expect_string(data.get("summary", ""), "summary")
+    status, status_errors = _expect_string(data.get("status", ""), "status")
+    new_nodes, new_nodes_errors = _expect_string_list(data.get("new_nodes", []), "new_nodes")
+    errors.extend(summary_errors + status_errors + new_nodes_errors)
+    if status and status not in WORKER_STATUSES:
+        errors.append(f"status must be one of {list(WORKER_STATUSES)}")
+    normalized: Dict[str, Any] = {
+        "summary": summary,
+        "status": status,
+        "new_nodes": new_nodes,
+    }
+    if phase == "theorem_stating":
+        difficulty_hints, diff_errors = _normalize_string_dict(
+            data.get("difficulty_hints", {}),
+            "difficulty_hints",
+            allowed_values=("easy", "hard"),
+        )
+        errors.extend(diff_errors)
+        extra_hint_nodes = sorted(set(difficulty_hints) - set(new_nodes))
+        if extra_hint_nodes:
+            errors.append(f"difficulty_hints keys must be listed in new_nodes: {extra_hint_nodes}")
+        normalized["difficulty_hints"] = difficulty_hints
+    if repo is not None:
+        for name in new_nodes:
+            lean_path = repo / "Tablet" / f"{name}.lean"
+            tex_path = repo / "Tablet" / f"{name}.tex"
+            if not lean_path.exists():
+                errors.append(f"new_nodes entry {name} is missing {lean_path}")
+            if not tex_path.exists():
+                errors.append(f"new_nodes entry {name} is missing {tex_path}")
+    return {"ok": not errors, "errors": errors, "data": normalized if not errors else None}
+
+
+def validate_reviewer_decision_data(data: Any, *, phase: str) -> Dict[str, Any]:
+    from lagent_tablets.state import (
+        normalize_open_rejections,
+        normalize_orphan_resolutions,
+        normalize_paper_focus_ranges,
+    )
+
+    errors: List[str] = []
+    if not isinstance(data, dict):
+        return {"ok": False, "errors": ["result must be a JSON object"], "data": None}
+
+    decision, decision_errors = _expect_string(data.get("decision", ""), "decision")
+    reason, reason_errors = _expect_string(data.get("reason", ""), "reason")
+    next_prompt, next_prompt_errors = _expect_string(data.get("next_prompt", ""), "next_prompt", allow_empty=True)
+    next_active_node, next_node_errors = _expect_string(data.get("next_active_node", ""), "next_active_node", allow_empty=True)
+    errors.extend(decision_errors + reason_errors + next_prompt_errors + next_node_errors)
+
+    if phase == "proof_formalization":
+        allowed_decisions = PROOF_REVIEWER_DECISIONS
+    elif phase == "theorem_stating":
+        allowed_decisions = THEOREM_REVIEWER_DECISIONS
+    else:
+        return {"ok": False, "errors": [f"unknown reviewer phase: {phase}"], "data": None}
+
+    if decision and decision not in allowed_decisions:
+        errors.append(f"decision must be one of {list(allowed_decisions)}")
+
+    normalized: Dict[str, Any] = {
+        "decision": decision,
+        "reason": reason,
+        "next_prompt": next_prompt,
+        "next_active_node": next_active_node,
+    }
+
+    paper_focus_ranges = normalize_paper_focus_ranges(data.get("paper_focus_ranges", []))
+    if data.get("paper_focus_ranges", []) != [] and not paper_focus_ranges:
+        errors.append("paper_focus_ranges must be a list of {start_line, end_line, reason}")
+    normalized["paper_focus_ranges"] = paper_focus_ranges
+
+    if phase == "proof_formalization":
+        difficulty_assignments, diff_errors = _normalize_string_dict(
+            data.get("difficulty_assignments", {}),
+            "difficulty_assignments",
+            allowed_values=("easy", "hard"),
+        )
+        elevate_to_hard, elevate_errors = _expect_string_list(
+            data.get("elevate_to_hard", []),
+            "elevate_to_hard",
+        )
+        errors.extend(diff_errors + elevate_errors)
+        normalized["difficulty_assignments"] = difficulty_assignments
+        normalized["elevate_to_hard"] = elevate_to_hard
+    else:
+        issues, issues_errors = _expect_string_list(data.get("issues", []), "issues")
+        errors.extend(issues_errors)
+        orphan_resolutions = normalize_orphan_resolutions(data.get("orphan_resolutions", []))
+        if data.get("orphan_resolutions", []) != [] and not orphan_resolutions:
+            errors.append("orphan_resolutions must be a list of valid orphan-resolution objects")
+        open_rejections = normalize_open_rejections(data.get("open_rejections", []))
+        if data.get("open_rejections", []) != [] and not open_rejections:
+            errors.append("open_rejections must be a list of valid rejection objects")
+        normalized["issues"] = issues
+        normalized["orphan_resolutions"] = orphan_resolutions
+        normalized["open_rejections"] = open_rejections
+
+    if phase == "theorem_stating" and decision == "ADVANCE_PHASE" and not next_active_node:
+        errors.append("next_active_node is required when decision is ADVANCE_PHASE")
+
+    return {"ok": not errors, "errors": errors, "data": normalized if not errors else None}
+
+
+def validate_json_artifact(
+    kind: str,
+    path: Path,
+    *,
+    phase: Optional[str] = None,
+    node_name: Optional[str] = None,
+    repo: Optional[Path] = None,
+) -> Dict[str, Any]:
+    data, load_errors = _load_json_artifact(path)
+    if load_errors:
+        return {"ok": False, "errors": load_errors, "data": None}
+    assert data is not None
+    if kind == "worker-handoff":
+        if phase is None:
+            return {"ok": False, "errors": ["phase is required for worker-handoff"], "data": None}
+        return validate_worker_handoff_data(data, phase=phase, repo=repo)
+    if kind == "reviewer-decision":
+        if phase is None:
+            return {"ok": False, "errors": ["phase is required for reviewer-decision"], "data": None}
+        return validate_reviewer_decision_data(data, phase=phase)
+    if kind == "correspondence-result":
+        return validate_correspondence_result_data(data)
+    if kind == "soundness-result":
+        if node_name is None:
+            return {"ok": False, "errors": ["node_name is required for soundness-result"], "data": None}
+        return validate_node_soundness_result_data(data, node_name=node_name)
+    if kind == "soundness-batch-result":
+        return validate_batch_soundness_result_data(data)
+    return {"ok": False, "errors": [f"unknown artifact kind: {kind}"], "data": None}
+
+
+# ---------------------------------------------------------------------------
+# Whole-tablet deterministic check
+# ---------------------------------------------------------------------------
+
+def run_lake_build_tablet(repo: Path, *, timeout_secs: float = 600.0) -> Dict[str, Any]:
+    try:
+        proc = subprocess.run(
+            ["lake", "build", "Tablet"],
+            capture_output=True,
+            text=True,
+            cwd=str(repo),
+            timeout=timeout_secs,
+        )
+        output = (proc.stdout + "\n" + proc.stderr).strip()
+        return {"ok": proc.returncode == 0, "returncode": proc.returncode, "output": output}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "returncode": None, "output": f"Timed out after {timeout_secs}s"}
+    except FileNotFoundError:
+        return {"ok": False, "returncode": None, "output": "lake not found"}
+
+
+def check_tablet(
+    repo: Path,
+    *,
+    allowed_prefixes: List[str],
+    forbidden_keywords: List[str],
+    approved_axioms_path: Optional[Path] = None,
+    timeout_secs: float = 300,
+) -> Dict[str, Any]:
+    from lagent_tablets.tablet import (
+        extract_declaration_name,
+        extract_marker_name,
+        is_valid_node_name,
+        scan_preamble_definitions,
+        validate_tex_format,
+    )
+
+    errors: List[str] = []
+    warnings: List[str] = []
+    node_results: Dict[str, Dict[str, Any]] = {}
+    tablet_dir = repo / "Tablet"
+    preamble = tablet_dir / "Preamble.lean"
+
+    if not tablet_dir.exists():
+        return {"ok": False, "errors": [f"{tablet_dir} not found"], "warnings": [], "nodes": {}}
+    if not preamble.exists():
+        errors.append(f"{preamble} not found")
+    else:
+        preamble_content = preamble.read_text(encoding="utf-8")
+        preamble_defs = scan_preamble_definitions(preamble_content)
+        if preamble_defs:
+            errors.append("Preamble.lean may only contain imports")
+        preamble_import_violations = check_imports(preamble_content, allowed_prefixes)
+        if preamble_import_violations:
+            errors.append(f"Preamble has unauthorized imports: {preamble_import_violations}")
+
+    for lean_path in sorted(tablet_dir.glob("*.lean")):
+        name = lean_path.stem
+        if name in ("Preamble", "Axioms"):
+            continue
+        if not is_valid_node_name(name):
+            errors.append(f"Invalid node name: {name}")
+            continue
+        tex_path = tablet_dir / f"{name}.tex"
+        if not tex_path.exists():
+            errors.append(f"{tex_path} not found")
+            continue
+        lean_content = lean_path.read_text(encoding="utf-8")
+        marker = extract_marker_name(lean_content)
+        if marker != name:
+            errors.append(f"{name}: marker says {marker!r}, expected {name!r}")
+        decl_name = extract_declaration_name(lean_content)
+        if decl_name != name:
+            errors.append(f"{name}: declaration name is {decl_name!r}, expected {name!r}")
+        tex_errors = validate_tex_format(tex_path.read_text(encoding="utf-8"))
+        if tex_errors:
+            errors.append(f"{name}: .tex format errors: {tex_errors}")
+        node_result = check_node(
+            repo,
+            name,
+            allowed_prefixes=allowed_prefixes,
+            forbidden_keywords=forbidden_keywords,
+            approved_axioms_path=approved_axioms_path,
+            timeout_secs=timeout_secs,
+        )
+        node_results[name] = node_result
+        errors.extend(f"{name}: {err}" for err in node_result["errors"])
+        warnings.extend(f"{name}: {warn}" for warn in node_result["warnings"])
+
+    build = run_lake_build_tablet(repo, timeout_secs=timeout_secs * 2)
+    if not build["ok"] and not is_lake_package_error(build["output"]):
+        err_lines = [line for line in build["output"].splitlines() if "error" in line.lower()]
+        errors.append("lake build Tablet failed" + (f": {' | '.join(err_lines[:10])}" if err_lines else ""))
+    elif not build["ok"]:
+        warnings.append("lake build Tablet reported Lake package noise")
+
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "warnings": warnings,
+        "nodes": node_results,
+        "build_output": build.get("output", ""),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main check function (used by both supervisor and worker)
 # ---------------------------------------------------------------------------
 
@@ -198,7 +811,10 @@ def check_node(
     allowed_prefixes: List[str],
     forbidden_keywords: List[str],
     expected_hash: str = "",
+    expected_declaration_hash: str = "",
+    approved_axioms_path: Optional[Path] = None,
     timeout_secs: float = 300,
+    timeout_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Run ALL deterministic checks on a single node.
 
@@ -224,6 +840,12 @@ def check_node(
         errors.append(f"{tex_path} not found (every node needs a .tex file)")
 
     content = lean_path.read_text(encoding="utf-8")
+
+    if timeout_seconds is not None:
+        timeout_secs = timeout_seconds
+
+    if not expected_hash and expected_declaration_hash:
+        expected_hash = expected_declaration_hash
 
     # Declaration hash
     declaration_intact = True
@@ -273,7 +895,23 @@ def check_node(
     if not sorry_free:
         warnings.append("Node has sorry (open)")
 
-    ok = compiles and sorry_free and keyword_clean and imports_valid and declaration_intact
+    axioms_valid = True
+    axiom_violations: List[str] = []
+    audited_axioms: List[str] = []
+    if compiles and sorry_free and keyword_clean and imports_valid and declaration_intact:
+        axiom_audit = audit_node_axioms(
+            repo,
+            name,
+            approved_axioms_path=approved_axioms_path,
+            timeout_secs=min(timeout_secs, 120.0),
+        )
+        audited_axioms = list(axiom_audit.get("axioms", []))
+        if not axiom_audit["ok"]:
+            axioms_valid = False
+            axiom_violations = list(axiom_audit.get("disallowed", []))
+            errors.append(f"Axiom audit failed: {axiom_audit['error']}")
+
+    ok = compiles and sorry_free and keyword_clean and imports_valid and declaration_intact and axioms_valid
 
     return {
         "ok": ok,
@@ -282,6 +920,9 @@ def check_node(
         "keyword_clean": keyword_clean,
         "imports_valid": imports_valid,
         "declaration_intact": declaration_intact,
+        "axioms_valid": axioms_valid,
+        "audited_axioms": audited_axioms,
+        "axiom_violations": axiom_violations,
         "errors": errors,
         "warnings": warnings,
         "build_output": build.get("output", ""),
@@ -289,70 +930,184 @@ def check_node(
 
 
 # ---------------------------------------------------------------------------
-# CLI entry point (for workers to run directly)
+# CLI entry point (shared by workers, reviewers, and verifiers)
 # ---------------------------------------------------------------------------
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python3 check.py <node_name> [repo_path]")
-        sys.exit(1)
+def _default_check_context(repo: Path) -> Tuple[List[str], List[str], Optional[Path]]:
+    from lagent_tablets.config import FORBIDDEN_KEYWORDS_DEFAULT
 
-    name = sys.argv[1]
-    repo = Path(sys.argv[2]) if len(sys.argv) > 2 else Path.cwd()
-
-    # Load config from tablet.json
-    tablet_path = repo / ".agent-supervisor" / "tablet.json"
-    expected_hash = ""
     allowed_prefixes = ["Mathlib"]
-    forbidden_keywords = ["sorry", "axiom", "constant", "unsafe", "native_decide", "implementedBy", "extern"]
+    forbidden_keywords = list(FORBIDDEN_KEYWORDS_DEFAULT)
+    approved_axioms_path = repo / "APPROVED_AXIOMS.json"
+    return allowed_prefixes, forbidden_keywords, approved_axioms_path
 
-    if tablet_path.exists():
-        tablet = json.loads(tablet_path.read_text())
-        node_data = tablet.get("nodes", {}).get(name, {})
-        expected_hash = node_data.get("lean_statement_hash", "")
 
-    # Load config for prefixes/keywords if available
-    config_candidates = list((repo / ".agent-supervisor").glob("*.json"))
-    # Try to find allowed_prefixes from any config-looking file
-    # Default is fine for most cases
+def _expected_hash_from_tablet(repo: Path, node_name: str) -> str:
+    tablet_path = repo / ".agent-supervisor" / "tablet.json"
+    if not tablet_path.exists():
+        return ""
+    try:
+        tablet = json.loads(tablet_path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    node_data = tablet.get("nodes", {}).get(node_name, {})
+    if not isinstance(node_data, dict):
+        return ""
+    return str(node_data.get("lean_statement_hash", ""))
 
-    print(f"=== Checking node: {name} ===")
-    print(f"  Repo: {repo}")
 
-    result = check_node(
-        repo, name,
-        allowed_prefixes=allowed_prefixes,
-        forbidden_keywords=forbidden_keywords,
-        expected_hash=expected_hash,
-    )
-
-    # Print results
-    for err in result["errors"]:
-        print(f"  FAIL: {err}")
-    for warn in result["warnings"]:
-        print(f"  WARNING: {warn}")
-
-    if result["declaration_intact"]:
-        print(f"  Declaration: OK")
-    if result["imports_valid"]:
-        print(f"  Imports: OK")
-    if result["keyword_clean"]:
-        print(f"  Keywords: OK")
-    if result["compiles"]:
-        print(f"  Compiles: OK")
-
+def _print_json_validation_result(result: Dict[str, Any], *, path: Path) -> int:
     if result["ok"]:
-        print(f"  Status: CLOSED (all checks pass)")
-    elif result["sorry_free"] and result["compiles"]:
-        print(f"  Status: CLOSED (sorry-free, compiles)")
-    elif not result["sorry_free"]:
-        print(f"  Status: OPEN (has sorry)")
-    else:
-        print(f"  Status: INVALID (errors above)")
+        print(f"OK: {path}")
+        return 0
+    for err in result["errors"]:
+        print(f"FAIL: {err}")
+    return 1
 
-    print(f"=== Done ===")
-    sys.exit(0 if not result["errors"] else 1)
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    raw_args = list(argv if argv is not None else sys.argv[1:])
+    command_names = {
+        "node",
+        "tablet",
+        "worker-handoff",
+        "reviewer-decision",
+        "correspondence-result",
+        "soundness-result",
+        "soundness-batch-result",
+    }
+    # Backward compatibility: `python3 check.py <node_name> [repo]`
+    if raw_args and raw_args[0] not in command_names and not raw_args[0].startswith("-"):
+        raw_args = ["node", *raw_args]
+
+    parser = argparse.ArgumentParser(description="Deterministic lagent-tablets checker")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    node_parser = subparsers.add_parser("node", help="Check one proof-formalization node")
+    node_parser.add_argument("node_name")
+    node_parser.add_argument("repo_path", nargs="?", default=".")
+
+    tablet_parser = subparsers.add_parser("tablet", help="Check the whole tablet structure")
+    tablet_parser.add_argument("repo_path", nargs="?", default=".")
+
+    handoff_parser = subparsers.add_parser("worker-handoff", help="Validate a worker handoff raw JSON file")
+    handoff_parser.add_argument("path")
+    handoff_parser.add_argument("--phase", required=True, choices=["proof_formalization", "theorem_stating"])
+    handoff_parser.add_argument("--repo", default=".")
+
+    reviewer_parser = subparsers.add_parser("reviewer-decision", help="Validate a reviewer decision raw JSON file")
+    reviewer_parser.add_argument("path")
+    reviewer_parser.add_argument("--phase", required=True, choices=["proof_formalization", "theorem_stating"])
+
+    corr_parser = subparsers.add_parser("correspondence-result", help="Validate a correspondence raw JSON file")
+    corr_parser.add_argument("path")
+
+    snd_parser = subparsers.add_parser("soundness-result", help="Validate a per-node soundness raw JSON file")
+    snd_parser.add_argument("path")
+    snd_parser.add_argument("--node", required=True)
+
+    snd_batch_parser = subparsers.add_parser("soundness-batch-result", help="Validate a batch soundness raw JSON file")
+    snd_batch_parser.add_argument("path")
+
+    args = parser.parse_args(raw_args)
+
+    if args.command == "node":
+        repo = Path(args.repo_path).resolve()
+        name = args.node_name
+        allowed_prefixes, forbidden_keywords, approved_axioms_path = _default_check_context(repo)
+        expected_hash = _expected_hash_from_tablet(repo, name)
+
+        print(f"=== Checking node: {name} ===")
+        print(f"  Repo: {repo}")
+        result = check_node(
+            repo,
+            name,
+            allowed_prefixes=allowed_prefixes,
+            forbidden_keywords=forbidden_keywords,
+            expected_hash=expected_hash,
+            approved_axioms_path=approved_axioms_path,
+        )
+        for err in result["errors"]:
+            print(f"  FAIL: {err}")
+        for warn in result["warnings"]:
+            print(f"  WARNING: {warn}")
+        if result["declaration_intact"]:
+            print("  Declaration: OK")
+        if result["imports_valid"]:
+            print("  Imports: OK")
+        if result["keyword_clean"]:
+            print("  Keywords: OK")
+        if result["compiles"]:
+            print("  Compiles: OK")
+        if result["ok"]:
+            print("  Status: CLOSED (all checks pass)")
+        elif result["sorry_free"] and result["compiles"]:
+            print("  Status: CLOSED (sorry-free, compiles)")
+        elif not result["sorry_free"]:
+            print("  Status: OPEN (has sorry)")
+        else:
+            print("  Status: INVALID (errors above)")
+        print("=== Done ===")
+        return 0 if not result["errors"] else 1
+
+    if args.command == "tablet":
+        repo = Path(args.repo_path).resolve()
+        allowed_prefixes, forbidden_keywords, approved_axioms_path = _default_check_context(repo)
+        print(f"=== Checking tablet: {repo} ===")
+        result = check_tablet(
+            repo,
+            allowed_prefixes=allowed_prefixes,
+            forbidden_keywords=forbidden_keywords,
+            approved_axioms_path=approved_axioms_path,
+        )
+        for err in result["errors"]:
+            print(f"FAIL: {err}")
+        for warn in result["warnings"]:
+            print(f"WARNING: {warn}")
+        if result["ok"]:
+            print("OK: tablet passes deterministic checks")
+            return 0
+        return 1
+
+    if args.command == "worker-handoff":
+        path = Path(args.path)
+        repo = Path(args.repo).resolve()
+        return _print_json_validation_result(
+            validate_json_artifact("worker-handoff", path, phase=args.phase, repo=repo),
+            path=path,
+        )
+
+    if args.command == "reviewer-decision":
+        path = Path(args.path)
+        return _print_json_validation_result(
+            validate_json_artifact("reviewer-decision", path, phase=args.phase),
+            path=path,
+        )
+
+    if args.command == "correspondence-result":
+        path = Path(args.path)
+        return _print_json_validation_result(
+            validate_json_artifact("correspondence-result", path),
+            path=path,
+        )
+
+    if args.command == "soundness-result":
+        path = Path(args.path)
+        return _print_json_validation_result(
+            validate_json_artifact("soundness-result", path, node_name=args.node),
+            path=path,
+        )
+
+    if args.command == "soundness-batch-result":
+        path = Path(args.path)
+        return _print_json_validation_result(
+            validate_json_artifact("soundness-batch-result", path),
+            path=path,
+        )
+
+    parser.error(f"Unknown command: {args.command}")
+    return 2
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -61,6 +61,12 @@ class TestNodeCheckResult(unittest.TestCase):
 
 class TestScriptGeneration(unittest.TestCase):
 
+    def test_default_forbidden_keywords_include_hardening_entries(self):
+        self.assertIn("partial", FORBIDDEN_KEYWORDS_DEFAULT)
+        self.assertIn("implemented_by", FORBIDDEN_KEYWORDS_DEFAULT)
+        self.assertIn("macro", FORBIDDEN_KEYWORDS_DEFAULT)
+        self.assertIn("#eval", FORBIDDEN_KEYWORDS_DEFAULT)
+
     def test_check_node_sh_is_valid_bash(self):
         repo = Path(tempfile.mkdtemp())
         state = Path(tempfile.mkdtemp())
@@ -70,8 +76,8 @@ class TestScriptGeneration(unittest.TestCase):
             forbidden_keywords=FORBIDDEN_KEYWORDS_DEFAULT,
         )
         self.assertIn("#!/bin/bash", script)
-        self.assertIn("lake env lean", script)
-        self.assertIn("sorry", script)
+        self.assertIn("check.py", script)
+        self.assertIn(" node ", script)
         self.assertIn(str(repo), script)
 
     def test_check_tablet_sh_is_valid_bash(self):
@@ -83,7 +89,8 @@ class TestScriptGeneration(unittest.TestCase):
             forbidden_keywords=FORBIDDEN_KEYWORDS_DEFAULT,
         )
         self.assertIn("#!/bin/bash", script)
-        self.assertIn("lake build Tablet", script)
+        self.assertIn("check.py", script)
+        self.assertIn(" tablet ", script)
 
     def test_write_scripts_creates_files(self):
         repo = Path(tempfile.mkdtemp())
@@ -107,7 +114,7 @@ class TestScriptGeneration(unittest.TestCase):
             allowed_prefixes=["Mathlib", "MyCustomLib"],
             forbidden_keywords=["sorry", "axiom"],
         )
-        self.assertIn("MyCustomLib", script)
+        self.assertIn("check.py", script)
 
 
 if __name__ == "__main__":

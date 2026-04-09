@@ -25,6 +25,12 @@ WORKER_PATH = "/home/leanagent/.local/bin:/home/leanagent/.elan/bin:/home/leanag
 WORKER_ELAN_HOME = "/home/leanagent/.elan"
 
 
+def _artifact_prefix(prefix: Optional[str], role: str) -> str:
+    base = prefix or role
+    base = re.sub(r"[^A-Za-z0-9_.-]+", "_", base).strip("._-") or role
+    return base[:80]
+
+
 def build_script(
     config: ProviderConfig,
     *,
@@ -37,6 +43,7 @@ def build_script(
     agent_timeout_seconds: int = 3600,
 ) -> Path:
     """Generate a bash script that wraps the codex exec command."""
+    codex_stdin = False
     if config.provider == "claude":
         cmd_parts = ["claude", "-p", "--dangerously-skip-permissions"]
         if config.model:
@@ -57,7 +64,8 @@ def build_script(
         if config.model:
             cmd_parts.extend(["-m", config.model])
         cmd_parts.extend(config.extra_args or [])
-        cmd_parts.append("__PROMPT__")
+        cmd_parts.append("-")
+        codex_stdin = True
     else:
         raise ValueError(f"Unknown provider: {config.provider}")
 
@@ -80,30 +88,75 @@ def build_script(
         f"EXIT_FILE={shlex.quote(str(exit_file))}",
         f"PROMPT_FILE={shlex.quote(str(prompt_file))}",
         f"WORK_DIR={shlex.quote(str(work_dir))}",
+        f"AGENT_TIMEOUT_SECONDS={int(agent_timeout_seconds)}",
         "",
-        "cleanup() { ec=$?; printf '%s\\n' \"$ec\" > \"$EXIT_FILE\"; exit \"$ec\"; }",
-        "trap cleanup EXIT",
+        "cleanup() {",
+        "  ec=$?",
+        "  trap - EXIT HUP INT TERM",
+        "  if [[ -n \"${WATCHDOG_PID:-}\" ]]; then",
+        "    kill \"$WATCHDOG_PID\" 2>/dev/null || true",
+        "    wait \"$WATCHDOG_PID\" 2>/dev/null || true",
+        "  fi",
+        "  if [[ -n \"${AGENT_PID:-}\" ]]; then",
+        "    kill -- -\"$AGENT_PID\" 2>/dev/null || true",
+        "    for _ in 1 2 3 4 5; do",
+        "      if ! kill -0 -- -\"$AGENT_PID\" 2>/dev/null; then",
+        "        break",
+        "      fi",
+        "      sleep 1",
+        "    done",
+        "    kill -KILL -- -\"$AGENT_PID\" 2>/dev/null || true",
+        "    wait \"$AGENT_PID\" 2>/dev/null || true",
+        "  fi",
+        "  printf '%s\\n' \"$ec\" > \"$EXIT_FILE\"",
+        "  exit \"$ec\"",
+        "}",
+        "trap cleanup EXIT HUP INT TERM",
         "",
         *env_lines,
         "",
         'cd "$WORK_DIR"',
         'printf "%s\\n" "$(date -Is)" > "$START_FILE"',
-        'PROMPT_CONTENT=$(cat "$PROMPT_FILE")',
-        "",
         "cmd=(",
         *[f"  {shlex.quote(p)}" for p in cmd_parts],
         ")",
-        "real_cmd=()",
-        'for arg in "${cmd[@]}"; do',
-        '  if [[ "$arg" == "__PROMPT__" ]]; then real_cmd+=("$PROMPT_CONTENT")',
-        '  else real_cmd+=("$arg"); fi',
-        "done",
         "",
         f'LOG_FILE={shlex.quote(str(start_file.parent / f"{log_prefix}-output.log"))}',
-        f'timeout --signal=TERM --kill-after=30 {agent_timeout_seconds} "${{real_cmd[@]}}" > "$LOG_FILE" 2>&1',
+    ]
+
+    if codex_stdin:
+        lines.extend([
+            'setsid "${cmd[@]}" < "$PROMPT_FILE" > "$LOG_FILE" 2>&1 &',
+            'AGENT_PID=$!',
+        ])
+    else:
+        lines.extend([
+            'PROMPT_CONTENT=$(cat "$PROMPT_FILE")',
+            "",
+            "real_cmd=()",
+            'for arg in "${cmd[@]}"; do',
+            '  if [[ "$arg" == "__PROMPT__" ]]; then real_cmd+=("$PROMPT_CONTENT")',
+            '  else real_cmd+=("$arg"); fi',
+            "done",
+            "",
+            'setsid "${real_cmd[@]}" > "$LOG_FILE" 2>&1 &',
+            'AGENT_PID=$!',
+        ])
+
+    lines.extend([
+        'if (( AGENT_TIMEOUT_SECONDS > 0 )); then',
+        '  (',
+        '    sleep "$AGENT_TIMEOUT_SECONDS"',
+        '    kill -- -"$AGENT_PID" 2>/dev/null || true',
+        '    sleep 30',
+        '    kill -KILL -- -"$AGENT_PID" 2>/dev/null || true',
+        '  ) &',
+        '  WATCHDOG_PID=$!',
+        'fi',
+        'wait "$AGENT_PID"',
         "ec=$?",
         'exit "$ec"',
-    ]
+    ])
 
     script_path = start_file.parent / f"{log_prefix}-burst.sh"
     script_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -122,6 +175,7 @@ def run(
     startup_timeout: float = 60.0,
     burst_timeout: float = 7200.0,
     log_dir: Optional[Path] = None,
+    artifact_prefix: Optional[str] = None,
 ) -> BurstResult:
     """Run a Codex burst via the script-based pattern."""
     start = time.monotonic()
@@ -129,17 +183,18 @@ def run(
     if log_dir is None:
         log_dir = work_dir / ".agent-supervisor" / "logs" / "bursts"
     log_dir.mkdir(parents=True, exist_ok=True)
+    prefix = _artifact_prefix(artifact_prefix, role)
 
-    prompt_file = log_dir / f"{role}-prompt.txt"
+    prompt_file = log_dir / f"{prefix}-prompt.txt"
     prompt_file.write_text(prompt, encoding="utf-8")
     prompt_file.chmod(0o644)
 
-    start_file = log_dir / f"{role}.started"
-    exit_file = log_dir / f"{role}.exit"
+    start_file = log_dir / f"{prefix}.started"
+    exit_file = log_dir / f"{prefix}.exit"
     start_file.unlink(missing_ok=True)
     exit_file.unlink(missing_ok=True)
 
-    output_log = log_dir / f"{role}-output.log"
+    output_log = log_dir / f"{prefix}-output.log"
     output_log.write_text("", encoding="utf-8")
 
     script_path = build_script(
@@ -149,14 +204,14 @@ def run(
         exit_file=exit_file,
         work_dir=work_dir,
         burst_user=burst_user,
-        log_prefix=role,
+        log_prefix=prefix,
         agent_timeout_seconds=int(burst_timeout),
     )
 
     # Launch via tmux for process isolation
     from lagent_tablets.burst import tmux_ensure_session, tmux_kill_window, tmux_cmd, tmux_pane_is_dead
     tmux_ensure_session(session_name)
-    window_name = f"{role}-{config.provider}"
+    window_name = f"{prefix}-{config.provider}"
     try:
         tmux_kill_window(session_name, window_name)
     except Exception:

@@ -7,7 +7,7 @@ IMPORTANT: Before starting, read the skill file at `{skill_path}` — it contain
 
 WORKFLOW:
 1. Work ONLY on `Tablet/{node_name}.lean`. Do NOT edit any other node's .lean file.
-2. When you have a result -- whether the proof compiles, you need helpers, or you're stuck -- STOP and write `worker_handoff.json`.
+2. When you have a result -- whether the proof compiles, you need helpers, or you're stuck -- STOP and write the raw handoff file `{raw_output_path}`.
 3. Do NOT move on to other nodes. The reviewer decides what to work on next.
 
 You may:
@@ -26,13 +26,17 @@ You must NOT:
 - Use `import Mathlib` -- only specific submodule imports (e.g., `import Mathlib.Analysis.SpecialFunctions.Log.Basic`)
 
 MANDATORY BEFORE SUBMITTING: Run the self-check and fix any errors:
-  {check_node} {node_name}
-You MUST iterate until check_node.sh reports all checks pass before writing worker_handoff.json.
+  python3 {check_script} node {node_name} {repo_path}
+You MUST iterate until the checker reports all deterministic node checks pass before writing the handoff.
 
-WHEN DONE -- write `worker_handoff.json`:
+WHEN DONE -- write the raw handoff JSON to `{raw_output_path}`:
 {{
   "summary": "brief description of what you did",
   "status": "NOT_STUCK | STUCK | DONE | NEED_INPUT",
   "new_nodes": ["list", "of", "new", "node", "names"]
 }}
-Stop after writing this file. The supervisor takes over.
+Then run:
+  python3 {check_script} worker-handoff {raw_output_path} --phase proof_formalization --repo {repo_path}
+If that passes, write the completion marker `{done_path}` and stop.
+
+The supervisor will rerun the same checker and then write the canonical result file `{canonical_output_path}`.

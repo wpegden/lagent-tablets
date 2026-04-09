@@ -161,9 +161,14 @@ def run_worker_burst(
     max_rate_limit_retries: int = 5,
     log_dir: Optional[Path] = None,
     port: Optional[int] = None,
+    done_file: Optional[Path] = None,
+    artifact_prefix: Optional[str] = None,
     **_kwargs,
 ) -> BurstResult:
     """Run a worker burst -- dispatches to the right backend."""
+    handoff_file = done_file or work_dir / "worker_handoff.json"
+    handoff_file.unlink(missing_ok=True)
+    prefix = artifact_prefix or handoff_file.stem or "worker"
 
     def _run():
         if config.provider == "codex":
@@ -171,21 +176,23 @@ def run_worker_burst(
             return run(config, prompt, role="worker", session_name=session_name,
                       work_dir=work_dir, burst_user=burst_user,
                       startup_timeout=startup_timeout_seconds,
-                      burst_timeout=timeout_seconds, log_dir=log_dir)
+                      burst_timeout=timeout_seconds, log_dir=log_dir,
+                      artifact_prefix=prefix)
 
         if config.provider in ("claude", "gemini"):
             from lagent_tablets.agents.agentapi_backend import run
             return run(config, prompt, role="worker", work_dir=work_dir,
                       burst_user=burst_user, timeout=timeout_seconds,
                       port=port,
-                      done_file=work_dir / "worker_handoff.json")
+                      done_file=handoff_file)
 
         # Unknown providers: script-based headless (-p mode)
         from lagent_tablets.agents.script_headless import run
         return run(config, prompt, role="worker", session_name=session_name,
                   work_dir=work_dir, burst_user=burst_user,
                   startup_timeout=startup_timeout_seconds,
-                  burst_timeout=timeout_seconds, log_dir=log_dir)
+                  burst_timeout=timeout_seconds, log_dir=log_dir,
+                  artifact_prefix=prefix)
 
     return run_with_retry(_run, max_retries=max_rate_limit_retries, rate_limit_delay=120.0,
                           config=config, port=port)
@@ -205,6 +212,7 @@ def run_reviewer_burst(
     port: Optional[int] = None,
     fresh: bool = False,
     done_file: Optional[Path] = None,
+    artifact_prefix: Optional[str] = None,
     **_kwargs,
 ) -> BurstResult:
     """Run a reviewer burst -- dispatches to the right backend.
@@ -214,12 +222,14 @@ def run_reviewer_burst(
     """
 
     def _run():
+        prefix = artifact_prefix or (done_file.stem if done_file is not None else "reviewer")
         if config.provider == "codex":
             from lagent_tablets.agents.codex_headless import run
             return run(config, prompt, role="reviewer", session_name=session_name,
                       work_dir=work_dir, burst_user=burst_user,
                       startup_timeout=startup_timeout_seconds,
-                      burst_timeout=timeout_seconds, log_dir=log_dir)
+                      burst_timeout=timeout_seconds, log_dir=log_dir,
+                      artifact_prefix=prefix)
 
         if config.provider in ("claude", "gemini"):
             from lagent_tablets.agents.agentapi_backend import run
@@ -233,7 +243,8 @@ def run_reviewer_burst(
         return run(config, prompt, role="reviewer", session_name=session_name,
                   work_dir=work_dir, burst_user=burst_user,
                   startup_timeout=startup_timeout_seconds,
-                  burst_timeout=timeout_seconds, log_dir=log_dir)
+                  burst_timeout=timeout_seconds, log_dir=log_dir,
+                  artifact_prefix=prefix)
 
     return run_with_retry(_run, max_retries=max_rate_limit_retries, rate_limit_delay=60.0,
                           config=config, port=port)

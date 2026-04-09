@@ -13,7 +13,10 @@ from lagent_tablets.config import (
 from lagent_tablets.state import SupervisorState, TabletNode, TabletState
 from lagent_tablets.tablet import generate_node_lean, node_lean_path, node_tex_path
 from lagent_tablets.prompts import (
+    build_correspondence_prompt,
     build_reviewer_prompt,
+    build_theorem_stating_prompt,
+    build_theorem_stating_reviewer_prompt,
     build_verification_prompt,
     build_worker_prompt,
 )
@@ -40,6 +43,8 @@ def _setup_repo(repo: Path) -> None:
     """Create minimal repo structure with tablet nodes."""
     (repo / "GOAL.md").write_text("Prove the main theorem.\n")
     (repo / ".agent-supervisor" / "scripts").mkdir(parents=True, exist_ok=True)
+    (repo / ".agent-supervisor" / "staging").mkdir(parents=True, exist_ok=True)
+    (repo / ".agent-supervisor" / "scripts" / "check.py").write_text("#!/usr/bin/env python3\nprint('ok')\n")
     (repo / ".agent-supervisor" / "scripts" / "check_node.sh").write_text("#!/bin/bash\necho ok\n")
     (repo / ".agent-supervisor" / "scripts" / "check_tablet.sh").write_text("#!/bin/bash\necho ok\n")
 
@@ -96,7 +101,9 @@ class TestWorkerPrompt(unittest.TestCase):
         state = SupervisorState(cycle=1, phase="proof_formalization", active_node="main_thm")
 
         prompt = build_worker_prompt(config, state, tablet, Policy())
-        self.assertIn("check_node.sh", prompt)
+        self.assertIn(".agent-supervisor/scripts/check.py node main_thm", prompt)
+        self.assertIn("worker_handoff.raw.json", prompt)
+        self.assertIn("worker_handoff.done", prompt)
 
     def test_includes_reviewer_guidance(self):
         repo = Path(tempfile.mkdtemp())
@@ -161,6 +168,34 @@ class TestWorkerPrompt(unittest.TestCase):
         prompt = build_worker_prompt(config, state, tablet, policy)
         self.assertIn("Use simp aggressively", prompt)
 
+    def test_includes_targeted_paper_excerpt_from_review(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        (repo / "paper.tex").write_text(
+            "LINE 1\nLINE 2\nUNIQUE_TARGET_LINE\nLINE 4\nUNRELATED_TAIL\n"
+        )
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open"),
+        }, active_node="main_thm")
+        state = SupervisorState(
+            cycle=1,
+            phase="proof_formalization",
+            active_node="main_thm",
+            last_review={
+                "paper_focus_ranges": [
+                    {"start_line": 2, "end_line": 3, "reason": "focused theorem statement"}
+                ]
+            },
+        )
+
+        prompt = build_worker_prompt(config, state, tablet, Policy())
+        self.assertIn("RELEVANT PAPER EXCERPTS", prompt)
+        self.assertIn("focused theorem statement", prompt)
+        self.assertIn("UNIQUE_TARGET_LINE", prompt)
+        self.assertNotIn("UNRELATED_TAIL", prompt)
+
 
 class TestReviewerPrompt(unittest.TestCase):
 
@@ -196,6 +231,34 @@ class TestReviewerPrompt(unittest.TestCase):
         self.assertIn("Tried rfl", prompt)
         self.assertIn("NOT_STUCK", prompt)
 
+    def test_references_paper_without_inlining_full_contents(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        (repo / "paper.tex").write_text("UNIQUE_PAPER_SENTINEL_FOR_REVIEWER\n")
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open"),
+        })
+        state = SupervisorState(cycle=1, phase="proof_formalization")
+
+        prompt = build_reviewer_prompt(config, state, tablet, Policy())
+        self.assertIn("Read the source paper directly", prompt)
+        self.assertNotIn("UNIQUE_PAPER_SENTINEL_FOR_REVIEWER", prompt)
+
+    def test_reviewer_prompt_requests_paper_focus_ranges(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open"),
+        })
+        state = SupervisorState(cycle=1, phase="proof_formalization")
+
+        prompt = build_reviewer_prompt(config, state, tablet, Policy())
+        self.assertIn("\"paper_focus_ranges\"", prompt)
+
     def test_shows_orphan_warning(self):
         repo = Path(tempfile.mkdtemp())
         _setup_repo(repo)
@@ -218,7 +281,215 @@ class TestReviewerPrompt(unittest.TestCase):
         self.assertIn("orphan_helper", prompt)
 
 
+class TestTheoremStatingPrompts(unittest.TestCase):
+
+    def test_worker_prompt_includes_open_rejections(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open", title="Main"),
+        })
+        state = SupervisorState(
+            cycle=2,
+            phase="theorem_stating",
+            last_review={"decision": "CONTINUE", "next_prompt": "Fix the statement."},
+            open_rejections=[
+                {
+                    "node": "main_thm",
+                    "phase": "correspondence",
+                    "reason": "The Lean statement drops a quantifier.",
+                }
+            ],
+        )
+
+        prompt = build_theorem_stating_prompt(config, state, tablet, Policy())
+        self.assertIn("CURRENT OPEN REJECTIONS", prompt)
+        self.assertIn("Theorem-stating continues until this list is empty", prompt)
+        self.assertIn("[correspondence] main_thm: The Lean statement drops a quantifier.", prompt)
+
+    def test_worker_prompt_includes_orphan_node_actions(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "helper_a": TabletNode(name="helper_a", kind="helper_lemma", status="open", title="Helper"),
+        })
+        state = SupervisorState(
+            cycle=2,
+            phase="theorem_stating",
+            last_review={
+                "decision": "CONTINUE",
+                "next_prompt": "Resolve the orphan candidates.",
+                "orphan_resolutions": [
+                    {
+                        "node": "helper_a",
+                        "action": "remove",
+                        "reason": "No downstream node needs it.",
+                        "suggested_parents": [],
+                    }
+                ],
+            },
+        )
+
+        prompt = build_theorem_stating_prompt(config, state, tablet, Policy())
+        self.assertIn("ORPHAN NODE ACTIONS", prompt)
+        self.assertIn("[remove] helper_a: No downstream node needs it.", prompt)
+
+    def test_worker_prompt_references_files_not_contents(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        (repo / "paper.tex").write_text("UNIQUE_PAPER_SENTINEL_12345\n")
+        (repo / "Tablet" / "main_thm.lean").write_text("UNIQUE_LEAN_SENTINEL_67890\n")
+        (repo / "Tablet" / "main_thm.tex").write_text("UNIQUE_TEX_SENTINEL_24680\n")
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open", title="Main"),
+        })
+        state = SupervisorState(cycle=2, phase="theorem_stating")
+
+        prompt = build_theorem_stating_prompt(config, state, tablet, Policy())
+        self.assertIn("Read the source paper directly", prompt)
+        self.assertIn("Tablet/main_thm.lean", prompt)
+        self.assertIn("Tablet/main_thm.tex", prompt)
+        self.assertNotIn("UNIQUE_PAPER_SENTINEL_12345", prompt)
+        self.assertNotIn("UNIQUE_LEAN_SENTINEL_67890", prompt)
+        self.assertNotIn("UNIQUE_TEX_SENTINEL_24680", prompt)
+
+    def test_worker_prompt_includes_targeted_paper_excerpt(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        (repo / "paper.tex").write_text(
+            "INTRO\nDEFN\nUNIQUE_TARGET_THEOREM\nTAIL\n"
+        )
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open", title="Main"),
+        })
+        state = SupervisorState(
+            cycle=2,
+            phase="theorem_stating",
+            last_review={
+                "paper_focus_ranges": [
+                    {"start_line": 2, "end_line": 3, "reason": "main theorem lines"}
+                ]
+            },
+        )
+
+        prompt = build_theorem_stating_prompt(config, state, tablet, Policy())
+        self.assertIn("RELEVANT PAPER EXCERPTS", prompt)
+        self.assertIn("main theorem lines", prompt)
+        self.assertIn("UNIQUE_TARGET_THEOREM", prompt)
+        self.assertNotIn("TAIL", prompt)
+
+    def test_reviewer_prompt_requires_open_rejections(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open", title="Main"),
+        })
+        state = SupervisorState(
+            cycle=2,
+            phase="theorem_stating",
+            open_rejections=[
+                {
+                    "node": "main_thm",
+                    "phase": "correspondence",
+                    "reason": "The Lean statement drops a quantifier.",
+                }
+            ],
+        )
+
+        prompt = build_theorem_stating_reviewer_prompt(
+            config,
+            state,
+            tablet,
+            Policy(),
+            nl_verification=[{
+                "check": "correspondence",
+                "overall": "REJECT",
+                "correspondence": {
+                    "decision": "FAIL",
+                    "issues": [{"node": "main_thm", "description": "Missing quantifier."}],
+                },
+            }],
+        )
+        self.assertIn("\"open_rejections\"", prompt)
+        self.assertIn("\"paper_focus_ranges\"", prompt)
+        self.assertIn("Do NOT advance while `open_rejections` is non-empty.", prompt)
+        self.assertIn("PREVIOUS OPEN REJECTIONS", prompt)
+
+    def test_reviewer_prompt_includes_current_orphan_candidates(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open", title="Main"),
+            "orphan_helper": TabletNode(name="orphan_helper", kind="helper_lemma", status="open", title="Orphan"),
+        })
+
+        prompt = build_theorem_stating_reviewer_prompt(
+            config,
+            SupervisorState(cycle=2, phase="theorem_stating"),
+            tablet,
+            Policy(),
+            orphan_candidates=["orphan_helper"],
+        )
+        self.assertIn("\"orphan_resolutions\"", prompt)
+        self.assertIn("CURRENT ORPHAN CANDIDATES", prompt)
+        self.assertIn("orphan_helper", prompt)
+
+    def test_reviewer_prompt_references_files_not_contents(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        (repo / "paper.tex").write_text("UNIQUE_PAPER_SENTINEL_ABCDE\n")
+        (repo / "Tablet" / "main_thm.lean").write_text("UNIQUE_LEAN_SENTINEL_FGHIJ\n")
+        (repo / "Tablet" / "main_thm.tex").write_text("UNIQUE_TEX_SENTINEL_KLMNO\n")
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open", title="Main"),
+        })
+
+        prompt = build_theorem_stating_reviewer_prompt(
+            config,
+            SupervisorState(cycle=2, phase="theorem_stating"),
+            tablet,
+            Policy(),
+        )
+        self.assertIn("Read the source paper directly", prompt)
+        self.assertIn("Tablet/main_thm.lean", prompt)
+        self.assertIn("Tablet/main_thm.tex", prompt)
+        self.assertNotIn("UNIQUE_PAPER_SENTINEL_ABCDE", prompt)
+        self.assertNotIn("UNIQUE_LEAN_SENTINEL_FGHIJ", prompt)
+        self.assertNotIn("UNIQUE_TEX_SENTINEL_KLMNO", prompt)
+
+
 class TestVerificationPrompt(unittest.TestCase):
+
+    def test_correspondence_prompt_requires_only_open_issues(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open"),
+        })
+
+        prompt = build_correspondence_prompt(
+            config, tablet,
+            node_names=["main_thm"],
+        )
+
+        self.assertIn("Put only CURRENTLY OPEN failures", prompt)
+        self.assertIn("mention that in `summary`, not in `issues`", prompt)
 
     def test_includes_new_nodes(self):
         repo = Path(tempfile.mkdtemp())

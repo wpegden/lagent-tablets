@@ -95,14 +95,15 @@ Phase transitions require human approval via the web viewer (ADVANCE_PHASE → a
 ### Claude/Gemini (`agentapi_backend.py`)
 - Runs via agentapi HTTP wrapper around CLI in PTY
 - Message delivery via POST `/message`
-- Completion via done_file polling (primary) + status liveness (fallback)
-- **done_file must match the actual output file** (correspondence_result_N.json, etc.)
+- Completion via a separate `*.done` marker plus status liveness
+- Agents write `*.raw.json`, run the shared checker, then write the matching `*.done`
+- The supervisor reruns the same checker and only then writes the canonical tracked JSON
 - Liveness-based timeout: resets while status="running", only fires on sustained inactivity
 - Claude effort via `--effort max`, Gemini has no effort concept
 
 ### Key Reliability Rules
 - **No hard wall-clock timeouts** for any agent
-- **done_file must be correct** per call site (not hardcoded)
+- **done_file must be the correct completion marker** per call site (not hardcoded)
 - **effort must be passed** from config through CorrespondenceAgentConfig to ProviderConfig
 - Log files are per-port to prevent concurrent write conflicts
 - Log file handles kept open (not via `with` block) for process lifetime
@@ -323,7 +324,7 @@ tests/                — Unit + regression tests
 - Multi-agent correspondence reconciliation
 - Model fallback and availability tracking
 - **Agent dispatch regression tests** (16 tests):
-  - done_file routing per provider
+  - done-marker routing per provider
   - effort passthrough (codex xhigh, claude max)
   - No hard timeout in codex script
   - Prompt doesn't inline content

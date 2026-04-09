@@ -369,13 +369,18 @@ def scan_sorry_in_definitions(lean_content: str) -> List[Dict[str, Any]]:
 
 def scan_forbidden_keywords(lean_content: str, forbidden: List[str]) -> List[Dict[str, Any]]:
     """Scan masked lean source for forbidden keywords. Returns list of {keyword, line, text}."""
+    def _pattern(keyword: str) -> str:
+        if re.fullmatch(r"[A-Za-z0-9_']+", keyword):
+            return r"\b" + re.escape(keyword) + r"\b"
+        return r"(?<![A-Za-z0-9_'])" + re.escape(keyword) + r"(?![A-Za-z0-9_'])"
+
     masked = mask_comments_and_strings(lean_content)
     hits = []
     for lineno, (masked_line, original_line) in enumerate(
         zip(masked.splitlines(), lean_content.splitlines()), start=1
     ):
         for keyword in forbidden:
-            pattern = r"\b" + re.escape(keyword) + r"\b"
+            pattern = _pattern(keyword)
             if re.search(pattern, masked_line):
                 hits.append({"keyword": keyword, "line": lineno, "text": original_line.strip()})
     return hits

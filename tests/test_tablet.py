@@ -173,6 +173,18 @@ class TestForbiddenKeywords(unittest.TestCase):
         hits = scan_forbidden_keywords(content, ["unsafe"])
         self.assertEqual(len(hits), 1)
 
+    def test_detects_hash_eval_directive(self):
+        content = "#eval 1 + 1"
+        hits = scan_forbidden_keywords(content, ["#eval"])
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["keyword"], "#eval")
+
+    def test_detects_implemented_by_attribute(self):
+        content = "attribute [implemented_by foo] bar"
+        hits = scan_forbidden_keywords(content, ["implemented_by"])
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["keyword"], "implemented_by")
+
 
 class TestTexValidation(unittest.TestCase):
 

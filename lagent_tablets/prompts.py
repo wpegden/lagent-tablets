@@ -10,8 +10,16 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from lagent_tablets.artifacts import prompt_artifact_paths
 from lagent_tablets.config import Config, Policy
-from lagent_tablets.state import SupervisorState, TabletNode, TabletState
+from lagent_tablets.state import (
+    normalize_paper_focus_ranges,
+    SupervisorState,
+    TabletNode,
+    TabletState,
+    normalize_open_rejections,
+    normalize_orphan_resolutions,
+)
 from lagent_tablets.tablet import (
     PREAMBLE_NAME,
     extract_tablet_imports,
@@ -61,6 +69,20 @@ def _trim(text: str, max_chars: int = 50000) -> str:
     return text[:half] + f"\n\n[... trimmed {len(text) - max_chars} chars ...]\n\n" + text[-half:]
 
 
+def _check_script_path(config: Config) -> Path:
+    return config.state_dir / "scripts" / "check.py"
+
+
+def _artifact_prompt_values(config: Config, canonical_name: str) -> Dict[str, str]:
+    paths = prompt_artifact_paths(config.state_dir, config.repo_path, canonical_name)
+    return {
+        "canonical_output_path": str(paths["canonical"]),
+        "raw_output_path": str(paths["raw"]),
+        "done_path": str(paths["done"]),
+        "check_script": str(_check_script_path(config)),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Context builders
 # ---------------------------------------------------------------------------
@@ -89,6 +111,165 @@ def _tablet_status_text(tablet: TabletState, repo_path: Path) -> str:
             diff_marker += f" ({node.easy_attempts} attempts)"
         lines.append(f"| {name} | {node.kind} | {status_marker} | {diff_marker} | {node.title} | {imports_str} |")
 
+    return "\n".join(lines)
+
+
+def _paper_reference_text(config: Config) -> str:
+    """Tell the agent where to read the source paper from disk."""
+    paper_path = config.workflow.paper_tex_path
+    if not paper_path or not paper_path.exists():
+        return ""
+    lines = [
+        "--- SOURCE PAPER ---",
+        f"Read the source paper directly from `{paper_path}`.",
+        "The prompt does not inline the full paper; use the file on disk as the authoritative source.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _paper_focus_excerpt_text(
+    config: Config,
+    paper_focus_ranges: Any,
+    *,
+    max_chars: int = 20000,
+) -> str:
+    """Render reviewer-selected paper excerpts for the next worker prompt."""
+    paper_path = config.workflow.paper_tex_path
+    if not paper_path or not paper_path.exists():
+        return ""
+
+    ranges = normalize_paper_focus_ranges(paper_focus_ranges)
+    if not ranges:
+        return ""
+
+    paper_lines = paper_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    intro = (
+        "--- RELEVANT PAPER EXCERPTS ---\n"
+        "The reviewer selected these source-paper ranges for focused context.\n"
+        f"Treat `{paper_path}` as authoritative if anything here is truncated.\n\n"
+    )
+    parts = [intro]
+    used = len(intro)
+
+    for entry in ranges:
+        start = max(1, min(entry["start_line"], len(paper_lines)))
+        end = max(1, min(entry["end_line"], len(paper_lines)))
+        if end < start:
+            start, end = end, start
+
+        reason = entry.get("reason", "")
+        header = f"[Lines {start}-{end}]"
+        if reason:
+            header += f" {reason}"
+        excerpt = "\n".join(paper_lines[start - 1:end]).strip()
+        if not excerpt:
+            continue
+        block = f"{header}\n{excerpt}\n\n"
+        remaining = max_chars - used
+        if remaining <= 0:
+            break
+        if len(block) <= remaining:
+            parts.append(block)
+            used += len(block)
+            continue
+        trimmed_body_budget = max(0, remaining - len(header) - 3)
+        if trimmed_body_budget <= 0:
+            break
+        parts.append(f"{header}\n{_trim(excerpt, trimmed_body_budget)}\n\n")
+        used = max_chars
+        break
+
+    if len(parts) == 1:
+        return ""
+    return "".join(parts)
+
+
+def _tablet_file_reference_text(
+    tablet: TabletState,
+    repo_path: Path,
+    *,
+    header: str = "--- CURRENT TABLET FILES ---",
+) -> str:
+    """List current tablet files without inlining their contents."""
+    lines = [
+        header,
+        "Read these files from disk as needed. The summary table above is only an index, not a complete substitute for the file contents.",
+    ]
+
+    support_files = [
+        repo_path / "Tablet.lean",
+        repo_path / "Tablet" / "INDEX.md",
+        repo_path / "Tablet" / "README.md",
+        repo_path / "Tablet" / "Preamble.lean",
+    ]
+    for path in support_files:
+        if path.exists():
+            lines.append(f"- {path.relative_to(repo_path)}")
+
+    for name in sorted(tablet.nodes.keys()):
+        if name == PREAMBLE_NAME:
+            continue
+        lean_path = node_lean_path(repo_path, name)
+        tex_path = node_tex_path(repo_path, name)
+        file_bits: List[str] = []
+        if lean_path.exists():
+            file_bits.append(str(lean_path.relative_to(repo_path)))
+        if tex_path.exists():
+            file_bits.append(str(tex_path.relative_to(repo_path)))
+        if file_bits:
+            lines.append(f"- {name}: {', '.join(file_bits)}")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _open_rejections_text(
+    open_rejections: Any,
+    *,
+    header: str = "--- CURRENT OPEN REJECTIONS ---",
+    include_completion_note: bool = False,
+) -> str:
+    """Render the persisted theorem-stating rejection list for prompts."""
+    rejections = normalize_open_rejections(open_rejections)
+    if not rejections:
+        return ""
+
+    lines = [header]
+    if include_completion_note:
+        lines.append("Theorem-stating continues until this list is empty. Resolve these items before treating the tablet as complete.")
+    for entry in rejections:
+        lines.append(f"- [{entry['phase']}] {entry['node']}: {entry['reason']}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _orphan_resolutions_text(
+    orphan_resolutions: Any,
+    *,
+    header: str = "--- ORPHAN NODE ACTIONS ---",
+    include_completion_note: bool = False,
+) -> str:
+    """Render reviewer decisions about current orphan-node candidates."""
+    resolutions = normalize_orphan_resolutions(orphan_resolutions)
+    if not resolutions:
+        return ""
+
+    lines = [header]
+    if include_completion_note:
+        lines.append(
+            "Resolve these orphan-node candidates before treating the tablet structure as complete."
+        )
+    for entry in resolutions:
+        parents = entry.get("suggested_parents", [])
+        if entry["action"] == "remove":
+            lines.append(f"- [remove] {entry['node']}: {entry['reason']}")
+        else:
+            parent_text = f" Suggested parent nodes: {', '.join(parents)}." if parents else ""
+            lines.append(
+                f"- [keep_and_add_dependency] {entry['node']}: {entry['reason']}{parent_text}"
+            )
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -254,9 +435,15 @@ def build_worker_prompt(
     sections.append(_tablet_status_text(tablet, repo_path))
 
     # 5. Source paper
-    if config.workflow.paper_tex_path and config.workflow.paper_tex_path.exists():
-        paper = _read_file(config.workflow.paper_tex_path)
-        sections.append(f"--- SOURCE PAPER ---\n{_trim(paper, 20000)}\n")
+    paper_ref = _paper_reference_text(config)
+    if paper_ref:
+        sections.append(paper_ref)
+    paper_focus = _paper_focus_excerpt_text(
+        config,
+        state.last_review.get("paper_focus_ranges", []) if state.last_review else [],
+    )
+    if paper_focus:
+        sections.append(paper_focus)
 
     # 6. Plan and tasks
     plan_text = _read_file(config.repo_path / "PLAN.md")
@@ -268,8 +455,7 @@ def build_worker_prompt(
         sections.append(f"--- TASKS.md ---\n{_trim(tasks_text, 5000)}\n")
 
     # 7. Instructions
-    check_node = config.state_dir / "scripts" / "check_node.sh"
-    check_tablet = config.state_dir / "scripts" / "check_tablet.sh"
+    worker_handoff_artifacts = _artifact_prompt_values(config, "worker_handoff.json")
 
     # Skill file reference
     skill_path = repo_path / ".agent-supervisor" / "skills" / "LEAN_WORKER.md"
@@ -280,7 +466,8 @@ def build_worker_prompt(
     instructions = _load_template(template_name).format(
         node_name=node_name,
         skill_path=skill_path,
-        check_node=check_node,
+        repo_path=repo_path,
+        **worker_handoff_artifacts,
     )
     sections.append(instructions)
 
@@ -327,38 +514,48 @@ def build_theorem_stating_prompt(
         sections.append(hi)
 
     # 2. Paper content
-    if config.workflow.paper_tex_path and config.workflow.paper_tex_path.exists():
-        paper = _read_file(config.workflow.paper_tex_path)
-        sections.append(f"--- SOURCE PAPER ---\n{_trim(paper, 30000)}\n")
+    paper_ref = _paper_reference_text(config)
+    if paper_ref:
+        sections.append(paper_ref)
+    paper_focus = _paper_focus_excerpt_text(
+        config,
+        state.last_review.get("paper_focus_ranges", []) if state.last_review else [],
+    )
+    if paper_focus:
+        sections.append(paper_focus)
 
     # 3. Feedback from previous cycle
     if state.last_review:
         next_prompt = state.last_review.get("next_prompt", "")
         if next_prompt:
             sections.append(f"REVIEWER GUIDANCE:\n{next_prompt}\n")
+    open_rejections = state.open_rejections
+    if not open_rejections and state.last_review:
+        open_rejections = state.last_review.get("open_rejections", [])
+    rejections_text = _open_rejections_text(
+        open_rejections,
+        include_completion_note=True,
+    )
+    if rejections_text:
+        sections.append(rejections_text)
+    orphan_resolutions = None
+    if state.last_review:
+        orphan_resolutions = state.last_review.get("orphan_resolutions", [])
+    orphan_text = _orphan_resolutions_text(
+        orphan_resolutions,
+        include_completion_note=True,
+    )
+    if orphan_text:
+        sections.append(orphan_text)
 
     # 4. Current tablet state (may be empty on first cycle)
     if tablet.nodes:
         sections.append(_tablet_status_text(tablet, repo_path))
-        sections.append("")
-        # Show existing files
-        for name in sorted(tablet.nodes.keys()):
-            if name == PREAMBLE_NAME:
-                continue
-            lean_path = node_lean_path(repo_path, name)
-            tex_path = node_tex_path(repo_path, name)
-            if lean_path.exists():
-                sections.append(f"--- {name}.lean ---\n{_read_file(lean_path)}\n")
-            if tex_path.exists():
-                sections.append(f"--- {name}.tex ---\n{_read_file(tex_path)}\n")
+        sections.append(_tablet_file_reference_text(tablet, repo_path))
     else:
         sections.append("The tablet is currently empty. You are creating it from scratch.\n")
 
     # 5. Preamble
-    preamble_path = repo_path / "Tablet" / "Preamble.lean"
-    if preamble_path.exists():
-        sections.append(f"--- Current Preamble.lean ---\n{_read_file(preamble_path)}\n")
-
     # Skill file reference (theorem_stating uses its own skill file)
     skill_path = repo_path / ".agent-supervisor" / "skills" / "LEAN_THEOREM_STATING.md"
     if not skill_path.exists():
@@ -367,6 +564,8 @@ def build_theorem_stating_prompt(
     # 6. Instructions
     instructions = _load_template("theorem_stating_instructions.md").format(
         skill_path=skill_path,
+        repo_path=repo_path,
+        **_artifact_prompt_values(config, "worker_handoff.json"),
     )
     sections.append(instructions)
 
@@ -389,6 +588,7 @@ def build_theorem_stating_reviewer_prompt(
     worker_handoff: Optional[Dict[str, Any]] = None,
     worker_output: str = "",
     nl_verification: Optional[List[Dict[str, Any]]] = None,
+    orphan_candidates: Optional[List[str]] = None,
 ) -> str:
     """Build the reviewer prompt for the theorem_stating phase."""
     sections = []
@@ -404,23 +604,14 @@ def build_theorem_stating_reviewer_prompt(
         sections.append(hi)
 
     # Paper
-    if config.workflow.paper_tex_path and config.workflow.paper_tex_path.exists():
-        paper = _read_file(config.workflow.paper_tex_path)
-        sections.append(f"--- SOURCE PAPER ---\n{_trim(paper, 20000)}\n")
+    paper_ref = _paper_reference_text(config)
+    if paper_ref:
+        sections.append(paper_ref)
 
     # Current tablet
     if tablet.nodes:
         sections.append(_tablet_status_text(tablet, config.repo_path))
-        sections.append("")
-        for name in sorted(tablet.nodes.keys()):
-            if name == PREAMBLE_NAME:
-                continue
-            lean_path = node_lean_path(config.repo_path, name)
-            tex_path = node_tex_path(config.repo_path, name)
-            if lean_path.exists():
-                sections.append(f"--- {name}.lean ---\n{_read_file(lean_path)}\n")
-            if tex_path.exists():
-                sections.append(f"--- {name}.tex ---\n{_read_file(tex_path)}\n")
+        sections.append(_tablet_file_reference_text(tablet, config.repo_path))
 
     # Worker handoff
     if worker_handoff:
@@ -447,6 +638,25 @@ def build_theorem_stating_reviewer_prompt(
                         sections.append(f"    [{key}] {issue.get('node', '?')}: {issue.get('description', '')}")
         sections.append("")
 
+    previous_rejections = _open_rejections_text(
+        state.open_rejections,
+        header="--- PREVIOUS OPEN REJECTIONS ---",
+    )
+    if previous_rejections:
+        sections.append(previous_rejections)
+
+    if orphan_candidates:
+        sections.append("--- CURRENT ORPHAN CANDIDATES ---")
+        sections.append(
+            "These nodes are not paper_main_result nodes and are not currently imported by any other node."
+        )
+        sections.append(
+            "For each one, decide whether the node should be removed or whether the worker missed a real downstream dependency/citation."
+        )
+        for name in orphan_candidates:
+            sections.append(f"- {name}")
+        sections.append("")
+
     # Skill file reference
     skill_path = config.repo_path / ".agent-supervisor" / "skills" / "LEAN_REVIEWER.md"
     if not skill_path.exists():
@@ -462,6 +672,8 @@ def build_theorem_stating_reviewer_prompt(
 
     instructions = _load_template("theorem_stating_reviewer_instructions.md").format(
         skill_path=skill_path,
+        phase="theorem_stating",
+        **_artifact_prompt_values(config, "reviewer_decision.json"),
     )
     sections.append(instructions)
 
@@ -500,9 +712,9 @@ def build_reviewer_prompt(
         sections.append(hi)
 
     # Paper
-    if config.workflow.paper_tex_path and config.workflow.paper_tex_path.exists():
-        paper = _read_file(config.workflow.paper_tex_path)
-        sections.append(f"--- SOURCE PAPER ---\n{_trim(paper, 20000)}\n")
+    paper_ref = _paper_reference_text(config)
+    if paper_ref:
+        sections.append(paper_ref)
 
     # Tablet status
     sections.append(_tablet_status_text(tablet, config.repo_path))
@@ -612,6 +824,8 @@ def build_reviewer_prompt(
     # Instructions
     instructions = _load_template("reviewer_instructions.md").format(
         skill_path=skill_path,
+        phase="proof_formalization",
+        **_artifact_prompt_values(config, "reviewer_decision.json"),
     )
     sections.append(instructions)
 
@@ -729,9 +943,9 @@ def build_correspondence_prompt(
                     sections.append(f"- **{issue.get('node', '?')}** ({phase}): {issue.get('description', '')[:300]}")
         sections.append("")
 
-    response_fmt = _load_template("correspondence_response_format.md")
-    if output_file != "correspondence_result.json":
-        response_fmt = response_fmt.replace("correspondence_result.json", output_file)
+    response_fmt = _load_template("correspondence_response_format.md").format(
+        **_artifact_prompt_values(config, output_file),
+    )
     sections.append(response_fmt)
     return "\n".join(sections)
 
@@ -743,6 +957,7 @@ def build_nl_proof_prompt(
     node_names: List[str],
     paper_tex: str = "",
     human_input: str = "",
+    output_file: str = "nl_proof_result.json",
 ) -> str:
     """Build the NL proof soundness verification prompt.
 
@@ -797,7 +1012,11 @@ def build_nl_proof_prompt(
         sections.append(_trim(paper_tex, 15000))
         sections.append("")
 
-    sections.append(_load_template("nl_proof_response_format.md"))
+    sections.append(
+        _load_template("nl_proof_response_format.md").format(
+            **_artifact_prompt_values(config, output_file),
+        )
+    )
     return "\n".join(sections)
 
 
@@ -871,9 +1090,10 @@ def build_node_soundness_prompt(
             sections.append(f"- {issue[:300]}")
         sections.append("")
 
+    artifact_values = _artifact_prompt_values(config, output_file)
     sections.append(f"""=== YOUR RESPONSE ===
 
-Evaluate this node's NL proof. Write your assessment as JSON to `{output_file}`:
+Evaluate this node's NL proof. Write your assessment as JSON to `{artifact_values["raw_output_path"]}`:
 
 {{
   "node": "{node_name}",
@@ -890,7 +1110,12 @@ Verdicts:
 - **UNSOUND**: The proof has gaps or errors but the DAG structure is reasonable. The proof text needs fixing.
 - **STRUCTURAL**: The children do NOT provide what is needed to prove this node. The DAG needs restructuring — new intermediate nodes or different dependencies are required.
 
-MANDATORY: Write the JSON to `{output_file}` then stop.
+MANDATORY:
+1. Write the JSON to `{artifact_values["raw_output_path"]}`.
+2. Run `python3 {artifact_values["check_script"]} soundness-result {artifact_values["raw_output_path"]} --node {node_name}`.
+3. If that passes, write the completion marker `{artifact_values["done_path"]}` and stop.
+
+The supervisor will rerun the same checker and then write the canonical result file `{artifact_values["canonical_output_path"]}`.
 """)
     return "\n".join(sections)
 

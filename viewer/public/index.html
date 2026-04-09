@@ -177,7 +177,7 @@ function layoutDAG(nodes, edges) {
   return positions;
 }
 
-let allNodes = {}, allCycles = [], selectedNode = null, currentState = {};
+let allNodes = {}, allCycles = [], timelineSlots = [], selectedNode = null, currentState = {};
 
 async function fetchData() {
   const [nodesRes, stateRes, cyclesRes] = await Promise.all([
@@ -194,7 +194,10 @@ async function fetchData() {
 
   // Setup slider
   const slider = document.getElementById('cycle-slider');
-  slider.max = Math.max(stateRes.state.cycle, allCycles.length);
+  const cycleNums = Array.from(new Set(allCycles.map(c => c.cycle))).sort((a, b) => a - b);
+  timelineSlots = [...cycleNums, 'current'];
+  slider.min = 0;
+  slider.max = Math.max(timelineSlots.length - 1, 0);
   slider.value = slider.max;
   updateCycleInfo();
 
@@ -310,9 +313,11 @@ function renderDAG() {
     }
 
     // Label: title or name, truncated
+    const theoremLike = ['theorem', 'corollary', 'proposition'].includes(node.texEnv);
+    const definitionLike = node.texEnv === 'definition' || (node.leanContent || '').match(/^(noncomputable\s+)?def\s/m);
     const kindPrefix = node.kind === 'preamble' ? '' :
-      node.kind === 'paper_main_result' ? 'T: ' :
-      (node.leanContent || '').match(/^(noncomputable\s+)?def\s/m) ? 'D: ' : 'L: ';
+      definitionLike ? 'D: ' :
+      (node.kind === 'paper_main_result' || theoremLike) ? 'T: ' : 'L: ';
     const label = (kindPrefix + (node.title || name)).substring(0, 26);
     const text = document.createElementNS(ns, 'text');
     text.setAttribute('x', 90); text.setAttribute('y', diff ? 28 : 24);
@@ -322,7 +327,7 @@ function renderDAG() {
 
     // Node border style encodes correspondence status
     const verif = node.verification || {};
-    const corrStatus = verif.correspondence || '?';
+    const corrStatus = node.kind === 'preamble' ? 'pass' : (verif.correspondence || '?');
     if (corrStatus === 'fail') rect.setAttribute('stroke-dasharray', '2 3');       // dotted
     else if (corrStatus === '?') rect.setAttribute('stroke-dasharray', '8 4');     // dashed
     // else solid (no dasharray)
@@ -408,13 +413,14 @@ function escHtml(s) {
 
 async function updateCycleInfo() {
   const slider = document.getElementById('cycle-slider');
-  const val = parseInt(slider.value);
+  const idx = parseInt(slider.value);
+  const slot = timelineSlots[idx];
   const info = document.getElementById('cycle-info');
-  const isLatest = val === parseInt(slider.max);
+  const isLatest = slot === 'current';
 
   if (isLatest) {
     // Show current live state
-    info.textContent = 'Current';
+    info.textContent = `Current (live, state cycle ${currentState.state?.cycle ?? '?'})`;
     const [nodesRes, stateRes] = await Promise.all([
       fetch('api/nodes.json').then(r => r.json()),
       fetch('api/state.json').then(r => r.json()),
@@ -425,6 +431,7 @@ async function updateCycleInfo() {
     return;
   }
 
+  const val = slot;
   const cycle = allCycles.find(c => c.cycle === val);
   if (cycle) {
     info.textContent = `Cycle ${val}: ${cycle.phase || '?'} | ${cycle.outcome || '?'}`;

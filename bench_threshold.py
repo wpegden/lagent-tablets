@@ -83,7 +83,12 @@ def run_one(name: str) -> dict:
     check = check_node(
         repo, "threshold_limit",
         allowed_prefixes=["Mathlib"],
-        forbidden_keywords=["sorry", "axiom", "constant", "unsafe", "native_decide", "implementedBy", "extern"],
+        forbidden_keywords=[
+            "sorry", "axiom", "constant", "unsafe", "opaque", "partial",
+            "native_decide", "implementedBy", "implemented_by", "extern",
+            "elab", "macro", "syntax", "run_cmd", "#eval",
+        ],
+        approved_axioms_path=repo / "APPROVED_AXIOMS.json",
     )
 
     # Parse usage from output

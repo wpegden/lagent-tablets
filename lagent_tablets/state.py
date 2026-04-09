@@ -22,6 +22,8 @@ except ImportError:
     fcntl = None  # type: ignore[assignment]
 
 T = TypeVar("T")
+OPEN_REJECTION_PHASES = ("correspondence", "paper_faithfulness")
+ORPHAN_RESOLUTION_ACTIONS = ("remove", "keep_and_add_dependency")
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +95,114 @@ def append_jsonl(path: Path, record: Dict[str, Any], *, mode: Optional[int] = No
 def timestamp_now() -> str:
     """ISO 8601 timestamp with timezone."""
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def normalize_open_rejections(raw: Any) -> List[Dict[str, str]]:
+    """Normalize stored theorem-stating rejection entries.
+
+    Each entry tracks one currently open correspondence or paper-faithfulness
+    rejection that the theorem-stating worker must address before the phase can
+    advance.
+    """
+    if not isinstance(raw, list):
+        return []
+
+    normalized: List[Dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        node = str(item.get("node", "")).strip() or "(global)"
+        phase = str(item.get("phase", "")).strip()
+        reason = str(item.get("reason", "")).strip()
+        if phase not in OPEN_REJECTION_PHASES or not reason:
+            continue
+        key = (node, phase)
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append({
+            "node": node,
+            "phase": phase,
+            "reason": reason,
+        })
+    return normalized
+
+
+def normalize_orphan_resolutions(
+    raw: Any,
+    *,
+    allowed_nodes: Optional[set[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Normalize structured reviewer decisions for theorem-stating orphan nodes."""
+    if not isinstance(raw, list):
+        return []
+
+    normalized: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        node = str(item.get("node", "")).strip()
+        action = str(item.get("action", "")).strip()
+        reason = str(item.get("reason", "")).strip()
+        if not node or node in seen:
+            continue
+        if allowed_nodes is not None and node not in allowed_nodes:
+            continue
+        if action not in ORPHAN_RESOLUTION_ACTIONS or not reason:
+            continue
+
+        suggested_parents: List[str] = []
+        raw_parents = item.get("suggested_parents", [])
+        if isinstance(raw_parents, list):
+            seen_parents: set[str] = set()
+            for parent in raw_parents:
+                parent_name = str(parent).strip()
+                if not parent_name or parent_name in seen_parents or parent_name == node:
+                    continue
+                seen_parents.add(parent_name)
+                suggested_parents.append(parent_name)
+
+        seen.add(node)
+        normalized.append({
+            "node": node,
+            "action": action,
+            "reason": reason,
+            "suggested_parents": suggested_parents,
+        })
+    return normalized
+
+
+def normalize_paper_focus_ranges(raw: Any) -> List[Dict[str, Any]]:
+    """Normalize reviewer-selected paper line ranges for worker prompt excerpts."""
+    if not isinstance(raw, list):
+        return []
+
+    normalized: List[Dict[str, Any]] = []
+    seen: set[tuple[int, int]] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            start_line = int(item.get("start_line", 0))
+            end_line = int(item.get("end_line", 0))
+        except (TypeError, ValueError):
+            continue
+        if start_line <= 0 or end_line <= 0:
+            continue
+        if end_line < start_line:
+            start_line, end_line = end_line, start_line
+        key = (start_line, end_line)
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append({
+            "start_line": start_line,
+            "end_line": end_line,
+            "reason": str(item.get("reason", "")).strip(),
+        })
+    return normalized
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +368,7 @@ class SupervisorState:
     active_node: str = ""
     last_worker_handoff: Optional[Dict[str, Any]] = None
     last_review: Optional[Dict[str, Any]] = None
+    open_rejections: List[Dict[str, str]] = field(default_factory=list)
     review_log: List[Dict[str, Any]] = field(default_factory=list)
     validation_summary: Optional[Dict[str, Any]] = None
     stuck_recovery_attempts: List[Dict[str, Any]] = field(default_factory=list)
@@ -275,6 +386,7 @@ class SupervisorState:
             "active_node": self.active_node,
             "last_worker_handoff": self.last_worker_handoff,
             "last_review": self.last_review,
+            "open_rejections": self.open_rejections,
             "review_log": self.review_log,
             "validation_summary": self.validation_summary,
             "stuck_recovery_attempts": self.stuck_recovery_attempts,
@@ -296,6 +408,7 @@ class SupervisorState:
             active_node=str(raw.get("active_node", "")),
             last_worker_handoff=raw.get("last_worker_handoff"),
             last_review=raw.get("last_review"),
+            open_rejections=normalize_open_rejections(raw.get("open_rejections", [])),
             review_log=list(raw.get("review_log", [])),
             validation_summary=raw.get("validation_summary"),
             stuck_recovery_attempts=list(raw.get("stuck_recovery_attempts", [])),

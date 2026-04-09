@@ -1,14 +1,19 @@
 === YOUR RESPONSE ===
 
-Write your assessment as JSON to the file `nl_proof_result.json`:
+Write your assessment as JSON to the raw file `{raw_output_path}`:
 
-{
-  "soundness": {
+{{
+  "soundness": {{
     "decision": "PASS" or "FAIL",
-    "issues": [{"node": "name", "description": "..."}]
-  },
+    "issues": [{{"node": "name", "description": "..."}}]
+  }},
   "overall": "APPROVE" or "REJECT",
   "summary": "brief overall assessment"
-}
+}}
 
-MANDATORY: Write the JSON to `nl_proof_result.json` then stop.
+MANDATORY:
+1. Write the JSON to `{raw_output_path}`.
+2. Run `python3 {check_script} soundness-batch-result {raw_output_path}`.
+3. If that passes, write the completion marker `{done_path}` and stop.
+
+The supervisor will rerun the same checker and then write the canonical result file `{canonical_output_path}`.

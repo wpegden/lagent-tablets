@@ -2,6 +2,11 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
+const {
+  buildVerifiedNodes,
+  createFsSnapshot,
+  createGitSnapshot,
+} = require('./state');
 
 const app = express();
 const PORT = process.env.PORT || 3300;
@@ -61,26 +66,32 @@ function getCycleDiff(cycle) {
   }
 }
 
+function writeJsonIfChanged(filePath, value) {
+  const next = JSON.stringify(value);
+  try {
+    const current = fs.readFileSync(filePath, 'utf-8');
+    if (current === next) return;
+  } catch {}
+  fs.writeFileSync(filePath, next);
+}
+
 function writeStatic() {
   try {
     fs.mkdirSync(path.join(STATIC_OUT, 'api'), { recursive: true });
+    const liveSnapshot = createFsSnapshot(REPO_PATH);
 
     // State
     const state = JSON.parse(fs.readFileSync(path.join(STATE_DIR, 'state.json'), 'utf-8'));
     const tablet = JSON.parse(fs.readFileSync(path.join(STATE_DIR, 'tablet.json'), 'utf-8'));
-    fs.writeFileSync(path.join(STATIC_OUT, 'api', 'state.json'), JSON.stringify({ state, tablet }));
+    writeJsonIfChanged(path.join(STATIC_OUT, 'api', 'state.json'), { state, tablet });
 
     // Cycles from git
     const cycles = getCyclesFromGit();
-    fs.writeFileSync(path.join(STATIC_OUT, 'api', 'cycles.json'), JSON.stringify(cycles));
+    writeJsonIfChanged(path.join(STATIC_OUT, 'api', 'cycles.json'), cycles);
 
     // Nodes (with verification status)
-    const nodes = buildNodes(tablet);
-    const verif = getVerificationStatus(tablet);
-    for (const [name, vs] of Object.entries(verif)) {
-      if (nodes[name]) nodes[name].verification = vs;
-    }
-    fs.writeFileSync(path.join(STATIC_OUT, 'api', 'nodes.json'), JSON.stringify(nodes));
+    const nodes = buildVerifiedNodes(tablet, liveSnapshot);
+    writeJsonIfChanged(path.join(STATIC_OUT, 'api', 'nodes.json'), nodes);
 
     // Generate state-at files for each cycle in git
     const stateAtDir = path.join(STATIC_OUT, 'api', 'state-at');
@@ -90,18 +101,14 @@ function writeStatic() {
       for (const tag of tags) {
         const cycleNum = parseInt(tag.replace('cycle-', ''), 10);
         const outFile = path.join(stateAtDir, `${cycleNum}.json`);
-        if (fs.existsSync(outFile)) continue; // already generated
         try {
           const tabletRaw = git(`show ${tag}:.agent-supervisor/tablet.json`);
           const stateRaw = git(`show ${tag}:.agent-supervisor/state.json`);
           const histTablet = JSON.parse(tabletRaw);
           const histState = JSON.parse(stateRaw);
-          const histNodes = buildNodes(histTablet);
-          const histVerif = getVerificationStatus(histTablet);
-          for (const [name, vs] of Object.entries(histVerif)) {
-            if (histNodes[name]) histNodes[name].verification = vs;
-          }
-          fs.writeFileSync(outFile, JSON.stringify({ state: histState, tablet: histTablet, nodes: histNodes }));
+          const histSnapshot = createGitSnapshot(REPO_PATH, tag);
+          const histNodes = buildVerifiedNodes(histTablet, histSnapshot);
+          writeJsonIfChanged(outFile, { state: histState, tablet: histTablet, nodes: histNodes });
         } catch {}
       }
     } catch {}
@@ -115,120 +122,6 @@ function writeStatic() {
   } catch (e) {
     console.error('Static write error:', e.message);
   }
-}
-
-function nodeContentHash(name) {
-  // SHA-256 of .lean + .tex, matching _node_content_hash in cycle.py
-  const crypto = require('crypto');
-  const h = crypto.createHash('sha256');
-  const tabletDir = path.join(REPO_PATH, 'Tablet');
-  for (const ext of ['.lean', '.tex']) {
-    const p = path.join(tabletDir, name + ext);
-    try { h.update(fs.readFileSync(p)); } catch {}
-  }
-  return h.digest('hex').substring(0, 16);
-}
-
-function getVerificationStatus(tablet) {
-  // Read per-node verification status from tablet.json.
-  // Status is sticky UNLESS the node's content has changed since verification.
-  const status = {};
-  for (const [name, node] of Object.entries(tablet.nodes || {})) {
-    if (name === 'Preamble') continue;
-    const savedHash = node.verification_content_hash || '';
-    const currentHash = savedHash ? nodeContentHash(name) : '';
-    const contentChanged = savedHash && currentHash !== savedHash;
-
-    const cs = contentChanged ? '?' : (node.correspondence_status || '?');
-    let ss = contentChanged ? '?' : (node.soundness_status || '?');
-    // Closed nodes (Lean proof complete) automatically pass soundness
-    if (node.status === 'closed') ss = 'pass';
-    status[name] = { correspondence: cs, nl_proof: ss };
-  }
-  return status;
-}
-
-function buildNodes(tablet) {
-  const tabletDir = path.join(REPO_PATH, 'Tablet');
-  const nodes = {};
-
-  // Add Preamble as a visible node
-  {
-    const preamblePath = path.join(tabletDir, 'Preamble.lean');
-    let preambleContent = '';
-    try { preambleContent = fs.readFileSync(preamblePath, 'utf-8'); } catch {}
-    if (preambleContent) {
-      // Extract definitions from preamble
-      const defs = [];
-      for (const line of preambleContent.split('\n')) {
-        if (line.match(/^(noncomputable\s+)?def\s/)) {
-          defs.push(line.trim());
-        }
-      }
-      nodes['Preamble'] = {
-        kind: 'preamble',
-        status: 'closed',
-        title: 'Definitions',
-        imports: [],
-        declaration: defs.join('\n'),
-        hasSorry: /\bsorry\b/.test(preambleContent.replace(/--.*$/gm, '')),
-        leanContent: preambleContent,
-        texContent: '',
-      };
-    }
-  }
-
-  for (const [name, meta] of Object.entries(tablet.nodes || {})) {
-    if (meta.kind === 'preamble') continue;
-
-    const leanPath = path.join(tabletDir, `${name}.lean`);
-    const texPath = path.join(tabletDir, `${name}.tex`);
-
-    let leanContent = '', texContent = '', imports = [], title = '';
-    try { leanContent = fs.readFileSync(leanPath, 'utf-8'); } catch {}
-    try { texContent = fs.readFileSync(texPath, 'utf-8'); } catch {}
-
-    // Extract imports
-    const importRe = /import\s+Tablet\.(\w+)/g;
-    let m;
-    while ((m = importRe.exec(leanContent)) !== null) {
-      imports.push(m[1]);
-    }
-
-    // Extract title from tex
-    const titleMatch = texContent.match(/\\begin\{(?:theorem|lemma|definition|proposition)\}\[(.*?)\]/);
-    if (titleMatch) title = titleMatch[1];
-
-    // Extract declaration (everything from theorem/lemma/def up to := sorry or := by)
-    let declaration = '';
-    const lines = leanContent.split('\n');
-    let inDecl = false;
-    for (const line of lines) {
-      if (!inDecl && line.match(/^(theorem|lemma|def|noncomputable\s+def)\s/)) {
-        inDecl = true;
-      }
-      if (inDecl) {
-        declaration += (declaration ? '\n' : '') + line;
-        if (line.includes(':= sorry') || line.includes(':= by') || line.trimEnd().endsWith(':=')) {
-          break;
-        }
-      }
-    }
-
-    // Check sorry
-    const hasSorry = /\bsorry\b/.test(leanContent.replace(/--.*$/gm, ''));
-
-    nodes[name] = {
-      ...meta,
-      title,
-      imports,
-      declaration,
-      hasSorry,
-      leanContent,
-      texContent,
-    };
-  }
-  return nodes;
 }
 
 // Serve static files
@@ -252,11 +145,7 @@ app.get(`${BASE}/api/cycles.json`, (req, res) => {
 app.get(`${BASE}/api/nodes.json`, (req, res) => {
   try {
     const tablet = JSON.parse(fs.readFileSync(path.join(STATE_DIR, 'tablet.json'), 'utf-8'));
-    const nodes = buildNodes(tablet);
-    const verif = getVerificationStatus(tablet);
-    for (const [name, vs] of Object.entries(verif)) {
-      if (nodes[name]) nodes[name].verification = vs;
-    }
+    const nodes = buildVerifiedNodes(tablet, createFsSnapshot(REPO_PATH));
     res.json(nodes);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -270,11 +159,7 @@ app.get(`${BASE}/api/state-at/:cycle`, (req, res) => {
     const stateRaw = git(`show ${tag}:.agent-supervisor/state.json`);
     const tablet = JSON.parse(tabletRaw);
     const state = JSON.parse(stateRaw);
-    const nodes = buildNodes(tablet);
-    const verif = getVerificationStatus(tablet);
-    for (const [name, vs] of Object.entries(verif)) {
-      if (nodes[name]) nodes[name].verification = vs;
-    }
+    const nodes = buildVerifiedNodes(tablet, createGitSnapshot(REPO_PATH, tag));
     res.json({ state, tablet, nodes });
   } catch (e) {
     res.status(404).json({ error: `Cycle ${cycle} not found: ${e.message}` });
@@ -388,10 +273,6 @@ ${nodeList}
   }
 });
 
-// Write static files on startup and every 30s
-writeStatic();
-setInterval(writeStatic, 30000);
-
 // API: submit human feedback
 app.use(express.json());
 
@@ -456,8 +337,22 @@ app.get(`${BASE}/api/feedback`, (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Tablet viewer at http://localhost:${PORT}${BASE}`);
-  console.log(`Static output: ${STATIC_OUT}`);
-  console.log(`Repo: ${REPO_PATH}`);
-});
+function startServer() {
+  writeStatic();
+  setInterval(writeStatic, 30000);
+  return app.listen(PORT, () => {
+    console.log(`Tablet viewer at http://localhost:${PORT}${BASE}`);
+    console.log(`Static output: ${STATIC_OUT}`);
+    console.log(`Repo: ${REPO_PATH}`);
+  });
+}
+
+if (require.main === module) {
+  startServer();
+}
+
+module.exports = {
+  app,
+  startServer,
+  writeStatic,
+};

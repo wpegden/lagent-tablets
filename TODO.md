@@ -11,3 +11,5 @@ Once burst.py is 100% solid, address these:
 4. **cli.py simplification**: Remove dead code from old interactive model (adapter creation, process cleanup). Simplify main loop.
 
 5. **cycle.py permission timing**: Verify setup_permissions runs before burst, snapshot after permissions. The script-based approach for Codex eliminates timing issues; interactive Claude/Gemini still need correct ordering.
+
+6. **Orphan-status protection policy**: Decide which nodes should be protected from orphan status by default. In particular, clarify whether all paper-facing statements (not just `paper_main_result`) should be exempt, and whether that classification should be reviewer-assigned and persisted in tablet metadata.
