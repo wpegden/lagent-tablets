@@ -1,0 +1,275 @@
+# AGENTS.md — Guide for Agents Working on lagent-tablets
+
+This document is for LLM agents (and humans) maintaining, debugging, or extending the lagent-tablets system. It covers the architecture, common pitfalls, and everything you need to know to work effectively.
+
+---
+
+## 1. What This System Does
+
+lagent-tablets orchestrates multiple LLM agents to formalize mathematical papers into verified Lean 4 proofs. It manages a "proof tablet" — a DAG of nodes where each node is a `.lean` + `.tex` pair representing one mathematical result.
+
+The system runs in cycles:
+1. **Worker** creates/modifies nodes (writes Lean code and NL proofs)
+2. **Verification agents** check the work (correspondence, faithfulness, soundness)
+3. **Reviewer** decides next steps based on verification results
+4. Repeat until the paper is fully formalized
+
+---
+
+## 2. The Proof Tablet Model
+
+### Nodes
+Each node in `Tablet/` has:
+- `{name}.lean` — Lean 4 declaration (theorem, lemma, or definition)
+- `{name}.tex` — Natural language statement + rigorous NL proof
+
+### Imports = DAG edges
+If `A.lean` has `import Tablet.B`, then A depends on B. B's NL statement can be cited in A's NL proof.
+
+### Invariants (enforced by verification)
+- Every node has both a Lean statement and an NL statement
+- Lean and NL statements must correspond (checked by correspondence agents)
+- Every theorem/lemma has either:
+  - A complete Lean proof (no `sorry`), OR
+  - A rigorous NL proof from its children's NL statements (checked by soundness agents)
+- `Preamble.lean` contains ONLY imports — no definitions
+- All definitions must be concrete (no `sorry`, `opaque`, `axiom`)
+- No bare `import Mathlib` — only specific submodule imports
+- Project definitions should not duplicate Mathlib concepts
+
+### Node Difficulty
+- **Easy**: straightforward proof from existing children. No new imports/files allowed. Filesystem-enforced.
+- **Hard**: may require new helper nodes, import changes, refactoring.
+- Auto-elevates from easy to hard after 2 failed attempts.
+- Different agent configs per difficulty (e.g., Gemini for easy, Codex for hard).
+
+---
+
+## 3. Verification Pipeline — Critical Details
+
+### Three checks, two stages
+**Stage 1: Correspondence + Paper Faithfulness** (one call per agent)
+- Does each node's Lean statement genuinely capture its NL statement?
+- Is each node a faithful intermediate step from the paper?
+- 3 agents run in parallel, each independently reading files from disk
+- Each agent gets its OWN previous cycle's results as context (not other agents')
+- Correspondence is a **GATE** — if rejected, soundness is skipped entirely
+
+**Stage 2: NL Proof Soundness** (per-node, only if correspondence passes)
+- Is each node's NL proof rigorous from its children's NL statements?
+- Each node checked individually with 3 agents
+- Verdicts: SOUND, UNSOUND (proof fixable), STRUCTURAL (DAG needs restructuring)
+- Batched: 3 nodes at a time × 3 agents = 9 concurrent
+
+### Verification Status Persistence
+- Stored per-node in `tablet.json`: `correspondence_status`, `soundness_status`
+- **Sticky**: persists until node content changes (tracked via `verification_content_hash`)
+- Closed nodes (Lean proof complete) automatically get soundness=pass
+- All result files are **tracked in git** — complete history preserved
+
+### Context Continuity
+Verifiers are stateless (fresh each cycle) but receive their own previous results in the prompt. This prevents workers from gaming verifiers with superficial fixes. Each agent sees: "Last cycle you flagged these issues — check if they're genuinely fixed."
+
+---
+
+## 4. Agent Backend Details
+
+### Three backends, critical differences
+
+| Backend | Provider | Session | Completion Signal | Timeout |
+|---------|----------|---------|-------------------|---------|
+| `codex_headless.py` | Codex | One-shot in tmux | `.exit` marker file | None (runs until done) |
+| `agentapi_backend.py` | Claude, Gemini | PTY via agentapi HTTP | `done_file` (result JSON) | Liveness-based (inactivity only) |
+| `script_headless.py` | Fallback | `-p` mode | Process exit | None |
+
+### Critical Rules (LEARNED THE HARD WAY)
+
+1. **done_file MUST match the actual output file**
+   - Correspondence agent 0 writes `correspondence_result_0.json` → done_file must be that file
+   - Soundness agent writes `nl_proof_{node}_{i}.json` → done_file must be that file
+   - Default `reviewer_decision.json` is ONLY for the actual reviewer
+   - **Regression test**: `TestCorrespondenceAgentDoneFiles`, `TestWorkerBurstDoneFile`
+
+2. **No hard wall-clock timeouts**
+   - Codex: no `timeout` command wrapper
+   - Agentapi: liveness-based — resets while status="running", only fires on sustained inactivity
+   - Extended thinking (Claude max effort) can run 15+ minutes — NEVER kill an active agent
+   - **Regression test**: `TestCodexNoHardTimeout`
+
+3. **effort MUST be passed through**
+   - `CorrespondenceAgentConfig.effort` → `ProviderConfig.effort` → backend command
+   - Codex: `-c reasoning_effort=xhigh`
+   - Claude: `--effort max`
+   - Gemini: no effort concept (ignored)
+   - **Regression test**: `TestEffortPassthrough`
+
+4. **Log file handles must stay open**
+   - `_launch_server` keeps the log file open for the process lifetime
+   - Do NOT use `with open() as f:` — the fd closes when the block exits, killing agentapi's stdout
+   - Per-port log files prevent concurrent write conflicts
+
+5. **Prompts reference files, don't inline content**
+   - Correspondence prompt is ~9K (was 70K before fix)
+   - Agents read .lean/.tex from disk via tool calls
+   - **Regression test**: `TestPromptNoInlineContent`
+
+6. **Result files are tracked in git**
+   - correspondence_result_*.json, nl_proof_result_*.json, reviewer_decision.json, worker_handoff.json
+   - NEVER delete these — they provide verification context continuity
+   - `git show cycle-N:correspondence_result_0.json` retrieves any cycle's results
+
+### Port Allocation
+| Port Range | Purpose |
+|------------|---------|
+| 3284 | Worker (agentapi) |
+| 3285 | Reviewer (agentapi) |
+| 3286, 3288, 3290 | Correspondence agents |
+| 3300 | Web viewer (RESERVED) |
+| 3310, 3312, 3314 | Soundness agents |
+
+### wait_for_stable Logic
+The unified poll loop in agentapi_backend:
+- Requires seeing status="running" at least once before accepting "stable" as completion
+- Resets inactivity timer every time status != "stable"
+- Only times out on SUSTAINED inactivity (agent idle, not just between tool calls)
+- Server unreachable → agent crashed → return False
+
+---
+
+## 5. Configuration
+
+### Config JSON structure
+See `configs/extremal_vectors_run.json` for a complete example. Key fields:
+- `worker`, `easy_worker`, `hard_worker` — ProviderConfig per difficulty
+- `reviewer` — ProviderConfig for the reviewer agent
+- `verification.correspondence_agents` — list of agents for correspondence checks
+- `verification.soundness_agents` — list of agents for soundness checks
+- Each agent: `provider`, `model`, `effort`, `fallback_models`, `label`
+
+### Policy JSON (hot-reloadable)
+Runtime tuning at `{config}.policy.json`. Editable while supervisor runs:
+- `timing.burst_timeout_seconds` — max agent runtime
+- `difficulty.easy_max_retries` — attempts before auto-elevation
+- `prompt_notes.worker` — ad-hoc instructions injected into prompts
+
+---
+
+## 6. Cycle Flow in Detail
+
+### Theorem Stating Phase
+```
+Cycle N:
+  1. Worker creates/modifies nodes (.lean + .tex pairs)
+  2. Register new nodes in tablet, apply difficulty hints
+  3. Correspondence + Faithfulness check (3 agents, gate)
+     - If REJECT → skip soundness, go to reviewer
+     - If APPROVE → proceed to soundness
+  4. Per-node NL Proof Soundness check (3 agents per node)
+  5. Apply verification results to tablet (sticky per-node status)
+  6. Reviewer evaluates, provides guidance
+  7. Git commit with cycle tag
+  8. If ADVANCE_PHASE → human approval via web viewer
+```
+
+### Proof Formalization Phase
+```
+Cycle N:
+  1. Select active node (reviewer's choice from previous cycle)
+  2. Route to easy_worker or hard_worker based on difficulty
+  3. Worker eliminates sorry from one node
+  4. Validation (compilation, imports, declaration integrity)
+  5. If easy mode: reject new imports/files, auto-elevate after 2 fails
+  6. NL verification on modified/new nodes
+  7. Reviewer evaluates, picks next node
+  8. Git commit
+```
+
+### Mid-Cycle Resume
+`state.resume_from` can be set to:
+- `""` — full cycle
+- `"verification"` — skip worker
+- `"reviewer"` — skip worker + verification (loads saved results)
+
+---
+
+## 7. Management Scripts
+
+```bash
+./scripts/status.sh [repo]           # Show everything
+./scripts/pause.sh [repo]            # Graceful stop after cycle
+./scripts/stop.sh [repo]             # Kill everything
+./scripts/rewind.sh 3 verification   # Rewind to cycle 3, verification stage
+./scripts/resume.sh config.json --stop-at-phase-boundary
+./scripts/setup_repo.sh /path paper.tex  # New formalization
+```
+
+---
+
+## 8. Web Viewer
+
+Dashboard at port 3300 (nginx serves static files from `/home/leanagent/lagent-tablets-web/`).
+
+### Visual encoding
+- **Node border**: solid=C pass, dashed=C unknown, dotted=C fail
+- **Edge style**: solid=P pass, dashed=P unknown, dotted=P fail (edges from the importing node)
+- **Corner shape**: rounded=easy, sharp=hard
+- **Prefix**: T:=theorem, D:=definition, L:=lemma
+- **Color**: blue=closed, green=recursively closed, yellow=active, grey=open
+
+### Features
+- Cycle history slider (loads state from git)
+- Pan/zoom (mouse wheel + drag, pinch on mobile)
+- Mobile responsive (timeline at top, slide-up detail sheet)
+- Human feedback panel at phase boundaries
+- Tablet snapshot download (.zip)
+
+---
+
+## 9. Common Debugging
+
+### Agent not producing results
+1. Check `scripts/status.sh` — is it running?
+2. Check the screen: `curl -s "http://localhost:PORT/internal/screen" -H "Accept: text/event-stream" --max-time 3`
+3. Check the agentapi log: `.agent-supervisor/logs/agentapi-reviewer-PORT.log`
+4. Check done_file: is the agent writing to the file wait_for_stable is watching?
+
+### Verification always rejects
+1. Check the specific issues in `correspondence_result_N.json`
+2. Common: Mathlib duplicates, missing quantifiers, weakened statements
+3. The reviewer prompt includes verification results — check if guidance is specific enough
+
+### Worker ignoring verification feedback
+1. Check the reviewer decision — is it specific about what to fix?
+2. The worker doesn't see verification results directly — only the reviewer's guidance
+3. Consider human feedback via the web viewer
+
+### Tests failing
+```bash
+python3 -m pytest tests/ --ignore=tests/test_adapters_live.py -v
+```
+Key test files:
+- `test_agent_dispatch.py` — done_file, effort, timeout regression tests
+- `test_difficulty.py` — tiering, git, multi-agent, model fallback
+- `test_state.py`, `test_config.py` — serialization, parsing
+
+---
+
+## 10. Extending the System
+
+### Adding a new agent provider
+1. Create `agents/new_provider.py` with a `run()` function returning `BurstResult`
+2. Add dispatch in `burst.py` `run_worker_burst` and `run_reviewer_burst`
+3. Add command building in `agentapi_backend._agent_command` (if using agentapi)
+4. Add regression tests in `test_agent_dispatch.py`
+
+### Adding a new verification check
+1. Add prompt builder in `prompts.py`
+2. Add runner in `cycle.py` (follow `_run_single_soundness_agent` pattern)
+3. Wire into `_run_nl_verification` with appropriate gating
+4. Add status field to `TabletNode` in `state.py`
+5. Update viewer to display the new status
+
+### Modifying the DAG structure
+- Nodes are registered via `register_new_node` in `tablet.py`
+- Support files (Tablet.lean, INDEX.md) are auto-regenerated
+- Git commits capture the full state at each cycle
