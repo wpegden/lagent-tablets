@@ -1169,15 +1169,26 @@ def _apply_verification_to_tablet(
             if issue.get("node"):
                 sound_failed.add(issue["node"])
 
-    # Apply to tablet nodes and store content hash for change detection
-    repo = Path(tablet.nodes[list(tablet.nodes.keys())[0]].name).parent if tablet.nodes else Path(".")
+    # Apply to tablet nodes. Only update if:
+    # - Node content changed since last verification (hash mismatch), OR
+    # - Node has never been verified ("?")
+    # This preserves sticky status for unchanged nodes.
     for name, node in tablet.nodes.items():
         if name == "Preamble":
             continue
-        if corr_checked:
+        current_hash = _node_content_hash(repo_path, name) if repo_path else ""
+        content_changed = (node.verification_content_hash != current_hash) if node.verification_content_hash else True
+
+        if corr_checked and (content_changed or node.correspondence_status == "?"):
             node.correspondence_status = "fail" if name in corr_failed else "pass"
             node.verification_at_cycle = cycle
-        if sound_checked:
+            if repo_path:
+                node.verification_content_hash = current_hash
+            # If correspondence changed, reset soundness (it's stale)
+            if content_changed and node.soundness_status != "?":
+                node.soundness_status = "?"
+
+        if sound_checked and (content_changed or node.soundness_status == "?"):
             if name in sound_structural:
                 node.soundness_status = "structural"
             elif name in sound_failed:
@@ -1185,8 +1196,8 @@ def _apply_verification_to_tablet(
             else:
                 node.soundness_status = "pass"
             node.verification_at_cycle = cycle
-        if (corr_checked or sound_checked) and repo_path:
-            node.verification_content_hash = _node_content_hash(repo_path, name)
+            if repo_path:
+                node.verification_content_hash = current_hash
 
 
 def _is_definition_node(repo_path: Path, name: str) -> bool:
