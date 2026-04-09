@@ -48,6 +48,9 @@ Two stages, correspondence is a **gate** for soundness:
 
 Both stages use 3 agents in parallel (configurable via `correspondence_agents` and `soundness_agents`).
 
+### Verification Context Continuity
+Verification agents receive previous cycle's results in their prompt ("Last cycle you flagged these issues — check if they're genuinely fixed"). This prevents workers from gaming verifiers with superficial fixes, since each agent knows what was previously flagged and must independently verify the fix.
+
 ### Per-Node Verification Status
 Status stored on each `TabletNode` in tablet.json:
 - `correspondence_status`: "?", "pass", "fail"

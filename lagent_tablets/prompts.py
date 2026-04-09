@@ -678,6 +678,7 @@ def build_correspondence_prompt(
     paper_tex: str = "",
     human_input: str = "",
     output_file: str = "correspondence_result.json",
+    previous_results: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """Build the Lean/NL correspondence verification prompt.
 
@@ -716,6 +717,17 @@ def build_correspondence_prompt(
 
     if config.workflow.paper_tex_path:
         sections.append(f"The source paper is at `{config.workflow.paper_tex_path}`. Read it as needed for context.\n")
+
+    if previous_results:
+        sections.append("=== PREVIOUS CYCLE'S VERIFICATION RESULTS ===\n")
+        sections.append("The worker was asked to fix these issues. Check whether each fix is genuine or superficial. Do NOT approve a node just because the worker claims to have fixed it — verify independently.\n")
+        for r in previous_results:
+            agent = r.get("agent", r.get("check", "?"))
+            for phase in ("correspondence", "paper_faithfulness"):
+                issues = r.get(phase, {}).get("issues", []) if isinstance(r.get(phase), dict) else []
+                for issue in issues:
+                    sections.append(f"- **{issue.get('node', '?')}** ({phase}): {issue.get('description', '')[:300]}")
+        sections.append("")
 
     response_fmt = _load_template("correspondence_response_format.md")
     if output_file != "correspondence_result.json":
@@ -797,6 +809,7 @@ def build_node_soundness_prompt(
     paper_tex: str = "",
     human_input: str = "",
     output_file: str = "nl_proof_result.json",
+    previous_issues: Optional[List[str]] = None,
 ) -> str:
     """Build a per-node NL proof soundness prompt.
 
@@ -849,6 +862,13 @@ def build_node_soundness_prompt(
     if paper_tex:
         sections.append("=== SOURCE PAPER (for reference) ===\n")
         sections.append(_trim(paper_tex, 15000))
+        sections.append("")
+
+    if previous_issues:
+        sections.append("=== PREVIOUS CYCLE'S ISSUES FOR THIS NODE ===\n")
+        sections.append("The worker was asked to fix these. Verify independently whether the fix is genuine:\n")
+        for issue in previous_issues:
+            sections.append(f"- {issue[:300]}")
         sections.append("")
 
     sections.append(f"""=== YOUR RESPONSE ===

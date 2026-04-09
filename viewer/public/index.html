@@ -310,7 +310,10 @@ function renderDAG() {
     }
 
     // Label: title or name, truncated
-    const label = (node.title || name).substring(0, 24);
+    const kindPrefix = node.kind === 'preamble' ? '' :
+      node.kind === 'paper_main_result' ? 'T: ' :
+      (node.leanContent || '').match(/^(noncomputable\s+)?def\s/m) ? 'D: ' : 'L: ';
+    const label = (kindPrefix + (node.title || name)).substring(0, 26);
     const text = document.createElementNS(ns, 'text');
     text.setAttribute('x', 90); text.setAttribute('y', diff ? 28 : 24);
     text.setAttribute('text-anchor', 'middle');

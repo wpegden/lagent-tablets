@@ -743,6 +743,7 @@ def _run_single_correspondence_agent(
     paper_tex: str,
     human_input: str,
     log_dir: Path,
+    previous_results: Optional[List[Dict[str, Any]]] = None,
     agent_index: int,
 ) -> Dict[str, Any]:
     """Run one correspondence agent. Designed to be called from a thread."""
@@ -760,6 +761,7 @@ def _run_single_correspondence_agent(
     prompt = build_correspondence_prompt(
         config, tablet, node_names=corr_nodes, paper_tex=paper_tex,
         human_input=human_input, output_file=output_file,
+        previous_results=previous_results,
     )
 
     agent_provider = ProviderConfig(
@@ -1223,6 +1225,7 @@ def _run_multi_correspondence(
     paper_tex: str,
     human_input: str,
     log_dir: Path,
+    previous_results: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Run multiple correspondence agents concurrently and reconcile results.
 
@@ -1243,6 +1246,7 @@ def _run_multi_correspondence(
                 config, tablet, corr_nodes, agent,
                 paper_tex=paper_tex, human_input=human_input,
                 log_dir=log_dir, agent_index=i,
+                previous_results=previous_results,
             ): i
             for i, agent in enumerate(agents)
         }
@@ -1285,6 +1289,26 @@ def _run_multi_correspondence(
         }
 
 
+def _load_previous_correspondence(repo: Path) -> List[Dict[str, Any]]:
+    """Load saved correspondence results from previous cycle for context."""
+    previous = []
+    for i in range(10):
+        f = repo / f"correspondence_result_{i}.json"
+        if f.exists():
+            try:
+                previous.append(load_json(f))
+            except Exception:
+                pass
+    if not previous:
+        f = repo / "correspondence_result.json"
+        if f.exists():
+            try:
+                previous.append(load_json(f))
+            except Exception:
+                pass
+    return previous
+
+
 def _run_nl_verification(
     config: Config,
     tablet: TabletState,
@@ -1297,6 +1321,7 @@ def _run_nl_verification(
     """Run correspondence and NL proof verification on the given nodes.
 
     Uses the NL cache to skip re-verification when content hasn't changed.
+    Passes previous cycle's results to verifiers for context continuity.
     Returns list of verification result dicts.
     """
     from lagent_tablets.burst import _clean_terminal_json
@@ -1306,6 +1331,9 @@ def _run_nl_verification(
 
     if not node_names:
         return results
+
+    # Load previous results for verifier context
+    previous_corr = _load_previous_correspondence(repo)
 
     paper_tex = ""
     if config.workflow.paper_tex_path and config.workflow.paper_tex_path.exists():
@@ -1328,6 +1356,7 @@ def _run_nl_verification(
             corr_result_entry = _run_multi_correspondence(
                 config, tablet, corr_nodes, corr_agents,
                 paper_tex=paper_tex, human_input=human_input, log_dir=log_dir,
+                previous_results=previous_corr,
             )
             results.append(corr_result_entry)
             if corr_result_entry.get("overall") == "APPROVE" and nl_cache:
