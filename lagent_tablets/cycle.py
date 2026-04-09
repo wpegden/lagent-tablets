@@ -743,7 +743,7 @@ def _run_single_correspondence_agent(
     paper_tex: str,
     human_input: str,
     log_dir: Path,
-    previous_results: Optional[List[Dict[str, Any]]] = None,
+    previous_own_result: Optional[Dict[str, Any]] = None,
     agent_index: int,
 ) -> Dict[str, Any]:
     """Run one correspondence agent. Designed to be called from a thread."""
@@ -761,7 +761,7 @@ def _run_single_correspondence_agent(
     prompt = build_correspondence_prompt(
         config, tablet, node_names=corr_nodes, paper_tex=paper_tex,
         human_input=human_input, output_file=output_file,
-        previous_results=previous_results,
+        previous_results=[previous_own_result] if previous_own_result else None,
     )
 
     agent_provider = ProviderConfig(
@@ -1225,7 +1225,6 @@ def _run_multi_correspondence(
     paper_tex: str,
     human_input: str,
     log_dir: Path,
-    previous_results: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Run multiple correspondence agents concurrently and reconcile results.
 
@@ -1246,7 +1245,7 @@ def _run_multi_correspondence(
                 config, tablet, corr_nodes, agent,
                 paper_tex=paper_tex, human_input=human_input,
                 log_dir=log_dir, agent_index=i,
-                previous_results=previous_results,
+                previous_own_result=_load_agent_previous_result(config.repo_path, i),
             ): i
             for i, agent in enumerate(agents)
         }
@@ -1287,6 +1286,17 @@ def _run_multi_correspondence(
             "summary": f"Agents disagree: {disagree_detail}. Reviewer must arbitrate.",
             "agent_results": agent_results,
         }
+
+
+def _load_agent_previous_result(repo: Path, agent_index: int) -> Optional[Dict[str, Any]]:
+    """Load a single agent's previous correspondence result."""
+    f = repo / f"correspondence_result_{agent_index}.json"
+    if f.exists():
+        try:
+            return load_json(f)
+        except Exception:
+            pass
+    return None
 
 
 def _load_previous_correspondence(repo: Path) -> List[Dict[str, Any]]:
@@ -1356,7 +1366,6 @@ def _run_nl_verification(
             corr_result_entry = _run_multi_correspondence(
                 config, tablet, corr_nodes, corr_agents,
                 paper_tex=paper_tex, human_input=human_input, log_dir=log_dir,
-                previous_results=previous_corr,
             )
             results.append(corr_result_entry)
             if corr_result_entry.get("overall") == "APPROVE" and nl_cache:
