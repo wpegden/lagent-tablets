@@ -210,7 +210,78 @@ Node.js server at port 3300, nginx serves static files.
 
 ---
 
-## 13. File Structure
+## 13. Usage Examples
+
+### Setting up a new formalization
+```bash
+./scripts/setup_repo.sh /home/leanagent/math/my_paper_tablets /path/to/paper.tex
+```
+
+### Starting a run
+```bash
+# First run (starts from theorem_stating)
+./scripts/resume.sh configs/my_config.json --stop-at-phase-boundary
+
+# Check status
+./scripts/status.sh /home/leanagent/math/my_paper_tablets
+```
+
+### Pausing and resuming
+```bash
+# Graceful pause after current cycle
+./scripts/pause.sh /home/leanagent/math/my_paper_tablets
+
+# Resume from saved state
+./scripts/resume.sh configs/my_config.json --stop-at-phase-boundary
+```
+
+### Rewinding to a previous cycle
+```bash
+# Rewind to cycle 3, resume from verification stage
+./scripts/rewind.sh 3 verification /home/leanagent/math/my_paper_tablets
+./scripts/resume.sh configs/my_config.json --resume-from verification
+
+# Rewind to cycle 1, re-run everything (worker + verification + reviewer)
+./scripts/rewind.sh 1 worker /home/leanagent/math/my_paper_tablets
+./scripts/resume.sh configs/my_config.json
+```
+
+### Mid-cycle resume (skip stages)
+```bash
+# Skip worker, re-run verification + reviewer on current tablet
+./scripts/resume.sh configs/my_config.json --resume-from verification
+
+# Skip worker + verification, re-run reviewer with saved correspondence results
+./scripts/resume.sh configs/my_config.json --resume-from reviewer
+```
+
+### Emergency stop
+```bash
+./scripts/stop.sh /home/leanagent/math/my_paper_tablets
+```
+
+### Viewing the web dashboard
+The viewer runs in a tmux session:
+```bash
+tmux new-session -d -s viewer "REPO_PATH=/path/to/repo node viewer/server.js"
+```
+Then visit `http://your-server/lagent-tablets/` (or localhost:3300).
+
+### CLI direct usage
+```bash
+# Dry run (validate config)
+python3 -m lagent_tablets.cli --config configs/my_config.json --dry-run
+
+# Run N cycles then stop
+python3 -m lagent_tablets.cli --config configs/my_config.json --cycles 5
+
+# Rewind via CLI
+python3 -m lagent_tablets.cli --config configs/my_config.json --rewind-to-cycle 2
+```
+
+---
+
+## 14. File Structure
 
 ```
 lagent_tablets/
