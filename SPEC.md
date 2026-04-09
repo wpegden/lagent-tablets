@@ -35,10 +35,10 @@ Different agent configs per difficulty: `easy_worker` and `hard_worker` in confi
 ### Verification Pipeline
 Two stages, correspondence is a **gate** for soundness:
 
-1. **Correspondence + Paper Faithfulness** (multi-agent, parallel)
-   - Does each node's Lean statement capture its NL statement?
-   - Is each node a faithful intermediate step from the paper?
-   - Agents read files from disk (prompt lists nodes, doesn't inline content)
+1. **Correspondence + Paper Faithfulness** (multi-agent, parallel, one call per agent)
+   - Single prompt checks both: does Lean match NL? Is each node faithful to the paper?
+   - Single result file per agent with `correspondence` and `paper_faithfulness` sections
+   - Agents read .lean/.tex files from disk (prompt lists nodes, doesn't inline content)
    - If ANY agent rejects, soundness is skipped — reviewer gets rejection details
 
 2. **NL Proof Soundness** (per-node, multi-agent, parallel) — only if correspondence passes
