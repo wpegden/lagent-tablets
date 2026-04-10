@@ -68,7 +68,7 @@ If `A.lean` has `import Tablet.B`, then A depends on B. B's NL statement can be 
 
 ### Theorem-Stating Target Modes
 - **repair**: modeled on proof-formalization easy mode. Only `Tablet/{target}.tex` is writable. If broader changes are needed, the worker should return `STUCK` and explain the restructure needed.
-- **restructure**: explicitly authorized by the reviewer when paper-faithful DAG enrichment or dependency changes are needed for the same target. Broader edits are allowed, but only inside that target's prerequisite slice.
+- **restructure**: explicitly authorized by the reviewer when paper-faithful DAG enrichment or dependency changes are needed for the same target. Broader edits are allowed, but only inside that target-centered authorized impact region (the target, prerequisites, and downstream consumers).
 
 New or changed theorem-stating targets default back to `repair`.
 
@@ -201,9 +201,10 @@ Cycle N:
   3. Worker eliminates sorry from one node
   4. Validation (compilation, imports, declaration integrity)
   5. If easy mode: reject any edit outside the active `.lean` proof body; auto-elevate after 2 fails
-  6. NL verification on modified/new nodes
-  7. Reviewer evaluates, picks next node
-  8. Git commit
+  6. Hard mode is still node-centered by default; broader edits to nearby existing nodes require explicit reviewer authorization (`proof_edit_mode: restructure`) for that same active node
+  7. NL verification on modified/new nodes
+  8. Reviewer evaluates, picks next node
+  9. Git commit
 ```
 
 ### Mid-Cycle Resume

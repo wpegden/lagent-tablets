@@ -7,6 +7,7 @@ This module handles the file-level operations; Lean/Lake handles the graph logic
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -757,6 +758,8 @@ def mark_node_closed(tablet: TabletState, name: str, cycle: int) -> None:
     if node:
         node.status = "closed"
         node.closed_at_cycle = cycle
+        node.soundness_status = "pass"
+        node.verification_at_cycle = cycle
 
 
 def mark_node_open(tablet: TabletState, name: str, cycle: int) -> None:
@@ -766,6 +769,8 @@ def mark_node_open(tablet: TabletState, name: str, cycle: int) -> None:
         node.status = "open"
         node.invalidated_at_cycle = cycle
         node.closed_at_cycle = None
+        node.soundness_status = "?"
+        node.soundness_content_hash = ""
 
 
 # ---------------------------------------------------------------------------

@@ -18,6 +18,7 @@ from lagent_tablets.check import (
     check_theorem_target_repair_scope,
 )
 from lagent_tablets.cycle import (
+    _accumulate_verification_usage,
     _apply_verification_to_tablet,
     _backfill_legacy_correspondence_hashes,
     _changed_tablet_nodes_since_snapshot,
@@ -154,6 +155,62 @@ class TestTheoremStatingOpenRejections(unittest.TestCase):
 
         self.assertIn("Open correspondence blockers", error)
 
+    def test_correspondence_frontier_rechecks_persisted_failed_node(self):
+        repo = Path(tempfile.mkdtemp())
+        tablet_dir = repo / "Tablet"
+        tablet_dir.mkdir()
+        (tablet_dir / "foo.lean").write_text("-- [TABLET NODE: foo]\ntheorem foo : True := by\n  trivial\n", encoding="utf-8")
+        (tablet_dir / "foo.tex").write_text("\\begin{theorem}True\\end{theorem}\n", encoding="utf-8")
+        tablet = TabletState(nodes={
+            "foo": TabletNode(
+                name="foo",
+                kind="paper_intermediate",
+                status="open",
+                correspondence_status="fail",
+                correspondence_text_hash="stale",
+                correspondence_content_hash="stale",
+            )
+        })
+
+        frontier = _theorem_stating_correspondence_frontier(tablet, repo)
+
+        self.assertEqual(frontier, ["foo"])
+
+    def test_run_nl_verification_keeps_soundness_gated_when_persisted_correspondence_blocked(self):
+        repo = Path(tempfile.mkdtemp())
+        tablet_dir = repo / "Tablet"
+        tablet_dir.mkdir()
+        (tablet_dir / "foo.lean").write_text("-- [TABLET NODE: foo]\ntheorem foo : True := by\n  trivial\n", encoding="utf-8")
+        (tablet_dir / "foo.tex").write_text("\\begin{theorem}True\\end{theorem}\n", encoding="utf-8")
+        config = SimpleNamespace(
+            repo_path=repo,
+            verification=SimpleNamespace(provider="claude", model="", extra_args=[]),
+            workflow=SimpleNamespace(paper_tex_path=None),
+            state_dir=repo / ".agent-supervisor",
+            tmux=SimpleNamespace(session_name="t", burst_user="u"),
+        )
+        policy = Policy()
+        tablet = TabletState(nodes={
+            "foo": TabletNode(name="foo", kind="paper_intermediate", status="open"),
+        })
+
+        results = _run_nl_verification(
+            config,
+            policy,
+            tablet,
+            ["foo"],
+            state=SupervisorState(cycle=1, phase="theorem_stating"),
+            cycle=1,
+            log_dir=repo,
+            correspondence_node_names=[],
+            soundness_node_names=["foo"],
+            persisted_correspondence_blocked=True,
+        )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["check"], "correspondence")
+        self.assertEqual(results[0]["overall"], "REJECT")
+
     def test_reconcile_prefers_reviewer_reason_and_drops_stale_entries(self):
         nl_verification = [{
             "check": "correspondence",
@@ -269,6 +326,26 @@ class TestTheoremStatingOpenRejections(unittest.TestCase):
                 },
             ],
         )
+
+    def test_accumulate_verification_usage_counts_nested_soundness_agents(self):
+        state = SupervisorState()
+        _accumulate_verification_usage(state, [
+            {
+                "check": "nl_proof",
+                "node_verdicts": [
+                    {
+                        "node": "foo",
+                        "agent_results": [
+                            {"agent": "A", "_usage": {"provider": "codex", "model": "m", "input_tokens": 10, "output_tokens": 2}},
+                            {"agent": "B", "_usage": {"provider": "gemini", "model": "g", "input_tokens": 5, "output_tokens": 1}},
+                        ],
+                    }
+                ],
+            }
+        ])
+
+        self.assertEqual(state.agent_token_usage["nl_proof"]["calls"], 2)
+        self.assertEqual(state.agent_token_usage["nl_proof"]["input_tokens"], 15)
 
 
 class TestTheoremStatingOrphanCandidates(unittest.TestCase):

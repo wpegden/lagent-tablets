@@ -161,6 +161,7 @@ class TestSupervisorState(unittest.TestCase):
         self.assertEqual(state.cycle, 0)
         self.assertEqual(state.phase, "paper_check")
         self.assertEqual(state.active_node, "")
+        self.assertEqual(state.proof_target_edit_mode, "local")
         self.assertEqual(state.theorem_soundness_target, "")
         self.assertEqual(state.theorem_target_edit_mode, "repair")
         self.assertFalse(state.theorem_correspondence_blocked)
@@ -172,6 +173,7 @@ class TestSupervisorState(unittest.TestCase):
             cycle=42,
             phase="proof_formalization",
             active_node="uniqueness_thm",
+            proof_target_edit_mode="restructure",
             theorem_soundness_target="paper_main",
             theorem_target_edit_mode="restructure",
             theorem_correspondence_blocked=True,
@@ -185,6 +187,7 @@ class TestSupervisorState(unittest.TestCase):
         self.assertEqual(restored.cycle, 42)
         self.assertEqual(restored.phase, "proof_formalization")
         self.assertEqual(restored.active_node, "uniqueness_thm")
+        self.assertEqual(restored.proof_target_edit_mode, "restructure")
         self.assertEqual(restored.theorem_soundness_target, "paper_main")
         self.assertEqual(restored.theorem_target_edit_mode, "restructure")
         self.assertTrue(restored.theorem_correspondence_blocked)

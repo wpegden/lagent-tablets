@@ -25,6 +25,8 @@ You must NOT:
 - Use `sorry` in definitions -- only in theorem/lemma proof bodies
 - Use `import Mathlib` -- only specific submodule imports (e.g., `import Mathlib.Analysis.SpecialFunctions.Log.Basic`)
 
+Hard mode is still node-centered. If you conclude that this node needs edits to other existing nodes, stop and return `status: STUCK` with a concrete broader-restructure request; only the reviewer can authorize that wider scope.
+
 MANDATORY BEFORE SUBMITTING: Run the self-check and fix any errors:
   {proof_scope_check_command}
   {proof_worker_delta_check_command}

@@ -392,6 +392,7 @@ class SupervisorState:
     cycle: int = 0
     phase: str = "paper_check"
     active_node: str = ""
+    proof_target_edit_mode: str = "local"
     theorem_soundness_target: str = ""
     theorem_target_edit_mode: str = "repair"
     theorem_correspondence_blocked: bool = False
@@ -414,6 +415,7 @@ class SupervisorState:
             "cycle": self.cycle,
             "phase": self.phase,
             "active_node": self.active_node,
+            "proof_target_edit_mode": self.proof_target_edit_mode,
             "theorem_soundness_target": self.theorem_soundness_target,
             "theorem_target_edit_mode": self.theorem_target_edit_mode,
             "theorem_correspondence_blocked": self.theorem_correspondence_blocked,
@@ -440,10 +442,14 @@ class SupervisorState:
         theorem_target_edit_mode = str(raw.get("theorem_target_edit_mode", "repair") or "repair")
         if theorem_target_edit_mode not in {"repair", "restructure"}:
             theorem_target_edit_mode = "repair"
+        proof_target_edit_mode = str(raw.get("proof_target_edit_mode", "local") or "local")
+        if proof_target_edit_mode not in {"local", "restructure"}:
+            proof_target_edit_mode = "local"
         return cls(
             cycle=int(raw.get("cycle", 0)),
             phase=str(raw.get("phase", "paper_check")),
             active_node=str(raw.get("active_node", "")),
+            proof_target_edit_mode=proof_target_edit_mode,
             theorem_soundness_target=str(raw.get("theorem_soundness_target", "")),
             theorem_target_edit_mode=theorem_target_edit_mode,
             theorem_correspondence_blocked=bool(raw.get("theorem_correspondence_blocked", False)),

@@ -220,6 +220,35 @@ class TestWorkerPrompt(unittest.TestCase):
         self.assertIn("Do NOT edit `Tablet/main_thm.tex`", prompt)
         self.assertNotIn("Update `Tablet/main_thm.tex`", prompt)
 
+    def test_hard_restructure_worker_prompt_authorizes_region(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        helper_lean = generate_node_lean("helper", "theorem helper : True", ["Tablet.Preamble"])
+        (repo / "Tablet" / "helper.lean").write_text(helper_lean)
+        (repo / "Tablet" / "helper.tex").write_text(
+            "\\begin{lemma}\nTrue.\n\\end{lemma}\n\\begin{proof}\nTrivial.\n\\end{proof}\n"
+        )
+        main_lean = (repo / "Tablet" / "main_thm.lean").read_text(encoding="utf-8") + "\nimport Tablet.helper\n"
+        (repo / "Tablet" / "main_thm.lean").write_text(main_lean)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "helper": TabletNode(name="helper", kind="helper_lemma", status="open"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open"),
+        }, active_node="main_thm")
+        state = SupervisorState(
+            cycle=1,
+            phase="proof_formalization",
+            active_node="main_thm",
+            proof_target_edit_mode="restructure",
+        )
+
+        prompt = build_worker_prompt(config, state, tablet, Policy(), difficulty="hard")
+        self.assertIn("reviewer-authorized restructure", prompt)
+        self.assertIn("AUTHORIZED IMPACT REGION", prompt)
+        self.assertIn("helper", prompt)
+        self.assertIn("Edit other existing node files only when those nodes are inside the authorized impact region", prompt)
+
     def test_includes_targeted_paper_excerpt_from_review(self):
         repo = Path(tempfile.mkdtemp())
         _setup_repo(repo)
@@ -323,6 +352,7 @@ class TestReviewerPrompt(unittest.TestCase):
 
         prompt = build_reviewer_prompt(config, state, tablet, Policy())
         self.assertIn("\"paper_focus_ranges\"", prompt)
+        self.assertIn("\"proof_edit_mode\"", prompt)
 
     def test_cleanup_reviewer_prompt_uses_cleanup_template(self):
         repo = Path(tempfile.mkdtemp())

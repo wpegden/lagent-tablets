@@ -26,7 +26,7 @@ A DAG of **nodes**, each a `.lean` + `.tex` pair in `Tablet/`. Children of node 
 ### Node Difficulty: Easy vs Hard
 Each node is classified as **easy** or **hard**:
 - **Easy**: prove using only existing children. Only the active `.lean` proof body may change. No `.tex` edits, import changes, or new files. Filesystem-enforced (Tablet/ dir read-only, active `.tex` read-only, Preamble read-only).
-- **Hard**: full flexibility — can create helper nodes, add imports, refactor.
+- **Hard**: node-centered refactoring — can create helper nodes, add imports, and refactor around the active node. Broader edits to nearby existing nodes require explicit reviewer authorization for that same active node.
 
 Classification is proposed by the theorem_stating worker and finalized by the reviewer. After `easy_max_retries` (default 2) failed easy attempts, auto-elevates to hard.
 
@@ -53,7 +53,7 @@ Two stages, correspondence is a **gate** for soundness:
 ### Theorem-Stating Target Edit Modes
 When theorem_stating is holding on a current soundness target, the supervisor tracks a target edit mode:
 - **repair**: default. Modeled on proof-formalization easy mode. Only `Tablet/{target}.tex` is writable, and any broader change must be escalated as restructure.
-- **restructure**: explicitly authorized by the reviewer when the current target needs paper-faithful DAG enrichment, dependency changes, or statement changes.
+- **restructure**: explicitly authorized by the reviewer when the current target needs paper-faithful DAG enrichment, dependency changes, or statement changes. Broader edits are allowed only inside that target-centered authorized impact region.
 
 Newly selected targets reset to `repair`.
 
@@ -77,7 +77,7 @@ Status stored on each `TabletNode` in tablet.json:
 | Phase | Purpose |
 |-------|---------|
 | `theorem_stating` | Build and refine the tablet DAG. Run correspondence on changed nodes and NL-proof soundness on one current target node at a time until every target is accepted. |
-| `proof_formalization` | Eliminate sorry from nodes. Easy nodes are locked to one active `.lean` proof body; hard nodes get broader refactoring freedom. |
+| `proof_formalization` | Eliminate sorry from nodes. Easy nodes are locked to one active `.lean` proof body; hard nodes allow node-centered refactoring plus new helpers, and broader existing-node edits only under reviewer-authorized `proof_edit_mode: restructure`. |
 | `proof_complete_style_cleanup` | Final cleanup after all nodes closed. |
 
 Phase transitions require human approval via the web viewer (ADVANCE_PHASE → awaiting_human_input).

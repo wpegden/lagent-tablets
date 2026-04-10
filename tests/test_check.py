@@ -8,7 +8,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from lagent_tablets.check import (
+    check_proof_hard_scope,
+    check_proof_worker_delta,
     check_node,
+    check_tablet,
     check_tablet_scoped,
     run_print_axioms,
     validate_correspondence_result_data,
@@ -157,8 +160,6 @@ class TestAxiomAudit(unittest.TestCase):
         self.assertTrue(any("disguised definitions" in warn for warn in result["warnings"]))
 
     def test_check_tablet_validates_preamble_tex_with_definitions(self):
-        from lagent_tablets.check import check_tablet
-
         repo = Path(tempfile.mkdtemp())
         tablet = repo / "Tablet"
         tablet.mkdir()
@@ -179,6 +180,70 @@ class TestAxiomAudit(unittest.TestCase):
                 allowed_prefixes=["Mathlib"],
                 forbidden_keywords=["sorry", "axiom"],
             )
+
+        self.assertTrue(result["ok"])
+
+    def test_check_tablet_rejects_tex_without_matching_lean(self):
+        repo = Path(tempfile.mkdtemp())
+        tablet = repo / "Tablet"
+        tablet.mkdir()
+        (tablet / "Preamble.lean").write_text("import Mathlib.Topology.Basic\n", encoding="utf-8")
+        (tablet / "orphan.tex").write_text("\\begin{lemma}True\\end{lemma}\n", encoding="utf-8")
+
+        with patch("lagent_tablets.check.run_lake_build_tablet", return_value={"ok": True, "output": "", "returncode": 0}):
+            result = check_tablet(
+                repo,
+                allowed_prefixes=["Mathlib"],
+                forbidden_keywords=["sorry", "axiom"],
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("every .tex node needs a matching .lean file" in err for err in result["errors"]))
+
+    def test_check_proof_worker_delta_rejects_stray_tex_without_lean(self):
+        repo = Path(tempfile.mkdtemp())
+        tablet = repo / "Tablet"
+        tablet.mkdir()
+        (tablet / "main_thm.lean").write_text("-- [TABLET NODE: main_thm]\ntheorem main_thm : True := by\n  sorry\n", encoding="utf-8")
+        (tablet / "main_thm.tex").write_text("\\begin{theorem}True\\end{theorem}\n", encoding="utf-8")
+        before = {"main_thm.lean": "a", "main_thm.tex": "b"}
+        (tablet / "helper.tex").write_text("\\begin{lemma}True\\end{lemma}\n", encoding="utf-8")
+
+        result = check_proof_worker_delta(
+            repo,
+            active_node="main_thm",
+            snapshot_before=before,
+            existing_nodes=["main_thm"],
+            allowed_prefixes=["Mathlib"],
+            forbidden_keywords=["sorry", "axiom"],
+        )
+
+        self.assertEqual(result["outcome"], "INVALID")
+        self.assertIn("Unpaired .tex files", result["errors"][0])
+
+    def test_check_proof_hard_scope_allows_authorized_existing_node_in_restructure_mode(self):
+        repo = Path(tempfile.mkdtemp())
+        tablet = repo / "Tablet"
+        tablet.mkdir()
+        (tablet / "main_thm.lean").write_text("-- [TABLET NODE: main_thm]\ntheorem main_thm : True := by\n  sorry\n", encoding="utf-8")
+        (tablet / "main_thm.tex").write_text("\\begin{theorem}True\\end{theorem}\n", encoding="utf-8")
+        (tablet / "helper.lean").write_text("-- [TABLET NODE: helper]\ntheorem helper : True := by\n  sorry\n", encoding="utf-8")
+        (tablet / "helper.tex").write_text("\\begin{lemma}True\\end{lemma}\n", encoding="utf-8")
+        before = {
+            "main_thm.lean": "a",
+            "main_thm.tex": "b",
+            "helper.lean": "c",
+            "helper.tex": "d",
+        }
+        (tablet / "helper.lean").write_text("-- [TABLET NODE: helper]\ntheorem helper : True := by\n  trivial\n", encoding="utf-8")
+
+        result = check_proof_hard_scope(
+            repo,
+            active_node="main_thm",
+            snapshot_before=before,
+            proof_edit_mode="restructure",
+            authorized_nodes=["main_thm", "helper"],
+        )
 
         self.assertTrue(result["ok"])
 
@@ -268,6 +333,20 @@ class TestArtifactValidation(unittest.TestCase):
         }, phase="theorem_stating")
         self.assertFalse(result["ok"])
         self.assertTrue(any("target_edit_mode must be one of" in err for err in result["errors"]))
+
+    def test_validates_proof_reviewer_decision_with_proof_edit_mode(self):
+        result = validate_reviewer_decision_data({
+            "decision": "CONTINUE",
+            "reason": "Need a broader local refactor.",
+            "next_prompt": "Keep the same node and widen scope.",
+            "next_active_node": "main_thm",
+            "paper_focus_ranges": [],
+            "difficulty_assignments": {},
+            "elevate_to_hard": [],
+            "proof_edit_mode": "restructure",
+        }, phase="proof_formalization")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"]["proof_edit_mode"], "restructure")
 
     def test_validates_cleanup_reviewer_decision(self):
         result = validate_reviewer_decision_data({

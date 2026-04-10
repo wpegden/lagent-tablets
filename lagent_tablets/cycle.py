@@ -141,6 +141,30 @@ def _accumulate_usage(state: SupervisorState, role: str, usage: Optional[Dict[st
     mbucket["calls"] += 1
 
 
+def _accumulate_verification_usage(state: SupervisorState, verification_results: Sequence[Dict[str, Any]]) -> None:
+    """Accumulate nested verification usage across correspondence and soundness shapes."""
+    def _walk(result: Any, *, default_role: Optional[str] = None) -> None:
+        if not isinstance(result, dict):
+            return
+        role = default_role
+        check_name = str(result.get("check", "") or "").strip()
+        if check_name == "correspondence":
+            role = "correspondence"
+        elif check_name == "nl_proof":
+            role = "nl_proof"
+        usage = result.pop("_usage", None)
+        if usage:
+            if role:
+                _accumulate_usage(state, role, usage)
+        for agent_result in result.get("agent_results", []) or []:
+            _walk(agent_result, default_role=role)
+        for verdict in result.get("node_verdicts", []) or []:
+            _walk(verdict, default_role=role)
+
+    for result in verification_results:
+        _walk(result)
+
+
 # ---------------------------------------------------------------------------
 # Cycle outcome
 # ---------------------------------------------------------------------------
@@ -359,7 +383,31 @@ def _theorem_stating_open_blockers(state: SupervisorState) -> List[Dict[str, str
 
 
 def _theorem_stating_has_correspondence_blockers(state: SupervisorState) -> bool:
-    return any(entry.get("phase") == "correspondence" for entry in _theorem_stating_open_blockers(state))
+    return any(
+        entry.get("phase") in {"correspondence", "paper_faithfulness"}
+        for entry in _theorem_stating_open_blockers(state)
+    )
+
+
+def _theorem_stating_persisted_correspondence_nodes(
+    tablet: TabletState,
+    state: SupervisorState,
+) -> List[str]:
+    """Return node-specific persisted correspondence blockers that must be rechecked."""
+    nodes: Set[str] = {
+        name
+        for name, node in tablet.nodes.items()
+        if name != PREAMBLE_NAME and node.kind != "preamble" and node.correspondence_status == "fail"
+    }
+    for entry in _theorem_stating_open_blockers(state):
+        if entry.get("phase") not in {"correspondence", "paper_faithfulness"}:
+            continue
+        node_name = str(entry.get("node", "")).strip()
+        if not node_name or node_name == "(global)":
+            continue
+        if node_name in tablet.nodes and tablet.nodes[node_name].kind != "preamble":
+            nodes.add(node_name)
+    return sorted(nodes)
 
 
 def _has_stale_theorem_stating_phase_carryover(state: SupervisorState) -> bool:
@@ -840,239 +888,6 @@ def _setup_theorem_stating_permissions(
             pass
 
 
-# ---------------------------------------------------------------------------
-# Post-burst validation
-# ---------------------------------------------------------------------------
-
-def validate_worker_cycle(
-    config: Config,
-    tablet: TabletState,
-    active_node: str,
-    snapshot_before: Dict[str, str],
-    snapshot_after: Dict[str, str],
-) -> CycleOutcome:
-    """Run all deterministic checks after a worker burst.
-
-    Returns a CycleOutcome. PROGRESS/NO_PROGRESS/INVALID.
-    Does NOT invoke the verification model (that's separate).
-    """
-    changes = _detect_changes(snapshot_before, snapshot_after)
-    repo = config.repo_path
-    allowed_prefixes = config.workflow.allowed_import_prefixes
-    forbidden = [kw for kw in FORBIDDEN_KEYWORDS_DEFAULT if kw not in config.workflow.forbidden_keyword_allowlist]
-
-    # Detect created .lean files (potential new nodes)
-    new_lean_names = [
-        fname.removesuffix(".lean")
-        for fname in changes["created"]
-        if fname.endswith(".lean")
-    ]
-
-    # Detect if active node changed
-    active_lean = f"{active_node}.lean"
-    active_tex = f"{active_node}.tex"
-    active_changed = active_lean in changes["modified"]
-
-    # Check: no deletions allowed
-    if changes["deleted"]:
-        return CycleOutcome(
-            outcome="INVALID",
-            detail=f"Files were deleted (not allowed): {changes['deleted']}",
-        )
-
-    # Check: only allowed files modified
-    # Supervisor-generated files are excluded from the check
-    supervisor_generated = {"INDEX.md", "README.md", "header.tex", "Tablet.lean"}
-    allowed_modified = {active_lean, active_tex, "Preamble.lean"} | supervisor_generated
-    unexpected_modified = [f for f in changes["modified"] if f not in allowed_modified]
-    if unexpected_modified:
-        return CycleOutcome(
-            outcome="INVALID",
-            detail=f"Unexpected files modified: {unexpected_modified}. Only {active_node} and Preamble may be modified.",
-        )
-
-    # No changes at all?
-    if not changes["created"] and not changes["modified"]:
-        return CycleOutcome(outcome="NO_PROGRESS", detail="No files were changed.")
-
-    # Validate Preamble changes
-    if "Preamble.lean" in changes["modified"]:
-        old_preamble = (repo / "Tablet" / "Preamble.lean").read_text(encoding="utf-8")
-        # We need the old content -- reconstruct from the fact that the hash changed
-        # Actually we can't reconstruct old content from hash. We need to check the current file.
-        # The preamble_diff validation compares structurally, so we read current and check format.
-        preamble_errors = validate_preamble_diff(
-            # We don't have the old content from just hashes.
-            # In practice, we'd save the old content before the burst.
-            # For now, just validate the current preamble's import patterns.
-            "", (repo / "Tablet" / "Preamble.lean").read_text(encoding="utf-8"),
-            allowed_prefixes,
-        )
-        # This is a simplification -- full implementation should save old content.
-        # For now just validate current imports are all legal.
-        current_preamble = (repo / "Tablet" / "Preamble.lean").read_text(encoding="utf-8")
-        import_violations = validate_imports(current_preamble, allowed_prefixes)
-        if import_violations:
-            return CycleOutcome(
-                outcome="INVALID",
-                detail=f"Preamble has unauthorized imports: {import_violations}",
-            )
-
-    # Validate active node
-    if active_changed:
-        active_path = node_lean_path(repo, active_node)
-        content = active_path.read_text(encoding="utf-8")
-
-        # Declaration signature intact?
-        stored_hash = tablet.nodes.get(active_node, TabletState()).lean_statement_hash if active_node in tablet.nodes else ""
-        if stored_hash:
-            actual_hash = declaration_hash(content, node_name=active_node)
-            if actual_hash != stored_hash:
-                return CycleOutcome(
-                    outcome="INVALID",
-                    detail=f"Declaration signature of {active_node} was modified. This is not allowed.",
-                )
-
-        # Imports valid?
-        import_violations = validate_imports(content, allowed_prefixes)
-        if import_violations:
-            return CycleOutcome(
-                outcome="INVALID",
-                detail=f"Unauthorized imports in {active_node}: {import_violations}",
-            )
-
-        # Forbidden keywords?
-        hits = scan_forbidden_keywords(content, forbidden)
-        non_sorry_hits = [h for h in hits if h["keyword"] != "sorry"]
-        if non_sorry_hits:
-            return CycleOutcome(
-                outcome="INVALID",
-                detail=f"Forbidden keywords in {active_node}: {[h['keyword'] for h in non_sorry_hits]}",
-            )
-
-        # Compile check
-        result = run_check_node(
-            repo, active_node,
-            allowed_prefixes=allowed_prefixes,
-            forbidden_keywords=forbidden,
-            expected_declaration_hash=stored_hash,
-            approved_axioms_path=config.workflow.approved_axioms_path,
-            timeout_seconds=config.burst_timeout_seconds,
-        )
-        if not result.compiles:
-            # Check if the failure is just Lake package noise
-            if is_lake_package_error(result.build_output):
-                pass  # Ignore Lake package errors -- the code itself is fine
-            else:
-                return CycleOutcome(
-                    outcome="INVALID",
-                    detail=f"Compilation failed for {active_node}",
-                    build_output=result.build_output,
-                )
-
-    # Validate new nodes
-    new_node_names = []
-    for lean_name in new_lean_names:
-        name = lean_name  # filename without .lean
-        if name == PREAMBLE_NAME or name == "Axioms":
-            continue
-
-        # Check name validity
-        if not is_valid_node_name(name):
-            _cleanup_new_files(repo, lean_name)
-            return CycleOutcome(outcome="INVALID", detail=f"Invalid node name: {name!r}")
-
-        # Check for conflicts
-        conflicts = find_name_conflicts(tablet, [name])
-        if conflicts:
-            _cleanup_new_files(repo, lean_name)
-            return CycleOutcome(outcome="INVALID", detail=f"Node name already exists: {name!r}")
-
-        # Check .tex exists
-        tex_path = node_tex_path(repo, name)
-        if not tex_path.exists():
-            _cleanup_new_files(repo, lean_name)
-            return CycleOutcome(outcome="INVALID", detail=f"New node {name} has .lean but no .tex file")
-
-        # Check marker
-        lean_path = node_lean_path(repo, name)
-        lean_content = lean_path.read_text(encoding="utf-8")
-        marker = extract_marker_name(lean_content)
-        if marker != name:
-            _cleanup_new_files(repo, lean_name)
-            return CycleOutcome(outcome="INVALID", detail=f"New node {name}: marker says {marker!r}, expected {name!r}")
-
-        # Check declaration name matches
-        decl_name = extract_declaration_name(lean_content)
-        if decl_name != name:
-            _cleanup_new_files(repo, lean_name)
-            return CycleOutcome(outcome="INVALID", detail=f"New node {name}: declaration name is {decl_name!r}, expected {name!r}")
-
-        # Check .tex format
-        tex_content = tex_path.read_text(encoding="utf-8")
-        tex_errors = validate_tex_format(tex_content)
-        if tex_errors:
-            _cleanup_new_files(repo, lean_name)
-            return CycleOutcome(outcome="INVALID", detail=f"New node {name} .tex format errors: {tex_errors}")
-
-        # Check imports
-        import_violations = validate_imports(lean_content, allowed_prefixes)
-        if import_violations:
-            _cleanup_new_files(repo, lean_name)
-            return CycleOutcome(outcome="INVALID", detail=f"New node {name} has unauthorized imports: {import_violations}")
-
-        # Compile check
-        result = run_check_node(
-            repo, name,
-            allowed_prefixes=allowed_prefixes,
-            forbidden_keywords=forbidden,
-            approved_axioms_path=config.workflow.approved_axioms_path,
-            timeout_seconds=config.burst_timeout_seconds,
-        )
-        if not result.compiles:
-            if not is_lake_package_error(result.build_output):
-                _cleanup_new_files(repo, lean_name)
-                return CycleOutcome(
-                    outcome="INVALID",
-                    detail=f"New node {name} does not compile",
-                    build_output=result.build_output,
-                )
-
-        new_node_names.append(name)
-
-    # Determine what progress was made
-    nodes_closed = []
-    if active_changed:
-        active_path = node_lean_path(repo, active_node)
-        if not has_sorry(active_path.read_text(encoding="utf-8")):
-            nodes_closed.append(active_node)
-
-    # Also check if any new nodes were closed in the same cycle
-    for name in new_node_names:
-        lean_content = node_lean_path(repo, name).read_text(encoding="utf-8")
-        if not has_sorry(lean_content):
-            nodes_closed.append(name)
-
-    if not nodes_closed and not new_node_names and not active_changed:
-        return CycleOutcome(outcome="NO_PROGRESS", detail="No meaningful changes detected.")
-
-    # Build the detail message
-    parts = []
-    if nodes_closed:
-        parts.append(f"closed: {nodes_closed}")
-    if new_node_names:
-        parts.append(f"created: {new_node_names}")
-    if active_changed and active_node not in nodes_closed:
-        parts.append(f"{active_node} modified (still open)")
-
-    return CycleOutcome(
-        outcome="PROGRESS",
-        detail="; ".join(parts),
-        nodes_closed=nodes_closed,
-        nodes_created=new_node_names,
-    )
-
-
 def _theorem_stating_node_kind(
     name: str,
     kind_hints: Dict[str, str],
@@ -1096,6 +911,8 @@ def validate_worker_cycle_v2(
     snapshot_before: Dict[str, str],
     active_changed: bool,
     new_lean_files: List[str],
+    proof_edit_mode: str = "local",
+    authorized_nodes: Optional[Sequence[str]] = None,
 ) -> CycleOutcome:
     """Compatibility wrapper over the canonical proof-worker delta check."""
     repo = config.repo_path
@@ -1107,6 +924,8 @@ def validate_worker_cycle_v2(
         snapshot_before=snapshot_before,
         existing_nodes=existing_nodes,
         expected_active_hash=tablet.nodes[active_node].lean_statement_hash if active_node in tablet.nodes else "",
+        proof_edit_mode=proof_edit_mode,
+        authorized_nodes=list(authorized_nodes or []),
         allowed_prefixes=config.workflow.allowed_import_prefixes,
         forbidden_keywords=forbidden,
         approved_axioms_path=config.workflow.approved_axioms_path,
@@ -1149,18 +968,6 @@ def _count_consecutive_invalids(state: SupervisorState) -> int:
     if not isinstance(summary, dict):
         return 0
     return int(summary.get("consecutive_invalids", 0))
-
-
-def _cleanup_new_files(repo: Path, lean_name: str) -> None:
-    """Remove a new node's files on validation failure."""
-    tdir = repo / "Tablet"
-    for suffix in (".lean", ".tex"):
-        path = tdir / f"{lean_name}{suffix}" if not lean_name.endswith(".lean") else tdir / lean_name.replace(".lean", suffix)
-        if path.exists():
-            try:
-                path.unlink()
-            except OSError:
-                pass
 
 
 # ---------------------------------------------------------------------------
@@ -2095,12 +1902,21 @@ def _repair_stale_legacy_correspondence_failures(
     return changed
 
 
-def _theorem_stating_correspondence_frontier(tablet: TabletState, repo_path: Path) -> List[str]:
+def _theorem_stating_correspondence_frontier(
+    tablet: TabletState,
+    repo_path: Path,
+    *,
+    forced_nodes: Optional[Sequence[str]] = None,
+) -> List[str]:
     """Return theorem-stating nodes whose statement-level correspondence changed."""
     frontier: List[str] = []
+    forced = {str(name) for name in (forced_nodes or []) if str(name).strip()}
     semantic_candidates: List[str] = []
     for name, node in tablet.nodes.items():
         if name == "Preamble" or node.kind == "preamble":
+            continue
+        if name in forced or node.correspondence_status == "fail":
+            frontier.append(name)
             continue
         current_text_hash = _correspondence_text_hash(repo_path, name)
         saved_text_hash = node.correspondence_text_hash
@@ -2136,7 +1952,8 @@ def _theorem_stating_correspondence_frontier(tablet: TabletState, repo_path: Pat
             node.verification_content_hash = node.soundness_content_hash or current_corr_hash
             continue
         frontier.append(name)
-    return sorted(frontier)
+    frontier.extend(name for name in forced if name in tablet.nodes and name != PREAMBLE_NAME)
+    return sorted(dict.fromkeys(frontier))
 
 
 def _tablet_node_file_hash(repo_path: Path, name: str) -> str:
@@ -2372,12 +2189,16 @@ def _write_proof_scope_payload(
     existing_nodes: Sequence[str],
     expected_active_hash: str = "",
     imports_before: Optional[Sequence[str]] = None,
+    proof_edit_mode: str = "local",
+    authorized_nodes: Optional[Sequence[str]] = None,
 ) -> Path:
     payload = {
         "active_node": active_node,
         "snapshot_before": snapshot_before,
         "existing_nodes": list(existing_nodes),
         "expected_active_hash": expected_active_hash,
+        "proof_edit_mode": proof_edit_mode,
+        "authorized_nodes": list(authorized_nodes or []),
     }
     if imports_before is not None:
         payload["imports_before"] = list(imports_before)
@@ -2752,6 +2573,8 @@ def _run_nl_verification(
     human_input: str = "",
     soundness_target_node: Optional[str] = None,
     soundness_node_names: Optional[List[str]] = None,
+    persisted_correspondence_blocked: bool = False,
+    force_correspondence_node_names: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Run correspondence and NL proof verification on the given nodes.
 
@@ -2785,8 +2608,10 @@ def _run_nl_verification(
     # 1. Correspondence check (possibly multi-agent)
     corr_nodes = corr_nodes_base
     cached_corr_nodes: List[str] = []
+    forced_corr_nodes = {str(name) for name in (force_correspondence_node_names or []) if str(name).strip()}
     if nl_cache:
-        corr_nodes = nl_cache.filter_uncached(repo, corr_nodes_base, "correspondence")
+        uncached_corr_nodes = set(nl_cache.filter_uncached(repo, corr_nodes_base, "correspondence"))
+        corr_nodes = [name for name in corr_nodes_base if name in uncached_corr_nodes or name in forced_corr_nodes]
         cached_corr_nodes = [name for name in corr_nodes_base if name not in set(corr_nodes)]
     if corr_nodes:
         _save_live_viewer_state(
@@ -2867,9 +2692,22 @@ def _run_nl_verification(
 
     # 2. NL proof soundness check — only if correspondence passed (it's a gate)
     corr_overall = "APPROVE"
+    saw_corr_result = False
     for r in results:
         if r.get("check") == "correspondence":
+            saw_corr_result = True
             corr_overall = r.get("overall", "?")
+    if persisted_correspondence_blocked and not saw_corr_result:
+        corr_overall = "REJECT"
+        results.append({
+            "check": "correspondence",
+            "overall": "REJECT",
+            "summary": (
+                "Persisted correspondence/paper-faithfulness blockers remain open from a previous cycle; "
+                "soundness stays gated until they are explicitly rechecked and cleared."
+            ),
+            "node_names": [],
+        })
     if corr_overall != "APPROVE":
         print(f"  Skipping NL proof soundness (correspondence {corr_overall} — must pass first)")
         return results
@@ -3090,6 +2928,8 @@ def run_theorem_stating_cycle(
 
         if worker_result.transcript_path:
             print(f"  Transcript saved: {worker_result.transcript_path}")
+
+        _accumulate_usage(state, "worker", worker_result.usage)
 
         if not worker_result.ok:
             print(f"  Worker burst failed: {worker_result.error}")
@@ -3336,7 +3176,13 @@ def run_theorem_stating_cycle(
         if repaired_hashes or repaired_failures:
             save_tablet(tablet_path(config), tablet)
         all_check_nodes = [n for n in tablet.nodes if tablet.nodes[n].kind != "preamble"]
-        corr_check_nodes = _theorem_stating_correspondence_frontier(tablet, repo)
+        forced_corr_nodes = _theorem_stating_persisted_correspondence_nodes(tablet, state)
+        corr_check_nodes = _theorem_stating_correspondence_frontier(
+            tablet,
+            repo,
+            forced_nodes=forced_corr_nodes,
+        )
+        persisted_corr_blocked = _theorem_stating_has_correspondence_blockers(state)
         print(f"  Running NL verification for {len(all_check_nodes)} nodes...")
         if state.theorem_soundness_target:
             print(f"  Current theorem-stating soundness target: {state.theorem_soundness_target}")
@@ -3346,6 +3192,8 @@ def run_theorem_stating_cycle(
             config, policy, tablet, all_check_nodes, state=verification_state, cycle=cycle, correspondence_node_names=corr_check_nodes, log_dir=log_dir, nl_cache=nl_cache,
             human_input=state.human_input,
             soundness_target_node=state.theorem_soundness_target or None,
+            persisted_correspondence_blocked=persisted_corr_blocked,
+            force_correspondence_node_names=forced_corr_nodes,
         )
         save_json(verification_checkpoint, nl_verification_results)
         # Save checkpoint: verification done
@@ -3382,6 +3230,7 @@ def run_theorem_stating_cycle(
 
     # Apply verification results to per-node tablet status
     if nl_verification_results:
+        _accumulate_verification_usage(state, nl_verification_results)
         _apply_verification_to_tablet(tablet, nl_verification_results, cycle, repo_path=repo)
         save_tablet(tablet_path(config), tablet)
         _save_live_viewer_state(config, tablet, state, source="verification")
@@ -3437,6 +3286,8 @@ def run_theorem_stating_cycle(
         done_file=reviewer_artifacts["done"],
         artifact_prefix=str(reviewer_artifacts["stem"]),
     )
+
+    _accumulate_usage(state, "reviewer", reviewer_result.usage)
 
     decision = None
     decision_error = None
@@ -3666,6 +3517,7 @@ def preview_next_cycle(
             "state": {
                 "active_node": active_node,
                 "difficulty": node_difficulty,
+                "proof_target_edit_mode": getattr(preview_state, "proof_target_edit_mode", "local"),
             },
             "worker_prompt": prompt,
         }
@@ -3700,6 +3552,10 @@ def run_cycle(
     node_meta = tablet.nodes.get(active_node)
     node_difficulty = node_meta.difficulty if node_meta else "hard"
     easy_mode = node_difficulty == "easy"
+    if easy_mode and getattr(state, "proof_target_edit_mode", "local") == "restructure":
+        state.proof_target_edit_mode = "local"
+    proof_restructure_mode = (not easy_mode) and str(getattr(state, "proof_target_edit_mode", "local") or "local").strip().lower() == "restructure"
+    proof_authorized_nodes = sorted(compute_target_impact_region(repo, active_node)) if proof_restructure_mode else []
 
     # Select worker config based on difficulty
     if easy_mode and config.easy_worker:
@@ -3752,6 +3608,8 @@ def run_cycle(
         existing_nodes=sorted(tablet.nodes.keys()),
         expected_active_hash=tablet.nodes[active_node].lean_statement_hash if active_node in tablet.nodes else "",
         imports_before=imports_before if easy_mode else None,
+        proof_edit_mode="restructure" if proof_restructure_mode else "local",
+        authorized_nodes=proof_authorized_nodes,
     )
     if easy_mode and active_lean.exists():
         imports_before = extract_imports(active_lean.read_text(encoding="utf-8"))
@@ -3763,6 +3621,7 @@ def run_cycle(
             existing_nodes=sorted(tablet.nodes.keys()),
             expected_active_hash=tablet.nodes[active_node].lean_statement_hash if active_node in tablet.nodes else "",
             imports_before=imports_before,
+            proof_edit_mode="local",
         )
 
     # Build worker prompt
@@ -3832,6 +3691,8 @@ def run_cycle(
             repo,
             active_node=active_node,
             snapshot_before=tablet_snapshot_before,
+            proof_edit_mode="restructure" if proof_restructure_mode else "local",
+            authorized_nodes=proof_authorized_nodes,
         )
         scope_error = hard_scope["errors"][0] if hard_scope["errors"] else None
         changes = hard_scope["changes"]
@@ -3880,6 +3741,8 @@ def run_cycle(
         snapshot_before=tablet_snapshot_before,
         active_changed=active_changed,
         new_lean_files=[f.removesuffix(".lean") for f in new_files if f.endswith(".lean")],
+        proof_edit_mode="restructure" if proof_restructure_mode else "local",
+        authorized_nodes=proof_authorized_nodes,
     )
     print(f"  Validation: {outcome.outcome} -- {outcome.detail}")
 
@@ -3887,11 +3750,13 @@ def run_cycle(
     if active_changed or active_tex_changed:
         proof_allowed_nodes.append(active_node)
     proof_allowed_nodes.extend(outcome.nodes_created)
+    if proof_restructure_mode:
+        proof_allowed_nodes.extend(proof_authorized_nodes)
     if outcome.outcome != "INVALID" and (proof_allowed_nodes or preamble_changed):
         scoped_outcome = _run_scoped_tablet_check(
             config,
             baseline_errors=proof_tablet_baseline_errors,
-            allowed_nodes=proof_allowed_nodes,
+            allowed_nodes=sorted(dict.fromkeys(proof_allowed_nodes)),
         )
         if scoped_outcome is not None:
             print(f"  Validation: {scoped_outcome.outcome} -- {scoped_outcome.detail}")
@@ -3949,14 +3814,7 @@ def run_cycle(
         )
 
     # Accumulate verification usage
-    for vr in nl_verification_results:
-        usage = vr.pop("_usage", None)
-        role = "correspondence" if vr.get("check") == "correspondence" else "nl_proof"
-        _accumulate_usage(state, role, usage)
-        # Also accumulate from multi-agent results
-        for ar in vr.get("agent_results", []):
-            agent_usage = ar.pop("_usage", None)
-            _accumulate_usage(state, "correspondence", agent_usage)
+    _accumulate_verification_usage(state, nl_verification_results)
 
     # Apply results to tablet state
     if outcome.outcome == "PROGRESS":
@@ -4084,6 +3942,19 @@ def run_cycle(
                     tablet.nodes[name].difficulty = "hard"
                     tablet.nodes[name].easy_attempts = 0
                     print(f"  Reviewer elevated {name} to hard")
+
+            requested_proof_mode = str(decision.get("proof_edit_mode", "local") or "local").strip().lower()
+            next_focus = state.active_node or active_node
+            next_node_meta = tablet.nodes.get(next_focus)
+            if (
+                requested_proof_mode == "restructure"
+                and next_focus == active_node
+                and next_node_meta is not None
+                and next_node_meta.difficulty == "hard"
+            ):
+                state.proof_target_edit_mode = "restructure"
+            else:
+                state.proof_target_edit_mode = "local"
 
             print(f"  Reviewer: {decision.get('decision', '?')} -> next: {state.active_node}")
         else:

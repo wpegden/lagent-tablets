@@ -171,6 +171,11 @@ def _theorem_target_edit_mode(state: SupervisorState) -> str:
     return mode if mode in {"repair", "restructure"} else "repair"
 
 
+def _proof_target_edit_mode(state: SupervisorState) -> str:
+    mode = str(getattr(state, "proof_target_edit_mode", "local") or "local").strip().lower()
+    return mode if mode in {"local", "restructure"} else "local"
+
+
 # ---------------------------------------------------------------------------
 # Context builders
 # ---------------------------------------------------------------------------
@@ -714,6 +719,16 @@ def build_worker_prompt(
     node_name = state.active_node or tablet.active_node
     repo_path = config.repo_path
     cleanup_mode = state.phase == "proof_complete_style_cleanup"
+    proof_restructure_mode = (
+        not cleanup_mode
+        and difficulty != "easy"
+        and _proof_target_edit_mode(state) == "restructure"
+    )
+    proof_authorized_region: Optional[List[str]] = None
+    if proof_restructure_mode and node_name:
+        from lagent_tablets.tablet import compute_target_impact_region
+
+        proof_authorized_region = sorted(compute_target_impact_region(repo_path, node_name))
 
     sections = []
 
@@ -726,6 +741,11 @@ def build_worker_prompt(
         )
     elif difficulty == "easy":
         sections.append(f"YOUR ROLE: **Worker** (proof_formalization phase, EASY node). You are proving `{node_name}` using ONLY its existing children. No new imports, no new files.\n")
+    elif proof_restructure_mode:
+        sections.append(
+            "YOUR ROLE: **Worker** (proof_formalization phase, HARD node, reviewer-authorized restructure). "
+            f"You are working on `{node_name}` with broader edits authorized inside its target-centered impact region.\n"
+        )
     else:
         sections.append("YOUR ROLE: **Worker** (proof_formalization phase). You are eliminating `sorry` from one node at a time. You do not decide which node to work on -- the reviewer assigns your node.\n")
     goal_text = _read_file(config.goal_file)
@@ -777,11 +797,17 @@ def build_worker_prompt(
     if cleanup_mode:
         template_name = "cleanup_worker_instructions.md"
     else:
-        template_name = "easy_worker_instructions.md" if difficulty == "easy" else "worker_instructions.md"
+        if difficulty == "easy":
+            template_name = "easy_worker_instructions.md"
+        elif proof_restructure_mode:
+            template_name = "worker_restructure_instructions.md"
+        else:
+            template_name = "worker_instructions.md"
     instructions = _load_template(template_name).format(
         node_name=node_name,
         skill_path=skill_path,
         repo_path=repo_path,
+        authorized_region_note=_authorized_region_note(proof_authorized_region),
         cleanup_check_command=_cleanup_check_command(config, cleanup_check_payload_path),
         proof_scope_check_command=_proof_scope_check_command(
             config,
