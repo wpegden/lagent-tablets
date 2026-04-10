@@ -154,6 +154,41 @@ class TestViewerSnapshots(unittest.TestCase):
         self.assertEqual(snapshot["nodes"]["foo"]["verification"]["correspondence"], "pass")
         self.assertEqual(snapshot["nodes"]["foo"]["verification"]["nl_proof"], "fail")
 
+    def test_write_live_snapshot_mirrors_project_static_files(self) -> None:
+        base = Path(tempfile.mkdtemp())
+        repo = base / "extremal_tablets"
+        static_out = base / "static"
+        (repo / "Tablet").mkdir(parents=True)
+        (repo / ".agent-supervisor").mkdir()
+        (static_out).mkdir()
+        (static_out / "index.html").write_text("<html>viewer</html>\n", encoding="utf-8")
+        (repo / "Tablet" / "Preamble.lean").write_text("import Mathlib.Data.Fin.Basic\n", encoding="utf-8")
+        (repo / "Tablet" / "foo.lean").write_text("theorem foo : True := by\n  trivial\n", encoding="utf-8")
+        (repo / "Tablet" / "foo.tex").write_text("\\begin{theorem}[Foo]\nTrue.\n\\end{theorem}\n", encoding="utf-8")
+
+        tablet = TabletState.from_dict({
+            "nodes": {
+                "foo": {
+                    "kind": "helper_lemma",
+                    "status": "open",
+                    "correspondence_status": "pass",
+                    "soundness_status": "fail",
+                }
+            }
+        })
+        state = SupervisorState(cycle=0, phase="theorem_stating")
+
+        with patch.dict(os.environ, {"LAGENT_VIEWER_STATIC_OUT": str(static_out)}, clear=False):
+            write_live_viewer_state(repo / ".agent-supervisor" / "viewer_state.json", repo, tablet, state, fast=True)
+
+        root_live = json.loads((static_out / "api" / "viewer-state.json").read_text(encoding="utf-8"))
+        project_live = json.loads((static_out / "extremal" / "api" / "viewer-state.json").read_text(encoding="utf-8"))
+        project_cycles = json.loads((static_out / "extremal" / "api" / "cycles.json").read_text(encoding="utf-8"))
+        self.assertEqual(root_live["state"]["cycle"], 0)
+        self.assertEqual(project_live["state"]["cycle"], 0)
+        self.assertEqual(project_cycles, [])
+        self.assertTrue((static_out / "extremal" / "index.html").exists())
+
     def test_node_payload_keeps_preamble_import_for_layout(self) -> None:
         repo = Path(tempfile.mkdtemp())
         (repo / "Tablet").mkdir()
@@ -284,6 +319,7 @@ writeStatic();
                 "REPO_PATH": str(repo),
                 "STATIC_OUT": str(static_out),
                 "BASE_PATH": "/lagent-tablets",
+                "VIEWER_PROJECTS_FILE": str(repo / "viewer-projects.json"),
             },
             check=True,
             capture_output=True,

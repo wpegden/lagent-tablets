@@ -18,7 +18,7 @@ Decide what to do next. Write your decision as JSON to the raw file `{raw_output
   ],
   "difficulty_assignments": {{"node_name": "easy or hard"}},
   "elevate_to_hard": ["node_name_if_easy_mode_is_insufficient"],
-  "proof_edit_mode": "local | restructure"
+  "proof_edit_mode": "local | restructure | coarse_restructure"
 }}
 
 Guidelines:
@@ -27,8 +27,10 @@ Guidelines:
 - STUCK: the worker has tried multiple approaches and is not making progress. This triggers stuck recovery.
 - NEED_INPUT: a human needs to provide mathematical guidance.
 - DONE: the entire project is complete.
-- `proof_edit_mode` defaults to `local`. Set it to `restructure` only when you are explicitly authorizing a broader refactor around the same hard active node inside its target-centered impact region.
+- `proof_edit_mode` defaults to `local`. Set it to `restructure` only when you are explicitly authorizing a broader refactor around the same hard active node inside its target-centered impact region without mutating the accepted coarse theorem-stating package.
+- Set `proof_edit_mode` to `coarse_restructure` only when the accepted coarse theorem-stating package itself must change. This is a higher-bar authorization than ordinary `restructure`.
 - When a hard-mode worker returns `STUCK` because nearby existing nodes must change, you may keep the same node active with `decision: "CONTINUE"` and `proof_edit_mode: "restructure"` instead of treating it as generic stuck recovery.
+- When a hard-mode worker returns `STUCK` because the accepted coarse package itself must change, you may keep the same node active with `decision: "CONTINUE"` and `proof_edit_mode: "coarse_restructure"`.
 - `paper_focus_ranges` is mandatory. Include the source-paper line ranges the next worker should have inlined for focused context. Use `[]` when no specific excerpt is needed.
 - Prefer short, high-signal ranges: theorem statements, notation blocks, or the exact proof paragraphs the worker should track next. Do not dump broad sections when a targeted excerpt will do.
 
@@ -40,7 +42,7 @@ Each node is classified as "easy" or "hard":
 - **easy**: A straightforward Lean proof from existing children. The worker can only edit the proof body -- no new imports, no new files. Use a faster/cheaper model.
 - **hard**: A challenging proof that may require creating helper lemmas, refactoring imports, or other structural changes. Uses a stronger model.
 
-Hard mode is still node-centered by default. Broader edits to nearby existing nodes require deliberate reviewer authorization via `proof_edit_mode: "restructure"`; they are not part of ordinary hard-mode freedom.
+Hard mode is still node-centered by default. Broader edits to nearby existing nodes require deliberate reviewer authorization via `proof_edit_mode: "restructure"`; they are not part of ordinary hard-mode freedom. Mutating the accepted coarse theorem-stating package requires the stronger `proof_edit_mode: "coarse_restructure"` authorization and should be used sparingly.
 
 You may assign or reassign difficulty via `difficulty_assignments`. You may elevate an easy node to hard via `elevate_to_hard` if you see the worker struggling (check the "attempts" count in the tablet status). The supervisor auto-elevates after 2 failed easy attempts.
 

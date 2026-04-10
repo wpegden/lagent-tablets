@@ -1,19 +1,20 @@
---- INSTRUCTIONS (HARD NODE, REVIEWER-AUTHORIZED RESTRUCTURE) ---
+--- INSTRUCTIONS (HARD NODE, REVIEWER-AUTHORIZED COARSE-RESTRUCTURE) ---
 
 YOUR ACTIVE NODE: `{node_name}`
-YOUR PRIMARY GOAL: Eliminate the `sorry` in `Tablet/{node_name}.lean`.
+YOUR PRIMARY GOAL: Eliminate the `sorry` in `Tablet/{node_name}.lean`, while deliberately mutating the accepted coarse theorem-stating package in a controlled way.
 
 IMPORTANT: Before starting, read the skill file at `{skill_path}` — it contains Loogle usage, proof strategies, and workflow examples.
 
 WORKFLOW:
-1. Keep `{node_name}` as the center of the cycle. You may edit nearby existing nodes only inside the authorized impact region below.
-2. When you have a result -- whether the proof compiles, you need a different authorization, or you're stuck -- STOP and write the raw handoff file `{raw_output_path}`.
+1. Keep `{node_name}` as the center of the cycle. Coarse-package edits are authorized only inside the impact region below.
+2. When you have a result -- whether the proof compiles, the coarse restructure works, or you are still blocked -- STOP and write the raw handoff file `{raw_output_path}`.
 3. Do NOT move on to unrelated parts of the tablet. The reviewer decides what to work on next.
 
 {authorized_region_note}
 You may:
 - Edit `Tablet/{node_name}.lean` and `Tablet/{node_name}.tex`
 - Edit other existing node files only when those nodes are inside the authorized impact region above
+- Change accepted coarse-node statements or `.tex` files when that is genuinely necessary for the same target-centered restructure
 - Add or remove `import Tablet.*` or `import Mathlib.*` lines in files inside the authorized impact region
 - Add `import Mathlib.*` lines to `Tablet/Preamble.lean` (additions only, no removals)
 - Create new helper nodes: write both `Tablet/{{name}}.lean` and `Tablet/{{name}}.tex` files
@@ -21,14 +22,16 @@ You may:
 
 You must NOT:
 - Edit existing nodes outside the authorized impact region
-- Modify the declaration line of `{node_name}` unless your reviewer-authorized restructure genuinely requires a paper-faithful statement adjustment for this same target
+- Treat this as a general whole-tablet refactor
 - Add `axiom`, `constant`, `unsafe`, `native_decide`, `opaque`, or other forbidden keywords
 - Use `sorry` in definitions -- only in theorem/lemma proof bodies
 - Use `import Mathlib` -- only specific submodule imports
 
-If you believe even this broader target-centered restructure is insufficient, return `status: STUCK` and explain what broader refactor would be required.
+This mode has a high bar. Use it only because the accepted coarse theorem-stating package itself must change. If the issue can be solved by adding non-coarse helpers beneath the existing coarse package, do that in ordinary proof mode instead.
 
-This mode still does NOT authorize mutation of the accepted coarse theorem-stating package. If a coarse node's accepted statement, `.tex`, or coarse-to-coarse package structure must change, stop and request reviewer-authorized `proof_edit_mode: "coarse_restructure"` instead.
+After the usual deterministic and local verification checks, the supervisor will run a coarse-wide correspondence / paper-faithfulness sweep over the resulting coarse package before accepting this cycle. New nodes you create during a successful coarse-restructure will become part of that refreshed coarse package.
+
+If you believe even this broader coarse-restructure is insufficient, return `status: STUCK` and explain what still blocks progress.
 
 MANDATORY BEFORE SUBMITTING: Run the self-check and fix any errors:
   {proof_scope_check_command}
@@ -38,7 +41,7 @@ You MUST iterate until the checker reports all deterministic checks pass before 
 
 WHEN DONE -- write the raw handoff JSON to `{raw_output_path}`:
 {{
-  "summary": "brief description of what you did",
+  "summary": "brief description of what you changed in the coarse package",
   "status": "NOT_STUCK | STUCK | DONE | NEED_INPUT",
   "new_nodes": ["list", "of", "new", "node", "names"]
 }}

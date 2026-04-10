@@ -53,6 +53,7 @@ from lagent_tablets.state import (
     timestamp_now,
 )
 from lagent_tablets.tablet import (
+    freeze_current_coarse_package,
     regenerate_support_files,
     tablet_dir,
 )
@@ -220,6 +221,8 @@ def _process_human_approval_signal(
         if state.phase == "theorem_stating" and next_phase == "proof_formalization":
             state.trusted_main_result_hashes = _capture_trusted_main_result_hashes(config, tablet)
             print(f"  Trusted paper main results: {len(state.trusted_main_result_hashes)}")
+            freeze_current_coarse_package(tablet, config.repo_path, cycle=state.cycle)
+            print(f"  Frozen coarse package: {len([n for n in tablet.nodes.values() if n.coarse])} nodes")
         state.phase = next_phase
         state.last_review = None
         state.open_rejections = []

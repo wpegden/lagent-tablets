@@ -28,6 +28,8 @@ GITIGNORE_CONTENT = """\
 .agent-supervisor/pause
 .agent-supervisor/human_approve.json
 .agent-supervisor/human_feedback.json
+.agent-supervisor/*.lock
+.agent-supervisor/**/*.lock
 
 # Editor / OS
 .DS_Store

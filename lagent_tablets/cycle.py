@@ -53,6 +53,7 @@ from lagent_tablets.state import (
 )
 from lagent_tablets.tablet import (
     PREAMBLE_NAME,
+    coarse_node_names,
     compute_import_closure,
     compute_target_impact_region,
     declaration_hash,
@@ -68,6 +69,7 @@ from lagent_tablets.tablet import (
     node_tex_path,
     regenerate_support_files,
     register_new_node,
+    refresh_coarse_package_hashes,
     validate_imports,
     validate_preamble_diff,
     validate_tex_format,
@@ -2207,6 +2209,31 @@ def _write_proof_scope_payload(
     return out
 
 
+def _coarse_restructure_candidate_nodes(
+    tablet: TabletState,
+    newly_created: Sequence[str],
+) -> List[str]:
+    candidate = set(coarse_node_names(tablet))
+    candidate.update(
+        str(name).strip()
+        for name in newly_created
+        if str(name).strip() and str(name).strip() != PREAMBLE_NAME
+    )
+    return sorted(candidate)
+
+
+def _coarse_restructure_correspondence_approved(
+    verification_results: Sequence[Dict[str, Any]],
+) -> bool:
+    corr_results = [
+        result for result in verification_results
+        if isinstance(result, dict) and result.get("check") == "correspondence"
+    ]
+    if not corr_results:
+        return True
+    return all(str(result.get("overall", "")).strip().upper() == "APPROVE" for result in corr_results)
+
+
 def _write_cleanup_check_payload(
     config: Config,
     tablet: TabletState,
@@ -3552,10 +3579,17 @@ def run_cycle(
     node_meta = tablet.nodes.get(active_node)
     node_difficulty = node_meta.difficulty if node_meta else "hard"
     easy_mode = node_difficulty == "easy"
-    if easy_mode and getattr(state, "proof_target_edit_mode", "local") == "restructure":
+    proof_mode = str(getattr(state, "proof_target_edit_mode", "local") or "local").strip().lower()
+    if easy_mode and proof_mode in {"restructure", "coarse_restructure"}:
         state.proof_target_edit_mode = "local"
-    proof_restructure_mode = (not easy_mode) and str(getattr(state, "proof_target_edit_mode", "local") or "local").strip().lower() == "restructure"
-    proof_authorized_nodes = sorted(compute_target_impact_region(repo, active_node)) if proof_restructure_mode else []
+        proof_mode = "local"
+    proof_restructure_mode = (not easy_mode) and proof_mode == "restructure"
+    proof_coarse_restructure_mode = (not easy_mode) and proof_mode == "coarse_restructure"
+    proof_authorized_nodes = (
+        sorted(compute_target_impact_region(repo, active_node))
+        if (proof_restructure_mode or proof_coarse_restructure_mode)
+        else []
+    )
 
     # Select worker config based on difficulty
     if easy_mode and config.easy_worker:
@@ -3608,7 +3642,7 @@ def run_cycle(
         existing_nodes=sorted(tablet.nodes.keys()),
         expected_active_hash=tablet.nodes[active_node].lean_statement_hash if active_node in tablet.nodes else "",
         imports_before=imports_before if easy_mode else None,
-        proof_edit_mode="restructure" if proof_restructure_mode else "local",
+        proof_edit_mode=proof_mode if not easy_mode else "local",
         authorized_nodes=proof_authorized_nodes,
     )
     if easy_mode and active_lean.exists():
@@ -3691,7 +3725,7 @@ def run_cycle(
             repo,
             active_node=active_node,
             snapshot_before=tablet_snapshot_before,
-            proof_edit_mode="restructure" if proof_restructure_mode else "local",
+            proof_edit_mode=proof_mode,
             authorized_nodes=proof_authorized_nodes,
         )
         scope_error = hard_scope["errors"][0] if hard_scope["errors"] else None
@@ -3741,7 +3775,7 @@ def run_cycle(
         snapshot_before=tablet_snapshot_before,
         active_changed=active_changed,
         new_lean_files=[f.removesuffix(".lean") for f in new_files if f.endswith(".lean")],
-        proof_edit_mode="restructure" if proof_restructure_mode else "local",
+        proof_edit_mode=proof_mode,
         authorized_nodes=proof_authorized_nodes,
     )
     print(f"  Validation: {outcome.outcome} -- {outcome.detail}")
@@ -3750,7 +3784,7 @@ def run_cycle(
     if active_changed or active_tex_changed:
         proof_allowed_nodes.append(active_node)
     proof_allowed_nodes.extend(outcome.nodes_created)
-    if proof_restructure_mode:
+    if proof_restructure_mode or proof_coarse_restructure_mode:
         proof_allowed_nodes.extend(proof_authorized_nodes)
     if outcome.outcome != "INVALID" and (proof_allowed_nodes or preamble_changed):
         scoped_outcome = _run_scoped_tablet_check(
@@ -3792,6 +3826,9 @@ def run_cycle(
     nodes_to_verify = []
     soundness_nodes_to_verify: List[str] = []
     if outcome.outcome == "PROGRESS":
+        for name in outcome.nodes_created:
+            if name not in tablet.nodes:
+                register_new_node(tablet, repo, name=name, kind="helper_lemma", cycle=cycle)
         if outcome.nodes_created:
             nodes_to_verify.extend(outcome.nodes_created)
             soundness_nodes_to_verify.extend([n for n in outcome.nodes_created if n not in outcome.nodes_closed])
@@ -3813,18 +3850,55 @@ def run_cycle(
             soundness_node_names=soundness_nodes_to_verify,
         )
 
+    coarse_restructure_results: List[Dict[str, Any]] = []
+    coarse_restructure_verified = not proof_coarse_restructure_mode
+    if outcome.outcome == "PROGRESS" and proof_coarse_restructure_mode:
+        coarse_candidate_nodes = _coarse_restructure_candidate_nodes(tablet, outcome.nodes_created)
+        if coarse_candidate_nodes:
+            print(
+                "  Running coarse-wide correspondence sweep for accepted package: "
+                f"{coarse_candidate_nodes}"
+            )
+            needs_nl_review = True
+            from lagent_tablets.nl_cache import NLCache
+            nl_cache = NLCache(config.state_dir / "nl_cache.json")
+            coarse_restructure_results = _run_nl_verification(
+                config,
+                policy,
+                tablet,
+                coarse_candidate_nodes,
+                state=state,
+                cycle=cycle,
+                log_dir=log_dir,
+                nl_cache=nl_cache,
+                human_input=state.human_input,
+                correspondence_node_names=coarse_candidate_nodes,
+                soundness_node_names=[],
+                force_correspondence_node_names=coarse_candidate_nodes,
+            )
+            nl_verification_results.extend(coarse_restructure_results)
+        coarse_restructure_verified = _coarse_restructure_correspondence_approved(
+            coarse_restructure_results
+        )
+
     # Accumulate verification usage
     _accumulate_verification_usage(state, nl_verification_results)
 
+    if nl_verification_results:
+        _apply_verification_to_tablet(tablet, nl_verification_results, cycle, repo_path=repo)
+
     # Apply results to tablet state
     if outcome.outcome == "PROGRESS":
-        for name in outcome.nodes_created:
-            node_lean = node_lean_path(repo, name)
-            # Determine kind from .tex (heuristic: check if it looks like a main result)
-            register_new_node(tablet, repo, name=name, kind="helper_lemma", cycle=cycle)
-
         for name in outcome.nodes_closed:
             mark_node_closed(tablet, name, cycle)
+
+        if proof_coarse_restructure_mode and coarse_restructure_verified:
+            refresh_coarse_package_hashes(
+                tablet,
+                repo,
+                cycle=cycle,
+                new_coarse=set(outcome.nodes_created),
+            )
 
         tablet.last_modified_at_cycle = cycle
 
@@ -3947,12 +4021,12 @@ def run_cycle(
             next_focus = state.active_node or active_node
             next_node_meta = tablet.nodes.get(next_focus)
             if (
-                requested_proof_mode == "restructure"
+                requested_proof_mode in {"restructure", "coarse_restructure"}
                 and next_focus == active_node
                 and next_node_meta is not None
                 and next_node_meta.difficulty == "hard"
             ):
-                state.proof_target_edit_mode = "restructure"
+                state.proof_target_edit_mode = requested_proof_mode
             else:
                 state.proof_target_edit_mode = "local"
 

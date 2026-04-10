@@ -235,6 +235,8 @@ class TabletNode:
     correspondence_content_hash: str = ""  # statement-level hash when correspondence was set
     soundness_content_hash: str = ""       # full NL-proof hash when soundness was set
     verification_content_hash: str = ""    # legacy combined hash for backward compatibility
+    coarse: bool = False
+    coarse_content_hash: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -271,6 +273,10 @@ class TabletNode:
             d["verification_content_hash"] = self.soundness_content_hash
         elif self.correspondence_content_hash:
             d["verification_content_hash"] = self.correspondence_content_hash
+        if self.coarse:
+            d["coarse"] = True
+        if self.coarse_content_hash:
+            d["coarse_content_hash"] = self.coarse_content_hash
         return d
 
     @classmethod
@@ -300,6 +306,8 @@ class TabletNode:
             correspondence_content_hash=correspondence_hash,
             soundness_content_hash=soundness_hash,
             verification_content_hash=legacy_hash or soundness_hash or correspondence_hash,
+            coarse=bool(raw.get("coarse", False)),
+            coarse_content_hash=str(raw.get("coarse_content_hash", "")),
         )
 
 
@@ -443,7 +451,7 @@ class SupervisorState:
         if theorem_target_edit_mode not in {"repair", "restructure"}:
             theorem_target_edit_mode = "repair"
         proof_target_edit_mode = str(raw.get("proof_target_edit_mode", "local") or "local")
-        if proof_target_edit_mode not in {"local", "restructure"}:
+        if proof_target_edit_mode not in {"local", "restructure", "coarse_restructure"}:
             proof_target_edit_mode = "local"
         return cls(
             cycle=int(raw.get("cycle", 0)),

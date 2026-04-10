@@ -37,13 +37,15 @@ class TestHumanInputHandling(unittest.TestCase):
             "main": TabletNode(name="main", kind="paper_main_result", status="open"),
         })
 
-        with patch("lagent_tablets.cli._capture_trusted_main_result_hashes", return_value={"main": "fp-main"}):
+        with patch("lagent_tablets.cli._capture_trusted_main_result_hashes", return_value={"main": "fp-main"}), \
+             patch("lagent_tablets.cli.freeze_current_coarse_package") as mock_freeze:
             stop = should_stop(config, state, tablet, CycleOutcome("CONTINUE", "ok"))
 
         self.assertFalse(stop)
         self.assertEqual(state.phase, "proof_formalization")
         self.assertEqual(state.trusted_main_result_hashes, {"main": "fp-main"})
         self.assertIsNone(state.last_review)
+        mock_freeze.assert_called_once_with(tablet, config.repo_path, cycle=state.cycle)
 
     def test_need_input_feedback_is_consumed(self):
         root = Path(tempfile.mkdtemp())

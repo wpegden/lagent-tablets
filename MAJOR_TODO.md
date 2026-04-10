@@ -83,3 +83,17 @@ One of the tablet's core invariants is that every theorem-style node is a `.lean
 
 28. [x] Scoped deterministic checking relies on brittle error-string parsing.
 `check_tablet_scoped(...)` currently decides whether a newly introduced error is relevant by extracting the text prefix before `:` and treating that as the owning node name. That only works as long as all node-owned errors keep exactly that rendering convention. A small change in error formatting can silently change scoped-check behavior by reclassifying a node-specific error as global, or a global error as node-owned. We should move scoped checking onto structured error metadata instead of inferring ownership from human-readable strings.
+
+29. [x] Freeze the coarse theorem-stating package during proof-formalization, with a distinct `coarse-restructure` escape hatch.
+When theorem-stating ends, the resulting coarse paper-facing DAG should become a system-verified package with stronger immutability than ordinary proof helpers. That means every node present in the accepted coarse tablet should be marked as a `coarse` node (separate from the stricter human-reviewed main-result trust), and ordinary proof-formalization should not be able to tamper with that package. In particular, neither ordinary hard `local` mode nor ordinary hard `restructure` mode should be allowed to change the coarse package's accepted paper-facing interface. They may still add new non-coarse helper nodes under coarse nodes and import those helpers as part of Lean proof development, but they should not be able to silently mutate the coarse package itself.
+
+The intended model needs to be explicit:
+- On phase transition out of theorem-stating, persist the set of accepted coarse nodes and the corresponding coarse-package fingerprints/metadata.
+- Ordinary proof-formalization may still add new helper nodes, close nodes in Lean, and refactor non-coarse proof structure, but it must not change coarse-node statement-level or package-level structure.
+- Changes that should require a new `coarse-restructure` authorization include at least: changing a coarse node's `.lean` declaration interface or `.tex` statement block, renaming/removing coarse nodes, or otherwise mutating the accepted coarse DAG/package rather than merely adding helpers beneath it.
+- `coarse-restructure` should be a separate reviewer-authorized operation with a higher bar than ordinary hard restructure. It should be rare, explicit, and clearly visible in prompts/state.
+- After a successful `coarse-restructure`, the new coarse set should be: all previously coarse nodes, plus any new nodes created during that coarse-restructure. We should *not* define coarse-ness by full descendant closure, because ordinary proof helpers under coarse nodes must remain possible without escalating immediately.
+- After all ordinary deterministic checks and local verification pass, a successful `coarse-restructure` must trigger a system-wide correspondence/paper-faithfulness sweep over the entire new coarse package before it is accepted.
+- If any human-reviewed `paper_main_result` loses correspondence through that coarse-restructure, the existing human re-review gate should also reopen.
+
+This would make the proof-formalization contract much cleaner: ordinary proof work proves against an accepted coarse package, while actual mutation of that package becomes a separate, explicitly reviewed operation.

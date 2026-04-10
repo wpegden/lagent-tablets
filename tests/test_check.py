@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,6 +20,7 @@ from lagent_tablets.check import (
     validate_reviewer_decision_data,
     validate_worker_handoff_data,
 )
+from lagent_tablets.state import TabletNode, TabletState, save_tablet
 from lagent_tablets.verification import write_scripts
 
 
@@ -247,6 +249,84 @@ class TestAxiomAudit(unittest.TestCase):
 
         self.assertTrue(result["ok"])
 
+    def test_check_proof_hard_scope_rejects_coarse_tex_change_without_coarse_restructure(self):
+        repo = Path(tempfile.mkdtemp())
+        tablet = repo / "Tablet"
+        tablet.mkdir()
+        (repo / ".agent-supervisor").mkdir()
+        (tablet / "main_thm.lean").write_text(
+            "-- [TABLET NODE: main_thm]\ntheorem main_thm : True := by\n  trivial\n",
+            encoding="utf-8",
+        )
+        (tablet / "main_thm.tex").write_text("\\begin{theorem}True\\end{theorem}\n", encoding="utf-8")
+        save_tablet(
+            repo / ".agent-supervisor" / "tablet.json",
+            TabletState(nodes={
+                "main_thm": TabletNode(
+                    name="main_thm",
+                    kind="paper_main_result",
+                    status="closed",
+                    coarse=True,
+                    coarse_content_hash="stable",
+                ),
+            }),
+        )
+        before = {"main_thm.lean": "a", "main_thm.tex": "b"}
+        (tablet / "main_thm.tex").write_text("\\begin{theorem}False\\end{theorem}\n", encoding="utf-8")
+
+        result = check_proof_hard_scope(
+            repo,
+            active_node="main_thm",
+            snapshot_before=before,
+            proof_edit_mode="local",
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(
+            any("Accepted coarse nodes may not change their `.tex` files" in err for err in result["errors"])
+        )
+
+    def test_check_proof_hard_scope_allows_active_coarse_proof_change(self):
+        repo = Path(tempfile.mkdtemp())
+        tablet = repo / "Tablet"
+        tablet.mkdir()
+        (repo / ".agent-supervisor").mkdir()
+        (tablet / "main_thm.lean").write_text(
+            "-- [TABLET NODE: main_thm]\ntheorem main_thm : True := by\n  sorry\n",
+            encoding="utf-8",
+        )
+        (tablet / "main_thm.tex").write_text("\\begin{theorem}True\\end{theorem}\n", encoding="utf-8")
+        save_tablet(
+            repo / ".agent-supervisor" / "tablet.json",
+            TabletState(nodes={
+                "main_thm": TabletNode(
+                    name="main_thm",
+                    kind="paper_main_result",
+                    status="open",
+                    coarse=True,
+                    coarse_content_hash="stable",
+                ),
+            }),
+        )
+        before = {
+            "main_thm.lean": hashlib.sha256((tablet / "main_thm.lean").read_bytes()).hexdigest(),
+            "main_thm.tex": hashlib.sha256((tablet / "main_thm.tex").read_bytes()).hexdigest(),
+        }
+        (tablet / "main_thm.lean").write_text(
+            "-- [TABLET NODE: main_thm]\ntheorem main_thm : True := by\n  trivial\n",
+            encoding="utf-8",
+        )
+
+        with patch("lagent_tablets.tablet.coarse_interface_fingerprint", return_value="stable"):
+            result = check_proof_hard_scope(
+                repo,
+                active_node="main_thm",
+                snapshot_before=before,
+                proof_edit_mode="local",
+            )
+
+        self.assertTrue(result["ok"])
+
 
 class TestWriteScripts(unittest.TestCase):
 
@@ -347,6 +427,20 @@ class TestArtifactValidation(unittest.TestCase):
         }, phase="proof_formalization")
         self.assertTrue(result["ok"])
         self.assertEqual(result["data"]["proof_edit_mode"], "restructure")
+
+    def test_validates_proof_reviewer_decision_with_coarse_restructure_mode(self):
+        result = validate_reviewer_decision_data({
+            "decision": "CONTINUE",
+            "reason": "The accepted coarse package itself must change.",
+            "next_prompt": "Keep the same node and authorize a coarse restructure.",
+            "next_active_node": "main_thm",
+            "paper_focus_ranges": [],
+            "difficulty_assignments": {},
+            "elevate_to_hard": [],
+            "proof_edit_mode": "coarse_restructure",
+        }, phase="proof_formalization")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"]["proof_edit_mode"], "coarse_restructure")
 
     def test_validates_cleanup_reviewer_decision(self):
         result = validate_reviewer_decision_data({

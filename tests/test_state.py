@@ -76,6 +76,8 @@ class TestTabletNode(unittest.TestCase):
             closed_at_cycle=23,
             correspondence_content_hash="corr123",
             soundness_content_hash="sound456",
+            coarse=True,
+            coarse_content_hash="coarse789",
         )
         d = node.to_dict()
         restored = TabletNode.from_dict("compactness_of_K", d)
@@ -87,6 +89,8 @@ class TestTabletNode(unittest.TestCase):
         self.assertEqual(restored.closed_at_cycle, 23)
         self.assertEqual(restored.correspondence_content_hash, "corr123")
         self.assertEqual(restored.soundness_content_hash, "sound456")
+        self.assertTrue(restored.coarse)
+        self.assertEqual(restored.coarse_content_hash, "coarse789")
 
     def test_legacy_verification_hash_populates_split_hashes(self):
         restored = TabletNode.from_dict("foo", {
@@ -173,7 +177,7 @@ class TestSupervisorState(unittest.TestCase):
             cycle=42,
             phase="proof_formalization",
             active_node="uniqueness_thm",
-            proof_target_edit_mode="restructure",
+            proof_target_edit_mode="coarse_restructure",
             theorem_soundness_target="paper_main",
             theorem_target_edit_mode="restructure",
             theorem_correspondence_blocked=True,
@@ -187,7 +191,7 @@ class TestSupervisorState(unittest.TestCase):
         self.assertEqual(restored.cycle, 42)
         self.assertEqual(restored.phase, "proof_formalization")
         self.assertEqual(restored.active_node, "uniqueness_thm")
-        self.assertEqual(restored.proof_target_edit_mode, "restructure")
+        self.assertEqual(restored.proof_target_edit_mode, "coarse_restructure")
         self.assertEqual(restored.theorem_soundness_target, "paper_main")
         self.assertEqual(restored.theorem_target_edit_mode, "restructure")
         self.assertTrue(restored.theorem_correspondence_blocked)

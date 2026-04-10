@@ -173,7 +173,7 @@ def _theorem_target_edit_mode(state: SupervisorState) -> str:
 
 def _proof_target_edit_mode(state: SupervisorState) -> str:
     mode = str(getattr(state, "proof_target_edit_mode", "local") or "local").strip().lower()
-    return mode if mode in {"local", "restructure"} else "local"
+    return mode if mode in {"local", "restructure", "coarse_restructure"} else "local"
 
 
 # ---------------------------------------------------------------------------
@@ -719,13 +719,19 @@ def build_worker_prompt(
     node_name = state.active_node or tablet.active_node
     repo_path = config.repo_path
     cleanup_mode = state.phase == "proof_complete_style_cleanup"
+    proof_mode = _proof_target_edit_mode(state)
     proof_restructure_mode = (
         not cleanup_mode
         and difficulty != "easy"
-        and _proof_target_edit_mode(state) == "restructure"
+        and proof_mode == "restructure"
+    )
+    proof_coarse_restructure_mode = (
+        not cleanup_mode
+        and difficulty != "easy"
+        and proof_mode == "coarse_restructure"
     )
     proof_authorized_region: Optional[List[str]] = None
-    if proof_restructure_mode and node_name:
+    if (proof_restructure_mode or proof_coarse_restructure_mode) and node_name:
         from lagent_tablets.tablet import compute_target_impact_region
 
         proof_authorized_region = sorted(compute_target_impact_region(repo_path, node_name))
@@ -741,6 +747,11 @@ def build_worker_prompt(
         )
     elif difficulty == "easy":
         sections.append(f"YOUR ROLE: **Worker** (proof_formalization phase, EASY node). You are proving `{node_name}` using ONLY its existing children. No new imports, no new files.\n")
+    elif proof_coarse_restructure_mode:
+        sections.append(
+            "YOUR ROLE: **Worker** (proof_formalization phase, HARD node, reviewer-authorized coarse-restructure). "
+            f"You are working on `{node_name}` with explicit permission to mutate the accepted coarse package inside its target-centered impact region.\n"
+        )
     elif proof_restructure_mode:
         sections.append(
             "YOUR ROLE: **Worker** (proof_formalization phase, HARD node, reviewer-authorized restructure). "
@@ -799,6 +810,8 @@ def build_worker_prompt(
     else:
         if difficulty == "easy":
             template_name = "easy_worker_instructions.md"
+        elif proof_coarse_restructure_mode:
+            template_name = "worker_coarse_restructure_instructions.md"
         elif proof_restructure_mode:
             template_name = "worker_restructure_instructions.md"
         else:

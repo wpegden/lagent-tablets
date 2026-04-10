@@ -27,6 +27,8 @@ You must NOT:
 
 Hard mode is still node-centered. If you conclude that this node needs edits to other existing nodes, stop and return `status: STUCK` with a concrete broader-restructure request; only the reviewer can authorize that wider scope.
 
+If `{node_name}` is part of the accepted coarse theorem-stating package, ordinary proof-formalization may still fill in its Lean proof and add non-coarse helpers beneath it, but it must NOT mutate that accepted coarse package. In particular, changing the coarse node's `.tex`, changing its accepted statement/interface, or changing coarse-to-coarse structure requires reviewer-authorized `proof_edit_mode: "coarse_restructure"`.
+
 MANDATORY BEFORE SUBMITTING: Run the self-check and fix any errors:
   {proof_scope_check_command}
   {proof_worker_delta_check_command}

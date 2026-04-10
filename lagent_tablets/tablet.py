@@ -7,6 +7,7 @@ This module handles the file-level operations; Lean/Lake handles the graph logic
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 from pathlib import Path
@@ -514,6 +515,110 @@ def compute_target_impact_region(
         {node_name}
         | compute_import_closure(repo_path, node_name)
         | compute_reverse_import_closure(repo_path, node_name)
+    )
+
+
+def coarse_node_names(tablet: TabletState) -> Set[str]:
+    """Return the explicit coarse-package node set."""
+    return {
+        name
+        for name, node in tablet.nodes.items()
+        if name not in {PREAMBLE_NAME, AXIOMS_NAME} and node.coarse
+    }
+
+
+def _extract_tex_statement_block(tex_content: str) -> str:
+    proof_start = tex_content.find("\\begin{proof}")
+    if proof_start >= 0:
+        return tex_content[:proof_start].strip()
+    return tex_content.strip()
+
+
+def coarse_interface_fingerprint(
+    tablet: TabletState,
+    repo_path: Path,
+    node_name: str,
+    *,
+    coarse_names: Optional[Set[str]] = None,
+) -> str:
+    """Fingerprint the accepted coarse interface of one node.
+
+    This fingerprint is intentionally stable under Lean proof-body edits and
+    helper-import additions, but changes when the paper-facing coarse package
+    itself changes.
+    """
+    node = tablet.nodes.get(node_name)
+    if node is None or node_name in {PREAMBLE_NAME, AXIOMS_NAME}:
+        return ""
+    coarse_set = set(coarse_names or coarse_node_names(tablet))
+    lean_path = node_lean_path(repo_path, node_name)
+    tex_path = node_tex_path(repo_path, node_name)
+    if not lean_path.exists() or not tex_path.exists():
+        return ""
+    lean_content = lean_path.read_text(encoding="utf-8")
+    tex_content = tex_path.read_text(encoding="utf-8")
+    coarse_imports = sorted(
+        dep for dep in extract_tablet_imports(lean_content)
+        if dep in coarse_set
+    )
+    from lagent_tablets.nl_cache import correspondence_fingerprint
+
+    payload = {
+        "kind": node.kind,
+        "correspondence_fingerprint": correspondence_fingerprint(repo_path, node_name) or "",
+        "tex_statement": _extract_tex_statement_block(tex_content),
+        "coarse_imports": coarse_imports,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def refresh_coarse_package_hashes(
+    tablet: TabletState,
+    repo_path: Path,
+    *,
+    cycle: Optional[int] = None,
+    new_coarse: Optional[Set[str]] = None,
+) -> None:
+    """Refresh persisted fingerprints for the explicit coarse package."""
+    if new_coarse:
+        for name in new_coarse:
+            node = tablet.nodes.get(name)
+            if node is not None and name not in {PREAMBLE_NAME, AXIOMS_NAME}:
+                node.coarse = True
+    coarse_set = coarse_node_names(tablet)
+    for name in coarse_set:
+        node = tablet.nodes.get(name)
+        if node is None:
+            continue
+        node.coarse = True
+        node.coarse_content_hash = coarse_interface_fingerprint(
+            tablet,
+            repo_path,
+            name,
+            coarse_names=coarse_set,
+        )
+        if cycle is not None:
+            tablet.last_modified_at_cycle = cycle
+
+
+def freeze_current_coarse_package(
+    tablet: TabletState,
+    repo_path: Path,
+    *,
+    cycle: Optional[int] = None,
+) -> None:
+    """Mark the current accepted theorem-stating package as coarse."""
+    new_coarse = {
+        name for name in tablet.nodes
+        if name not in {PREAMBLE_NAME, AXIOMS_NAME}
+    }
+    refresh_coarse_package_hashes(
+        tablet,
+        repo_path,
+        cycle=cycle,
+        new_coarse=new_coarse,
     )
 
 

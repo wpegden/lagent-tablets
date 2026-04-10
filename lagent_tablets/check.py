@@ -99,7 +99,7 @@ CLEANUP_REVIEWER_DECISIONS: Tuple[str, ...] = (
     "NEED_INPUT",
     "DONE",
 )
-PROOF_EDIT_MODES: Tuple[str, ...] = ("local", "restructure")
+PROOF_EDIT_MODES: Tuple[str, ...] = ("local", "restructure", "coarse_restructure")
 THEOREM_REVIEWER_DECISIONS: Tuple[str, ...] = (
     "CONTINUE",
     "ADVANCE_PHASE",
@@ -792,6 +792,102 @@ def check_proof_easy_scope(
     }
 
 
+def _load_tablet_state_for_checks(repo: Path) -> Any:
+    from lagent_tablets.state import TabletState
+
+    tablet_path = repo / ".agent-supervisor" / "tablet.json"
+    if not tablet_path.exists():
+        return TabletState()
+    try:
+        raw = json.loads(tablet_path.read_text(encoding="utf-8"))
+    except Exception:
+        return TabletState()
+    return TabletState.from_dict(raw)
+
+
+def check_coarse_package_guard(
+    repo: Path,
+    *,
+    active_node: str,
+    changes: Dict[str, List[str]],
+    proof_edit_mode: str = "local",
+) -> Dict[str, Any]:
+    """Reject ordinary proof-mode edits that mutate the accepted coarse package."""
+    if proof_edit_mode == "coarse_restructure":
+        return {"ok": True, "errors": [], "warnings": []}
+
+    from lagent_tablets.tablet import coarse_interface_fingerprint, coarse_node_names
+
+    tablet = _load_tablet_state_for_checks(repo)
+    coarse_names = coarse_node_names(tablet)
+    if not coarse_names:
+        return {"ok": True, "errors": [], "warnings": []}
+
+    def _node_name(fname: str) -> str:
+        return Path(fname).stem
+
+    errors: List[str] = []
+    changed_lean_nodes = {
+        _node_name(fname)
+        for fname in changes.get("modified", [])
+        if fname.endswith(".lean")
+    }
+    changed_tex_nodes = {
+        _node_name(fname)
+        for fname in changes.get("modified", [])
+        if fname.endswith(".tex")
+    }
+    deleted_nodes = {
+        _node_name(fname)
+        for fname in changes.get("deleted", [])
+        if fname.endswith(".lean") or fname.endswith(".tex")
+    }
+
+    deleted_coarse = sorted(name for name in deleted_nodes if name in coarse_names)
+    if deleted_coarse:
+        errors.append(
+            f"Accepted coarse nodes may not be deleted outside `coarse_restructure`: {deleted_coarse}"
+        )
+
+    changed_coarse_tex = sorted(name for name in changed_tex_nodes if name in coarse_names)
+    if changed_coarse_tex:
+        errors.append(
+            f"Accepted coarse nodes may not change their `.tex` files outside `coarse_restructure`: {changed_coarse_tex}"
+        )
+
+    changed_other_coarse = sorted(
+        name for name in changed_lean_nodes
+        if name in coarse_names and name != active_node
+    )
+    if changed_other_coarse:
+        errors.append(
+            "Accepted coarse nodes outside the active node may not be modified in ordinary proof mode: "
+            f"{changed_other_coarse}"
+        )
+
+    if active_node in coarse_names and active_node in changed_lean_nodes:
+        node = tablet.nodes.get(active_node)
+        expected = node.coarse_content_hash if node is not None else ""
+        current = coarse_interface_fingerprint(
+            tablet,
+            repo,
+            active_node,
+            coarse_names=coarse_names,
+        )
+        if not expected:
+            errors.append(
+                f"Accepted coarse fingerprint missing for `{active_node}`. "
+                "Use `coarse_restructure` if the coarse package must be re-established."
+            )
+        elif current != expected:
+            errors.append(
+                f"`{active_node}` changed the accepted coarse package interface. "
+                "Use `proof_edit_mode: coarse_restructure` for coarse package changes."
+            )
+
+    return {"ok": not errors, "errors": errors, "warnings": []}
+
+
 def check_proof_hard_scope(
     repo: Path,
     *,
@@ -807,7 +903,7 @@ def check_proof_hard_scope(
     changes = _detect_snapshot_changes(snapshot_before, after)
     supervisor_generated = {"INDEX.md", "README.md", "header.tex", "Tablet.lean"}
     allowed_modified = {"Preamble.lean"} | supervisor_generated
-    if proof_edit_mode == "restructure":
+    if proof_edit_mode in {"restructure", "coarse_restructure"}:
         allowed_nodes = set(str(name) for name in (authorized_nodes or []))
         allowed_nodes |= compute_target_impact_region(repo, active_node)
         for name in allowed_nodes:
@@ -822,7 +918,7 @@ def check_proof_hard_scope(
 
     unexpected_modified = [f for f in changes["modified"] if f not in allowed_modified]
     if unexpected_modified:
-        if proof_edit_mode == "restructure":
+        if proof_edit_mode in {"restructure", "coarse_restructure"}:
             errors.append(
                 f"Unexpected files modified: {unexpected_modified}. "
                 f"Only nodes in `{active_node}`'s authorized impact region, Preamble.lean, "
@@ -833,6 +929,14 @@ def check_proof_hard_scope(
                 f"Unexpected files modified: {unexpected_modified}. "
                 f"Only {active_node}, Preamble.lean, and supervisor-generated support files may be modified."
             )
+
+    coarse_result = check_coarse_package_guard(
+        repo,
+        active_node=active_node,
+        changes=changes,
+        proof_edit_mode=proof_edit_mode,
+    )
+    errors.extend(coarse_result["errors"])
 
     return {"ok": not errors, "errors": errors, "warnings": [], "changes": changes}
 
@@ -887,6 +991,24 @@ def check_proof_worker_delta(
             "warnings": [],
         }
 
+    coarse_result = check_coarse_package_guard(
+        repo,
+        active_node=active_node,
+        changes=changes,
+        proof_edit_mode=proof_edit_mode,
+    )
+    if coarse_result["errors"]:
+        return {
+            "ok": False,
+            "outcome": "INVALID",
+            "detail": coarse_result["errors"][0],
+            "nodes_closed": [],
+            "nodes_created": [],
+            "build_output": "",
+            "errors": list(coarse_result["errors"]),
+            "warnings": list(coarse_result.get("warnings", [])),
+        }
+
     extra_changed_nodes = sorted(
         {
             Path(fname).stem
@@ -894,7 +1016,7 @@ def check_proof_worker_delta(
             if fname.endswith(".lean")
             and Path(fname).stem not in {active_node, "Preamble", "Axioms"}
             and Path(fname).stem in existing
-            and proof_edit_mode == "restructure"
+            and proof_edit_mode in {"restructure", "coarse_restructure"}
             and Path(fname).stem in allowed_existing_nodes
         }
     )
@@ -920,7 +1042,7 @@ def check_proof_worker_delta(
             active_node,
             allowed_prefixes=allowed_prefixes,
             forbidden_keywords=forbidden_keywords,
-            expected_hash=expected_active_hash,
+            expected_hash="" if proof_edit_mode == "coarse_restructure" else expected_active_hash,
             approved_axioms_path=approved_axioms_path,
         )
         if result["errors"]:

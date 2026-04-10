@@ -220,6 +220,20 @@ class TestWorkerPrompt(unittest.TestCase):
         self.assertIn("Do NOT edit `Tablet/main_thm.tex`", prompt)
         self.assertNotIn("Update `Tablet/main_thm.tex`", prompt)
 
+    def test_hard_local_prompt_warns_that_coarse_package_changes_need_coarse_restructure(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open", coarse=True),
+        }, active_node="main_thm")
+        state = SupervisorState(cycle=1, phase="proof_formalization", active_node="main_thm")
+
+        prompt = build_worker_prompt(config, state, tablet, Policy(), difficulty="hard")
+        self.assertIn("accepted coarse theorem-stating package", prompt)
+        self.assertIn("proof_edit_mode: \"coarse_restructure\"", prompt)
+
     def test_hard_restructure_worker_prompt_authorizes_region(self):
         repo = Path(tempfile.mkdtemp())
         _setup_repo(repo)
@@ -248,6 +262,34 @@ class TestWorkerPrompt(unittest.TestCase):
         self.assertIn("AUTHORIZED IMPACT REGION", prompt)
         self.assertIn("helper", prompt)
         self.assertIn("Edit other existing node files only when those nodes are inside the authorized impact region", prompt)
+
+    def test_hard_coarse_restructure_worker_prompt_authorizes_coarse_package_mutation(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        helper_lean = generate_node_lean("helper", "theorem helper : True", ["Tablet.Preamble"])
+        (repo / "Tablet" / "helper.lean").write_text(helper_lean)
+        (repo / "Tablet" / "helper.tex").write_text(
+            "\\begin{lemma}\nTrue.\n\\end{lemma}\n\\begin{proof}\nTrivial.\n\\end{proof}\n"
+        )
+        main_lean = (repo / "Tablet" / "main_thm.lean").read_text(encoding="utf-8") + "\nimport Tablet.helper\n"
+        (repo / "Tablet" / "main_thm.lean").write_text(main_lean)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "helper": TabletNode(name="helper", kind="helper_lemma", status="open"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open", coarse=True),
+        }, active_node="main_thm")
+        state = SupervisorState(
+            cycle=1,
+            phase="proof_formalization",
+            active_node="main_thm",
+            proof_target_edit_mode="coarse_restructure",
+        )
+
+        prompt = build_worker_prompt(config, state, tablet, Policy(), difficulty="hard")
+        self.assertIn("coarse-restructure", prompt)
+        self.assertIn("accepted coarse theorem-stating package", prompt)
+        self.assertIn("coarse-wide correspondence / paper-faithfulness sweep", prompt)
 
     def test_includes_targeted_paper_excerpt_from_review(self):
         repo = Path(tempfile.mkdtemp())

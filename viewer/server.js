@@ -126,48 +126,54 @@ function writeJsonIfChanged(filePath, value) {
   fs.chmodSync(filePath, 0o644);
 }
 
-function writeStatic() {
-  try {
-    const { repoPath } = resolveRepoPath(defaultProjectSlug());
-    fs.mkdirSync(path.join(STATIC_OUT, 'api'), { recursive: true });
-    const live = readLiveViewerState(repoPath);
+function writeProjectStatic(projectSlug, repoPath, { writeRoot = false } = {}) {
+  const live = readLiveViewerState(repoPath);
+  const cycles = getCyclesFromGit(repoPath);
+  const roots = [path.join(STATIC_OUT, projectSlug)];
+  if (writeRoot) roots.unshift(STATIC_OUT);
 
-    writeJsonIfChanged(path.join(STATIC_OUT, 'api', 'viewer-state.json'), live);
-
-    // Cycles from git
-    const cycles = getCyclesFromGit(repoPath);
-    writeJsonIfChanged(path.join(STATIC_OUT, 'api', 'cycles.json'), cycles);
-
-    // Generate state-at files by copying committed viewer_state snapshots
-    // (or legacy backfill cache for pre-cutover cycles).
-    const stateAtDir = path.join(STATIC_OUT, 'api', 'state-at');
+  for (const root of roots) {
+    const apiRoot = path.join(root, 'api');
+    const stateAtDir = path.join(apiRoot, 'state-at');
+    fs.mkdirSync(apiRoot, { recursive: true });
     fs.mkdirSync(stateAtDir, { recursive: true });
-    try {
-      const tags = git(repoPath, 'tag -l "cycle-*" --sort=version:refname').split('\n').filter(t => /^cycle-\d+$/.test(t));
-      const validCycles = new Set();
-      for (const tag of tags) {
-        const cycleNum = parseInt(tag.replace('cycle-', ''), 10);
-        if (Number.isNaN(cycleNum)) continue;
-        validCycles.add(String(cycleNum));
-        const outFile = path.join(stateAtDir, `${cycleNum}.json`);
-        try {
-          writeJsonIfChanged(outFile, readHistoricalViewerState(repoPath, cycleNum));
-        } catch {}
-      }
-      for (const entry of fs.readdirSync(stateAtDir)) {
-        const match = entry.match(/^(\d+)\.json$/);
-        if (!match) continue;
-        if (validCycles.has(match[1])) continue;
-        try { fs.unlinkSync(path.join(stateAtDir, entry)); } catch {}
-      }
-    } catch {}
+    writeJsonIfChanged(path.join(apiRoot, 'viewer-state.json'), live);
+    writeJsonIfChanged(path.join(apiRoot, 'cycles.json'), cycles);
 
-    // Copy index.html
-    const htmlSrc = path.join(__dirname, 'public', 'index.html');
-    if (fs.existsSync(htmlSrc)) {
-      fs.copyFileSync(htmlSrc, path.join(STATIC_OUT, 'index.html'));
+    const validCycles = new Set();
+    for (const entry of cycles) {
+      const cycleNum = entry.cycle;
+      if (!Number.isInteger(cycleNum)) continue;
+      validCycles.add(String(cycleNum));
+      const outFile = path.join(stateAtDir, `${cycleNum}.json`);
+      try {
+        writeJsonIfChanged(outFile, readHistoricalViewerState(repoPath, cycleNum));
+      } catch {}
+    }
+    for (const entry of fs.readdirSync(stateAtDir)) {
+      const match = entry.match(/^(\d+)\.json$/);
+      if (!match) continue;
+      if (validCycles.has(match[1])) continue;
+      try { fs.unlinkSync(path.join(stateAtDir, entry)); } catch {}
     }
 
+    const htmlSrc = path.join(__dirname, 'public', 'index.html');
+    const htmlDest = path.join(root, 'index.html');
+    if (fs.existsSync(htmlSrc)) {
+      fs.mkdirSync(root, { recursive: true });
+      fs.copyFileSync(htmlSrc, htmlDest);
+      fs.chmodSync(htmlDest, 0o644);
+    }
+  }
+}
+
+function writeStatic() {
+  try {
+    const projects = projectMap();
+    const defaultSlug = defaultProjectSlug();
+    for (const [slug, repoPath] of Object.entries(projects)) {
+      writeProjectStatic(slug, repoPath, { writeRoot: slug === defaultSlug });
+    }
   } catch (e) {
     console.error('Static write error:', e.message);
   }
