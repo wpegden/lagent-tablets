@@ -33,6 +33,12 @@ Mode:  2775 (setgid, group-writable)
 ```
 lagentworker can create new files (new tablet nodes).
 
+When theorem_stating is holding on a current soundness target in `repair` mode, the supervisor temporarily changes this to:
+```
+Mode: 2755 (setgid, not group-writable)
+```
+so the worker cannot create new node files during a pure NL-proof repair cycle.
+
 ### Tablet node files (`Tablet/{name}.lean`, `Tablet/{name}.tex`)
 
 **Before each cycle, the supervisor sets permissions:**
@@ -40,10 +46,19 @@ lagentworker can create new files (new tablet nodes).
 | File | Mode | Who can write | Purpose |
 |------|------|--------------|---------|
 | Active node `.lean` | 0664 | Both | Worker edits proof |
-| Active node `.tex` | 0664 | Both | Worker edits NL proof |
-| `Preamble.lean` | 0664 | Both | Worker adds imports |
+| Active node `.tex` | 0644 | Supervisor only | Frozen in easy mode |
+| `Preamble.lean` | 0644 | Supervisor only | Import changes require hard mode |
 | All other `.lean` | 0644 | Supervisor only | FROZEN during cycle |
 | All other `.tex` | 0644 | Supervisor only | FROZEN during cycle |
+
+For theorem_stating target repair cycles, the lock is stricter:
+
+| File | Mode | Who can write | Purpose |
+|------|------|--------------|---------|
+| Target `.tex` | 0664 | Both | Worker repairs the current NL proof only |
+| All `.lean` files | 0644 | Supervisor only | Statement/DAG changes require restructure authorization |
+| All other `.tex` | 0644 | Supervisor only | FROZEN during cycle |
+| `Preamble.lean` | 0644 | Supervisor only | Import changes require restructure authorization |
 
 **Supervisor-generated files** (`INDEX.md`, `README.md`, `header.tex`, `Tablet.lean`):
 ```
@@ -132,8 +147,8 @@ lagentworker has read+execute access. Cannot modify.
    ├── fix_lake_permissions(repo)        # .lake/build/ → 2775/0664
    ├── setup_permissions(config, active) # Set Tablet/ file modes
    │   ├── Active node .lean → 0664
-   │   ├── Active node .tex  → 0664
-   │   ├── Preamble.lean     → 0664
+   │   ├── Active node .tex  → 0644
+   │   ├── Preamble.lean     → 0644
    │   ├── All other .lean   → 0644
    │   └── All other .tex    → 0644
    ├── Clear stale staging/*.raw.json and staging/*.done
@@ -144,7 +159,8 @@ lagentworker has read+execute access. Cannot modify.
 2. Worker runs as lagentworker
    ├── Reads prompt file (0644 → lagentworker can read)
    ├── Edits active node .lean (0664 → lagentworker can write)
-   ├── May edit Preamble.lean (0664 → lagentworker can write)
+   ├── CANNOT edit active node .tex (0644 → lagentworker cannot write)
+   ├── CANNOT edit Preamble.lean (0644 → lagentworker cannot write)
    ├── CANNOT edit other .lean (0644 → lagentworker cannot write)
    ├── Writes staging/worker_handoff.raw.json
    ├── Runs .agent-supervisor/scripts/check.py
@@ -167,5 +183,5 @@ lagentworker has read+execute access. Cannot modify.
 2. **lagentworker cannot modify .lake/packages/**: git checkout, lagentworker has no write access
 3. **lagentworker cannot modify state.json/tablet.json**: mode 0600, only leanagent can read/write
 4. **lagentworker cannot replace the checker or burst scripts**: `.agent-supervisor/` and `scripts/` are not group-writable
-5. **lagentworker CAN create new files in Tablet/**: this is intentional (new helper nodes)
-6. **lagentworker CAN modify Preamble.lean**: intentional (add imports) but supervisor validates changes
+5. **lagentworker CAN create new files in Tablet/**: intentional in hard/restructure modes only; easy mode locks `Tablet/` itself to prevent this
+6. **lagentworker CANNOT modify `Preamble.lean` in easy mode**: import changes require hard mode

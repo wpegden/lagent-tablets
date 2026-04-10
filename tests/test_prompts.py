@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import subprocess
 from pathlib import Path
 
 from lagent_tablets.config import (
     BranchingConfig, ChatConfig, Config, GitConfig, Policy,
     ProviderConfig, TmuxConfig, VerificationConfig, WorkflowConfig,
+    VerificationPolicy,
 )
 from lagent_tablets.state import SupervisorState, TabletNode, TabletState
 from lagent_tablets.tablet import generate_node_lean, node_lean_path, node_tex_path
 from lagent_tablets.prompts import (
     build_correspondence_prompt,
+    build_node_soundness_prompt,
     build_reviewer_prompt,
     build_theorem_stating_prompt,
     build_theorem_stating_reviewer_prompt,
@@ -105,6 +108,19 @@ class TestWorkerPrompt(unittest.TestCase):
         self.assertIn("worker_handoff.raw.json", prompt)
         self.assertIn("worker_handoff.done", prompt)
 
+    def test_proof_worker_prompt_uses_phase_specific_skill_file(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open"),
+        }, active_node="main_thm")
+        state = SupervisorState(cycle=1, phase="proof_formalization", active_node="main_thm")
+
+        prompt = build_worker_prompt(config, state, tablet, Policy())
+        self.assertIn("PROOF_FORMALIZATION_WORKER.md", prompt)
+
     def test_includes_reviewer_guidance(self):
         repo = Path(tempfile.mkdtemp())
         _setup_repo(repo)
@@ -168,6 +184,21 @@ class TestWorkerPrompt(unittest.TestCase):
         prompt = build_worker_prompt(config, state, tablet, policy)
         self.assertIn("Use simp aggressively", prompt)
 
+    def test_easy_worker_prompt_locks_to_single_lean_proof(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open"),
+        }, active_node="main_thm")
+        state = SupervisorState(cycle=1, phase="proof_formalization", active_node="main_thm")
+
+        prompt = build_worker_prompt(config, state, tablet, Policy(), difficulty="easy")
+        self.assertIn("Work ONLY on `Tablet/main_thm.lean`", prompt)
+        self.assertIn("Do NOT edit `Tablet/main_thm.tex`", prompt)
+        self.assertNotIn("Update `Tablet/main_thm.tex`", prompt)
+
     def test_includes_targeted_paper_excerpt_from_review(self):
         repo = Path(tempfile.mkdtemp())
         _setup_repo(repo)
@@ -213,6 +244,19 @@ class TestReviewerPrompt(unittest.TestCase):
         self.assertIn("main_thm", prompt)
         self.assertIn("CONTINUE", prompt)
         self.assertIn("next_active_node", prompt)
+
+    def test_proof_reviewer_prompt_uses_phase_specific_skill_file(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open", title="Main"),
+        })
+        state = SupervisorState(cycle=1, phase="proof_formalization")
+
+        prompt = build_reviewer_prompt(config, state, tablet, Policy())
+        self.assertIn("PROOF_FORMALIZATION_REVIEWER.md", prompt)
 
     def test_includes_worker_handoff(self):
         repo = Path(tempfile.mkdtemp())
@@ -280,10 +324,41 @@ class TestReviewerPrompt(unittest.TestCase):
         self.assertIn("Orphan", prompt)
         self.assertIn("orphan_helper", prompt)
 
+    def test_reviewer_prompt_includes_reject_biased_soundness_split_note(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open"),
+        })
+        state = SupervisorState(cycle=1, phase="proof_formalization")
+
+        prompt = build_reviewer_prompt(
+            config, state, tablet,
+            Policy(verification=VerificationPolicy(soundness_agent_selectors=("gemini", "codex"), soundness_disagree_bias="reject")),
+            nl_verification=[{
+                "check": "nl_proof",
+                "overall": "REJECT",
+                "summary": "Failed: ['main_thm']",
+                "node_verdicts": [{
+                    "node": "main_thm",
+                    "overall": "REJECT",
+                    "panel_split": True,
+                    "agent_results": [
+                        {"agent": "Gemini", "overall": "APPROVE"},
+                        {"agent": "Codex", "overall": "REJECT"},
+                    ],
+                }],
+            }],
+        )
+        self.assertIn("1-1 panel split", prompt)
+        self.assertIn("default to CONTINUE/REJECT", prompt)
+
 
 class TestTheoremStatingPrompts(unittest.TestCase):
 
-    def test_worker_prompt_includes_open_rejections(self):
+    def test_worker_prompt_includes_open_blockers(self):
         repo = Path(tempfile.mkdtemp())
         _setup_repo(repo)
         config = _make_config(repo)
@@ -295,7 +370,7 @@ class TestTheoremStatingPrompts(unittest.TestCase):
             cycle=2,
             phase="theorem_stating",
             last_review={"decision": "CONTINUE", "next_prompt": "Fix the statement."},
-            open_rejections=[
+            open_blockers=[
                 {
                     "node": "main_thm",
                     "phase": "correspondence",
@@ -305,7 +380,7 @@ class TestTheoremStatingPrompts(unittest.TestCase):
         )
 
         prompt = build_theorem_stating_prompt(config, state, tablet, Policy())
-        self.assertIn("CURRENT OPEN REJECTIONS", prompt)
+        self.assertIn("CURRENT OPEN BLOCKERS", prompt)
         self.assertIn("Theorem-stating continues until this list is empty", prompt)
         self.assertIn("[correspondence] main_thm: The Lean statement drops a quantifier.", prompt)
 
@@ -386,7 +461,20 @@ class TestTheoremStatingPrompts(unittest.TestCase):
         self.assertIn("UNIQUE_TARGET_THEOREM", prompt)
         self.assertNotIn("TAIL", prompt)
 
-    def test_reviewer_prompt_requires_open_rejections(self):
+    def test_theorem_stating_worker_prompt_uses_phase_specific_skill_file(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open", title="Main"),
+        })
+        state = SupervisorState(cycle=2, phase="theorem_stating")
+
+        prompt = build_theorem_stating_prompt(config, state, tablet, Policy())
+        self.assertIn("THEOREM_STATING_WORKER.md", prompt)
+
+    def test_target_repair_prompt_does_not_reference_skill_file(self):
         repo = Path(tempfile.mkdtemp())
         _setup_repo(repo)
         config = _make_config(repo)
@@ -397,7 +485,102 @@ class TestTheoremStatingPrompts(unittest.TestCase):
         state = SupervisorState(
             cycle=2,
             phase="theorem_stating",
-            open_rejections=[
+            theorem_soundness_target="main_thm",
+            theorem_target_edit_mode="repair",
+        )
+
+        prompt = build_theorem_stating_prompt(config, state, tablet, Policy())
+        self.assertNotIn("Read the skill file at", prompt)
+
+    def test_worker_prompt_without_target_still_tells_worker_to_stay_local(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open", title="Main"),
+        })
+        state = SupervisorState(cycle=2, phase="theorem_stating")
+
+        prompt = build_theorem_stating_prompt(config, state, tablet, Policy())
+        self.assertIn("work in deterministic deepest-first DAG order", prompt)
+        self.assertIn("broad opportunistic rewrites", prompt)
+
+    def test_worker_prompt_with_target_requires_scope_to_stay_in_target_chain(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open", title="Main"),
+        })
+        state = SupervisorState(
+            cycle=2,
+            phase="theorem_stating",
+            theorem_soundness_target="main_thm",
+        )
+
+        prompt = build_theorem_stating_prompt(config, state, tablet, Policy())
+        self.assertIn("CURRENT SOUNDNESS TARGET", prompt)
+        self.assertIn("Work ONLY on `Tablet/main_thm.tex`", prompt)
+        self.assertIn("request restructure", prompt)
+        self.assertNotIn("If the tablet is still missing major parts, create the needed nodes", prompt)
+        self.assertNotIn("For each node, create two files", prompt)
+
+    def test_worker_prompt_with_target_restructure_mode_authorizes_broader_slice(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open", title="Main"),
+        })
+        state = SupervisorState(
+            cycle=2,
+            phase="theorem_stating",
+            theorem_soundness_target="main_thm",
+            theorem_target_edit_mode="restructure",
+        )
+
+        prompt = build_theorem_stating_prompt(config, state, tablet, Policy())
+        self.assertIn("Current target mode: `restructure`.", prompt)
+        self.assertIn("Broader restructure is authorized", prompt)
+        self.assertIn("MODE: target restructure", prompt)
+        self.assertIn("WHAT YOU MAY EDIT:", prompt)
+        self.assertNotIn("DECOMPOSITION STRATEGY:", prompt)
+        self.assertNotIn("For each node, create two files", prompt)
+
+    def test_worker_prompt_with_target_hides_stale_freeform_next_prompt(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open", title="Main"),
+        })
+        state = SupervisorState(
+            cycle=2,
+            phase="theorem_stating",
+            theorem_soundness_target="main_thm",
+            last_review={"next_prompt": "Start with some unrelated slice first."},
+        )
+
+        prompt = build_theorem_stating_prompt(config, state, tablet, Policy())
+        self.assertIn("Focus this cycle on `main_thm`", prompt)
+        self.assertNotIn("Start with some unrelated slice first.", prompt)
+
+    def test_reviewer_prompt_requires_open_blockers(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open", title="Main"),
+        })
+        state = SupervisorState(
+            cycle=2,
+            phase="theorem_stating",
+            open_blockers=[
                 {
                     "node": "main_thm",
                     "phase": "correspondence",
@@ -420,10 +603,11 @@ class TestTheoremStatingPrompts(unittest.TestCase):
                 },
             }],
         )
-        self.assertIn("\"open_rejections\"", prompt)
+        self.assertIn("\"open_blockers\"", prompt)
+        self.assertIn("\"target_edit_mode\"", prompt)
         self.assertIn("\"paper_focus_ranges\"", prompt)
-        self.assertIn("Do NOT advance while `open_rejections` is non-empty.", prompt)
-        self.assertIn("PREVIOUS OPEN REJECTIONS", prompt)
+        self.assertIn("Do NOT advance while `open_blockers` is non-empty.", prompt)
+        self.assertIn("PREVIOUS OPEN BLOCKERS", prompt)
 
     def test_reviewer_prompt_includes_current_orphan_candidates(self):
         repo = Path(tempfile.mkdtemp())
@@ -445,6 +629,23 @@ class TestTheoremStatingPrompts(unittest.TestCase):
         self.assertIn("\"orphan_resolutions\"", prompt)
         self.assertIn("CURRENT ORPHAN CANDIDATES", prompt)
         self.assertIn("orphan_helper", prompt)
+
+    def test_theorem_reviewer_prompt_uses_phase_specific_skill_file(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open", title="Main"),
+        })
+
+        prompt = build_theorem_stating_reviewer_prompt(
+            config,
+            SupervisorState(cycle=2, phase="theorem_stating"),
+            tablet,
+            Policy(),
+        )
+        self.assertIn("THEOREM_STATING_REVIEWER.md", prompt)
 
     def test_reviewer_prompt_references_files_not_contents(self):
         repo = Path(tempfile.mkdtemp())
@@ -470,6 +671,149 @@ class TestTheoremStatingPrompts(unittest.TestCase):
         self.assertNotIn("UNIQUE_PAPER_SENTINEL_ABCDE", prompt)
         self.assertNotIn("UNIQUE_LEAN_SENTINEL_FGHIJ", prompt)
         self.assertNotIn("UNIQUE_TEX_SENTINEL_KLMNO", prompt)
+
+    def test_theorem_reviewer_prompt_includes_reject_biased_soundness_split_note(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open", title="Main"),
+        })
+
+        prompt = build_theorem_stating_reviewer_prompt(
+            config,
+            SupervisorState(cycle=2, phase="theorem_stating"),
+            tablet,
+            Policy(verification=VerificationPolicy(soundness_agent_selectors=("gemini", "codex"), soundness_disagree_bias="reject")),
+            nl_verification=[{
+                "check": "nl_proof",
+                "overall": "REJECT",
+                "summary": "Failed: ['main_thm']",
+                "node_verdicts": [{
+                    "node": "main_thm",
+                    "overall": "REJECT",
+                    "panel_split": True,
+                    "agent_results": [
+                        {"agent": "Gemini", "overall": "APPROVE"},
+                        {"agent": "Codex", "overall": "REJECT"},
+                    ],
+                }],
+            }],
+        )
+        self.assertIn("1-1 panel split", prompt)
+        self.assertIn("default to CONTINUE/REJECT", prompt)
+
+    def test_theorem_reviewer_prompt_surfaces_structural_soundness_objection(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open", title="Main"),
+        })
+
+        prompt = build_theorem_stating_reviewer_prompt(
+            config,
+            SupervisorState(cycle=2, phase="theorem_stating"),
+            tablet,
+            Policy(verification=VerificationPolicy(soundness_agent_selectors=("gemini", "codex"), soundness_disagree_bias="reject")),
+            nl_verification=[{
+                "check": "nl_proof",
+                "overall": "REJECT",
+                "summary": "Failed: ['main_thm']",
+                "node_verdicts": [{
+                    "node": "main_thm",
+                    "overall": "REJECT",
+                    "agent_results": [
+                        {"agent": "Gemini", "overall": "APPROVE", "soundness": {"decision": "SOUND"}},
+                        {"agent": "Codex", "overall": "REJECT", "soundness": {"decision": "STRUCTURAL"}},
+                    ],
+                }],
+            }],
+        )
+        self.assertIn("[soundness structural] main_thm", prompt)
+        self.assertIn("STRUCTURAL objection from Codex", prompt)
+
+    def test_theorem_reviewer_instructions_encourage_judicious_restructure(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open", title="Main"),
+        })
+
+        prompt = build_theorem_stating_reviewer_prompt(
+            config,
+            SupervisorState(cycle=2, phase="theorem_stating"),
+            tablet,
+            Policy(),
+        )
+        self.assertIn("richer DAG structure is generally good when it reflects real paper structure", prompt)
+        self.assertIn("take them seriously", prompt)
+        self.assertIn("You may override a `STRUCTURAL` objection", prompt)
+
+    def test_theorem_reviewer_prompt_says_missing_prereqs_require_restructure(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open", title="Main"),
+        })
+        state = SupervisorState(
+            cycle=2,
+            phase="theorem_stating",
+            theorem_soundness_target="main_thm",
+            theorem_target_edit_mode="repair",
+        )
+
+        prompt = build_theorem_stating_reviewer_prompt(
+            config,
+            state,
+            tablet,
+            Policy(),
+        )
+        self.assertIn("set `target_edit_mode` to `restructure`", prompt)
+
+    def test_theorem_reviewer_prompt_says_resolved_target_advances_automatically(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open", title="Main"),
+        })
+        state = SupervisorState(
+            cycle=2,
+            phase="theorem_stating",
+            theorem_soundness_target="main_thm",
+            theorem_target_edit_mode="repair",
+        )
+
+        prompt = build_theorem_stating_reviewer_prompt(
+            config,
+            state,
+            tablet,
+            Policy(),
+            nl_verification=[{
+                "check": "nl_proof",
+                "overall": "APPROVE",
+                "summary": "Passed: main_thm",
+                "node_verdicts": [{
+                    "node": "main_thm",
+                    "overall": "APPROVE",
+                    "agent_results": [
+                        {"agent": "Gemini", "overall": "APPROVE", "soundness": {"decision": "SOUND"}},
+                        {"agent": "Codex", "overall": "APPROVE", "soundness": {"decision": "SOUND"}},
+                    ],
+                }],
+            }],
+        )
+        self.assertIn("This target has passed NL proof soundness in the current cycle.", prompt)
+        self.assertIn("the next cycle will move automatically to the next unresolved target", prompt)
+        self.assertIn("reopened", prompt)
 
 
 class TestVerificationPrompt(unittest.TestCase):
@@ -529,6 +873,58 @@ class TestVerificationPrompt(unittest.TestCase):
         self.assertIn("paper", prompt.lower())  # references paper file path
         # Paper content is read from disk, not inlined
         self.assertIn("paper.tex", prompt)
+
+    def test_correspondence_prompt_includes_previous_and_current_for_changed_node(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True, text=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "t"], check=True, capture_output=True, text=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t"], check=True, capture_output=True, text=True)
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True, capture_output=True, text=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, text=True)
+        subprocess.run(["git", "-C", str(repo), "tag", "cycle-12"], check=True, capture_output=True, text=True)
+
+        (repo / "Tablet" / "main_thm.tex").write_text(
+            "\\begin{theorem}[Main]\nFor all $x$, $x = x$ and this is explicit.\n\\end{theorem}\n\n"
+            "\\begin{proof}\nBy reflexivity.\n\\end{proof}\n",
+            encoding="utf-8",
+        )
+
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(
+                name="main_thm",
+                kind="paper_main_result",
+                status="open",
+                correspondence_status="pass",
+                verification_at_cycle=12,
+            ),
+        })
+
+        prompt = build_correspondence_prompt(config, tablet, node_names=["main_thm"])
+        self.assertIn("CHANGE CONTEXT FOR THE NODE THAT REOPENED THIS FRONTIER", prompt)
+        self.assertIn("last verified in cycle-12", prompt)
+        self.assertIn("Previous NL statement block:", prompt)
+        self.assertIn("Current NL statement block:", prompt)
+        self.assertIn("For all $x$, $x = x$.", prompt)
+        self.assertIn("For all $x$, $x = x$ and this is explicit.", prompt)
+
+
+class TestNodeSoundnessPrompt(unittest.TestCase):
+
+    def test_single_node_prompt_uses_singular_language(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open"),
+        })
+
+        prompt = build_node_soundness_prompt(config, tablet, node_name="main_thm")
+        self.assertIn("For the node shown below, check:", prompt)
+        self.assertNotIn("For each node listed below, check:", prompt)
 
 
 if __name__ == "__main__":

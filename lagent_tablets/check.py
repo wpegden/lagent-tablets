@@ -95,6 +95,7 @@ THEOREM_REVIEWER_DECISIONS: Tuple[str, ...] = (
     "ADVANCE_PHASE",
     "NEED_INPUT",
 )
+THEOREM_TARGET_EDIT_MODES: Tuple[str, ...] = ("repair", "restructure")
 CORRESPONDENCE_DECISIONS: Tuple[str, ...] = ("PASS", "FAIL")
 BATCH_SOUNDNESS_DECISIONS: Tuple[str, ...] = ("PASS", "FAIL")
 NODE_SOUNDNESS_DECISIONS: Tuple[str, ...] = ("SOUND", "UNSOUND", "STRUCTURAL")
@@ -251,18 +252,29 @@ def run_print_axioms(
     """Run `#print axioms <decl>` against a temporary Lean file."""
     temp_path: Optional[Path] = None
     try:
+        temp_dir = repo / ".agent-supervisor" / "staging"
+        try:
+            temp_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            temp_dir = Path(tempfile.gettempdir()) / "lagent-tablets-check"
+            temp_dir.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(
             mode="w",
             suffix=".lean",
-            dir=str(repo),
+            dir=str(temp_dir),
             prefix=f"axioms_{name}_",
             delete=False,
             encoding="utf-8",
         ) as handle:
             handle.write(f"import Tablet.{name}\n#print axioms {name}\n")
             temp_path = Path(handle.name)
+        lean_arg = (
+            os.path.relpath(temp_path, repo)
+            if temp_path.is_relative_to(repo)
+            else str(temp_path)
+        )
         proc = subprocess.run(
-            ["lake", "env", "lean", temp_path.name],
+            ["lake", "env", "lean", lean_arg],
             capture_output=True,
             text=True,
             cwd=str(repo),
@@ -595,7 +607,7 @@ def validate_worker_handoff_data(data: Any, *, phase: str, repo: Optional[Path] 
 
 def validate_reviewer_decision_data(data: Any, *, phase: str) -> Dict[str, Any]:
     from lagent_tablets.state import (
-        normalize_open_rejections,
+        normalize_open_blockers,
         normalize_orphan_resolutions,
         normalize_paper_focus_ranges,
     )
@@ -648,15 +660,25 @@ def validate_reviewer_decision_data(data: Any, *, phase: str) -> Dict[str, Any]:
     else:
         issues, issues_errors = _expect_string_list(data.get("issues", []), "issues")
         errors.extend(issues_errors)
+        target_edit_mode, target_edit_mode_errors = _expect_string(
+            data.get("target_edit_mode", "repair"),
+            "target_edit_mode",
+        )
+        errors.extend(target_edit_mode_errors)
+        if target_edit_mode and target_edit_mode not in THEOREM_TARGET_EDIT_MODES:
+            errors.append(f"target_edit_mode must be one of {list(THEOREM_TARGET_EDIT_MODES)}")
         orphan_resolutions = normalize_orphan_resolutions(data.get("orphan_resolutions", []))
         if data.get("orphan_resolutions", []) != [] and not orphan_resolutions:
             errors.append("orphan_resolutions must be a list of valid orphan-resolution objects")
-        open_rejections = normalize_open_rejections(data.get("open_rejections", []))
-        if data.get("open_rejections", []) != [] and not open_rejections:
-            errors.append("open_rejections must be a list of valid rejection objects")
+        raw_open_blockers = data.get("open_blockers", data.get("open_rejections", []))
+        open_blockers = normalize_open_blockers(raw_open_blockers)
+        if raw_open_blockers != [] and not open_blockers:
+            errors.append("open_blockers must be a list of valid blocker objects")
         normalized["issues"] = issues
+        normalized["target_edit_mode"] = target_edit_mode or "repair"
         normalized["orphan_resolutions"] = orphan_resolutions
-        normalized["open_rejections"] = open_rejections
+        normalized["open_blockers"] = open_blockers
+        normalized["open_rejections"] = open_blockers
 
     if phase == "theorem_stating" and decision == "ADVANCE_PHASE" and not next_active_node:
         errors.append("next_active_node is required when decision is ADVANCE_PHASE")

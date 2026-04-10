@@ -1,6 +1,9 @@
 #!/bin/bash
 # Rewind to a specific cycle and stage, cleaning all artifacts.
-# Usage: ./scripts/rewind.sh <cycle> [stage] [repo_path] [config]
+# Usage: ./scripts/rewind.sh <cycle> [stage] [repo_path]
+# Optional env:
+#   FRESH_THEOREM_TARGET=1  Clear the persisted theorem-stating soundness target
+#                           so the resumed run selects a fresh deepest unresolved node.
 #   stage: verification (default), reviewer, or worker
 #
 # Example: ./scripts/rewind.sh 1 verification
@@ -12,6 +15,7 @@ CYCLE="${1:?Usage: rewind.sh <cycle> [stage] [repo_path]}"
 STAGE="${2:-verification}"
 REPO="${3:-/home/leanagent/math/extremal_vectors_tablets}"
 BURST_USER="${BURST_USER:-lagentworker}"
+FRESH_THEOREM_TARGET="${FRESH_THEOREM_TARGET:-0}"
 
 if [[ "$STAGE" != "verification" && "$STAGE" != "reviewer" && "$STAGE" != "worker" ]]; then
     echo "ERROR: stage must be 'verification', 'reviewer', or 'worker' (got '$STAGE')"
@@ -57,6 +61,7 @@ done
 echo "3. Cleaning ephemeral files..."
 rm -f "$REPO/.agent-supervisor/nl_cache.json"* \
       "$REPO/.agent-supervisor/pause" \
+      "$REPO/.agent-supervisor/restart" \
       "$REPO/.agent-supervisor/human_approve.json" \
       "$REPO/.agent-supervisor/human_feedback.json"
 # Result files (correspondence_result_*.json, etc.) are preserved in git history.
@@ -100,6 +105,9 @@ fi
 if [ -d "$REPO/.agent-supervisor/checkpoints" ]; then
     rm -rf "$REPO/.agent-supervisor/checkpoints"/*
 fi
+if [ -d "$REPO/.agent-supervisor/staging" ]; then
+    find "$REPO/.agent-supervisor/staging" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+fi
 
 # 4. Clean agent sessions (prevent context poisoning)
 echo "4. Clearing agent sessions..."
@@ -120,6 +128,7 @@ from lagent_tablets.state import normalize_open_rejections
 repo = Path(os.environ["REPO_ENV"])
 cycle = int(os.environ["CYCLE_ENV"])
 stage = os.environ["STAGE_ENV"]
+fresh_theorem_target = os.environ.get("FRESH_THEOREM_TARGET", "0") == "1"
 
 state_path = repo / ".agent-supervisor" / "state.json"
 state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -128,6 +137,9 @@ state["cycle"] = cycle
 state["resume_from"] = stage if stage != "worker" else ""
 state["agent_token_usage"] = {}
 state["awaiting_human_input"] = False
+if fresh_theorem_target and state.get("phase") == "theorem_stating":
+    state["theorem_soundness_target"] = ""
+    state["theorem_target_edit_mode"] = "repair"
 
 review_log = state.get("review_log", [])
 if isinstance(review_log, list):
@@ -190,6 +202,8 @@ else:
 
 state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
 print(f"  cycle={state['cycle']} phase={state['phase']} resume={state.get('resume_from','')}")
+if fresh_theorem_target and state.get("phase") == "theorem_stating":
+    print("  theorem_soundness_target cleared for fresh deepest-first replay")
 if stage == "worker" and state.get("phase") == "theorem_stating":
     print(f"  open_rejections={len(state.get('open_rejections', []))}")
 PY
@@ -211,9 +225,9 @@ with_verification = sum(
 print(f"  {len(nodes)} nodes, verification metadata preserved on {with_verification}")
 PY
 
-# 7. Clear stale viewer cache
-echo "7. Clearing viewer cache..."
-rm -f /home/leanagent/lagent-tablets-web/api/state-at/*.json
+# 7. Historical viewer snapshots are now sourced from git and legacy backfill.
+# No generated history cache reset is required here.
+echo "7. Viewer history snapshots preserved (git/backfill sourced)."
 
 echo ""
 echo "Done. To resume:"

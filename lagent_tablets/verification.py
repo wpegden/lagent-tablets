@@ -373,7 +373,29 @@ def write_scripts(
     import shutil
     check_src = Path(__file__).parent / "check.py"
     check_dst = scripts_dir / "check.py"
-    shutil.copy2(check_src, check_dst)
+    source_root = str(Path(__file__).resolve().parent.parent)
+    check_text = check_src.read_text(encoding="utf-8")
+    bootstrap = (
+        "import sys as _sys\n"
+        f"_src_root = {source_root!r}\n"
+        "if _src_root not in _sys.path:\n"
+        "    _sys.path.insert(0, _src_root)\n\n"
+    )
+    shebang = "#!/usr/bin/env python3\n"
+    if check_text.startswith(shebang):
+        body = check_text[len(shebang):]
+        prefix = shebang
+    else:
+        body = check_text
+        prefix = ""
+    future_line = "from __future__ import annotations\n"
+    if future_line in body:
+        body = body.replace(future_line, future_line + "\n" + bootstrap, 1)
+    else:
+        body = bootstrap + body
+    check_text = prefix + body
+    check_dst.write_text(check_text, encoding="utf-8")
+    shutil.copystat(check_src, check_dst)
     check_dst.chmod(0o755)
     try:
         os.chown(str(check_dst), -1, gid)

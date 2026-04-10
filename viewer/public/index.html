@@ -51,8 +51,15 @@ svg { width: 100%; height: 100%; }
 .node.open rect { fill: #2a2a3d; stroke: #6272a4; }
 .node.error rect { fill: #3d1a1a; stroke: #ff5555; }
 .node.selected rect { stroke-width: 3; }
-.edge { fill: none; stroke: #444; stroke-width: 1.5; }
+.node.correspondence-working rect { stroke: #f1fa8c !important; stroke-width: 3; }
+.edge { fill: none; stroke-width: 1.5; pointer-events: none; }
+.edge.edge-failed { stroke: #444; }
+.edge.edge-unknown { stroke: #a2a2a2; }
+.edge.edge-nl-pass { stroke: #bd93f9; }
 .edge.to-closed { stroke: #4a9eff; }
+.edge.active { stroke-width: 3.5; }
+.edge.soundness-working { stroke: #f1fa8c !important; stroke-width: 2.5; }
+.edge.soundness-working.active { stroke-width: 3.5; }
 
 /* Mobile: detail pane becomes a slide-up sheet */
 @media (max-width: 768px) {
@@ -177,20 +184,24 @@ function layoutDAG(nodes, edges) {
   return positions;
 }
 
-let allNodes = {}, allCycles = [], timelineSlots = [], selectedNode = null, currentState = {};
+let allNodes = {}, allCycles = [], timelineSlots = [], selectedNode = null, hoveredNode = null, currentState = {};
+
+async function fetchViewerState(url) {
+  const res = await fetch(url);
+  return res.json();
+}
 
 async function fetchData() {
-  const [nodesRes, stateRes, cyclesRes] = await Promise.all([
-    fetch('api/nodes.json').then(r => r.json()),
-    fetch('api/state.json').then(r => r.json()),
+  const [viewerRes, cyclesRes] = await Promise.all([
+    fetchViewerState('api/viewer-state.json'),
     fetch('api/cycles.json').then(r => r.json()),
   ]);
-  allNodes = nodesRes;
-  currentState = stateRes;
+  allNodes = viewerRes.nodes || {};
+  currentState = viewerRes;
   allCycles = cyclesRes;
 
   document.getElementById('header-status').textContent =
-    `Cycle ${stateRes.state.cycle} | Phase: ${stateRes.state.phase} | ${Object.values(nodesRes).filter(n => n.status === 'closed').length}/${Object.keys(nodesRes).length} closed`;
+    `Cycle ${viewerRes.state.cycle} | Phase: ${viewerRes.state.phase} | ${Object.values(allNodes).filter(n => n.status === 'closed').length}/${Object.keys(allNodes).length} closed`;
 
   // Setup slider
   const slider = document.getElementById('cycle-slider');
@@ -253,24 +264,6 @@ function renderDAG() {
 
   const ns = 'http://www.w3.org/2000/svg';
 
-  // Draw edges — style encodes soundness status of the importing (from) node
-  for (const [from, to] of edges) {
-    const p1 = positions[from], p2 = positions[to];
-    if (!p1 || !p2) continue;
-    const line = document.createElementNS(ns, 'line');
-    line.setAttribute('x1', p1.x); line.setAttribute('y1', p1.y + 20);
-    line.setAttribute('x2', p2.x); line.setAttribute('y2', p2.y - 20);
-    line.setAttribute('class', 'edge' + (allNodes[from]?.status === 'closed' ? ' to-closed' : ''));
-    line.setAttribute('marker-end', 'url(#arrow)');
-    // Soundness status of the importing node determines edge style
-    const fromNode = allNodes[from];
-    const proofStatus = fromNode?.verification?.nl_proof || '?';
-    if (proofStatus === 'fail') line.setAttribute('stroke-dasharray', '2 3');       // dotted
-    else if (proofStatus === '?') line.setAttribute('stroke-dasharray', '8 4');     // dashed
-    // else solid
-    svg.appendChild(line);
-  }
-
   // Arrow marker
   const defs = document.createElementNS(ns, 'defs');
   const marker = document.createElementNS(ns, 'marker');
@@ -279,8 +272,38 @@ function renderDAG() {
   marker.setAttribute('markerWidth', '8'); marker.setAttribute('markerHeight', '8');
   marker.setAttribute('orient', 'auto-start-reverse');
   const arrowPath = document.createElementNS(ns, 'path');
-  arrowPath.setAttribute('d', 'M 0 0 L 10 5 L 0 10 z'); arrowPath.setAttribute('fill', '#444');
+  arrowPath.setAttribute('d', 'M 0 0 L 10 5 L 0 10 z');
+  arrowPath.setAttribute('fill', 'context-stroke');
   marker.appendChild(arrowPath); defs.appendChild(marker); svg.appendChild(defs);
+
+  // Draw edges — style encodes soundness status of the importing (from) node.
+  // Since dependencies sit above their importers in the layered layout, draw
+  // each edge from the top of the lower node to the bottom of the upper node
+  // so the arrowhead remains visible outside the target box.
+  for (const [from, to] of edges) {
+    const p1 = positions[from], p2 = positions[to];
+    if (!p1 || !p2) continue;
+    const fromNode = allNodes[from];
+    const soundnessWorking = !!fromNode?.activity?.soundness;
+    const proofStatus = fromNode?.verification?.nl_proof || '?';
+    const edgeStatusClass =
+      allNodes[from]?.status === 'closed' ? ' to-closed' :
+      (proofStatus === 'pass' ? ' edge-nl-pass' :
+       (proofStatus === 'fail' || proofStatus === 'structural' ? ' edge-failed' : ' edge-unknown'));
+    const line = document.createElementNS(ns, 'line');
+    line.setAttribute('x1', p1.x); line.setAttribute('y1', p1.y - 20);
+    line.setAttribute('x2', p2.x); line.setAttribute('y2', p2.y + 20);
+    line.setAttribute(
+      'class',
+      'edge'
+      + edgeStatusClass
+      + (soundnessWorking ? ' soundness-working' : '')
+    );
+    line.setAttribute('marker-end', 'url(#arrow)');
+    line.dataset.from = from;
+    line.dataset.to = to;
+    svg.appendChild(line);
+  }
 
   // Draw nodes
   for (const [name, pos] of Object.entries(positions)) {
@@ -290,10 +313,23 @@ function renderDAG() {
 
     const g = document.createElementNS(ns, 'g');
     const diffCls = (node.difficulty === 'easy') ? 'easy' : 'hard';
-    g.setAttribute('class', `node ${cls} ${diffCls}` + (selectedNode === name ? ' selected' : ''));
+    g.setAttribute(
+      'class',
+      `node ${cls} ${diffCls}`
+      + (selectedNode === name ? ' selected' : '')
+      + (node.activity?.correspondence ? ' correspondence-working' : '')
+    );
     g.setAttribute('transform', `translate(${pos.x - 90}, ${pos.y - 20})`);
     g.style.cursor = 'pointer';
     g.onclick = () => selectNode(name);
+    g.onmouseenter = () => {
+      hoveredNode = name;
+      updateEdgeEmphasis();
+    };
+    g.onmouseleave = () => {
+      if (hoveredNode === name) hoveredNode = null;
+      updateEdgeEmphasis();
+    };
 
     const rect = document.createElementNS(ns, 'rect');
     rect.setAttribute('width', 180); rect.setAttribute('height', 40);
@@ -331,9 +367,10 @@ function renderDAG() {
     if (corrStatus === 'fail') rect.setAttribute('stroke-dasharray', '2 3');       // dotted
     else if (corrStatus === '?') rect.setAttribute('stroke-dasharray', '8 4');     // dashed
     // else solid (no dasharray)
-
     svg.appendChild(g);
   }
+
+  updateEdgeEmphasis();
 }
 
 function selectNode(name) {
@@ -346,6 +383,14 @@ function selectNode(name) {
   renderDetail(name);
   // Open mobile detail sheet
   document.getElementById('detail-pane').classList.add('mobile-open');
+}
+
+function updateEdgeEmphasis() {
+  const active = hoveredNode || selectedNode;
+  document.querySelectorAll('#dag-svg .edge').forEach(edge => {
+    const dependencyEdge = active && edge.dataset.from === active;
+    edge.classList.toggle('active', !!dependencyEdge);
+  });
 }
 
 function renderDetail(name) {
@@ -386,7 +431,8 @@ function renderDetail(name) {
         (node.verification.correspondence === 'fail' ? '<span style="color:#ff5555">Correspondence: FAIL</span>' :
          node.verification.correspondence === 'pass' ? '<span style="color:#50fa7b">Correspondence: PASS</span>' : 'Correspondence: ?') +
         '<br>' +
-        (node.verification.nl_proof === 'fail' ? '<span style="color:#ff5555">NL Proof: FAIL</span>' :
+        (node.verification.nl_proof === 'structural' ? '<span style="color:#ff5555">NL Proof: STRUCTURAL</span>' :
+         node.verification.nl_proof === 'fail' ? '<span style="color:#ff5555">NL Proof: FAIL</span>' :
          node.verification.nl_proof === 'pass' ? '<span style="color:#50fa7b">NL Proof: PASS</span>' : 'NL Proof: ?')
       }</div>
       ${node.verification.correspondence_issue ? `<div class="field-value collapsible" onclick="this.classList.toggle('expanded')" style="color:#ff5555;font-size:11px;margin-top:4px">${escHtml(node.verification.correspondence_issue)}</div>` : ''}
@@ -421,12 +467,9 @@ async function updateCycleInfo() {
   if (isLatest) {
     // Show current live state
     info.textContent = `Current (live, state cycle ${currentState.state?.cycle ?? '?'})`;
-    const [nodesRes, stateRes] = await Promise.all([
-      fetch('api/nodes.json').then(r => r.json()),
-      fetch('api/state.json').then(r => r.json()),
-    ]);
-    allNodes = nodesRes;
-    currentState = stateRes;
+    const live = await fetchViewerState('api/viewer-state.json');
+    allNodes = live.nodes || {};
+    currentState = live;
     renderDAG();
     return;
   }
@@ -444,8 +487,8 @@ async function updateCycleInfo() {
     const resp = await fetch(`api/state-at/${val}.json`);
     if (resp.ok) {
       const data = await resp.json();
-      allNodes = data.nodes;
-      currentState = { state: data.state, tablet: data.tablet };
+      allNodes = data.nodes || {};
+      currentState = data;
       const svg = document.getElementById('dag-svg');
       const savedVB = svg.getAttribute('viewBox');
       renderDAG();

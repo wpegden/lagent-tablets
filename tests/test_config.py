@@ -166,6 +166,7 @@ class TestPolicyManager(unittest.TestCase):
         policy = pm.current()
         self.assertEqual(policy.stuck_recovery.mainline_max_attempts, 10)
         self.assertEqual(policy.timing.sleep_seconds, 1.0)
+        self.assertEqual(policy.verification.soundness_disagree_bias, "reject")
         self.assertTrue((tmpdir / "policy.json").exists())
 
     def test_reloads_on_change(self):
@@ -219,6 +220,34 @@ class TestPolicyManager(unittest.TestCase):
         p2 = pm.reload(force=True)
         # Should keep old value
         self.assertEqual(p2.stuck_recovery.mainline_max_attempts, 7)
+
+    def test_reloads_verification_agent_policy(self):
+        tmpdir = Path(tempfile.mkdtemp())
+        policy_path = tmpdir / "policy.json"
+        policy_path.write_text(json.dumps({
+            "verification": {
+                "correspondence_agent_selectors": ["claude", "gemini", "codex"],
+                "soundness_agent_selectors": ["gemini", "codex"],
+                "soundness_disagree_bias": "reject",
+            }
+        }))
+        from lagent_tablets.config import Config, ProviderConfig, TmuxConfig, WorkflowConfig, ChatConfig, GitConfig, VerificationConfig
+        config = Config(
+            repo_path=tmpdir, goal_file=tmpdir / "GOAL.md", state_dir=tmpdir,
+            worker=ProviderConfig(provider="claude"), reviewer=ProviderConfig(provider="claude"),
+            verification=VerificationConfig(),
+            tmux=TmuxConfig(session_name="t", dashboard_window_name="d", kill_windows_after_capture=True, burst_user="u"),
+            workflow=WorkflowConfig(start_phase="paper_check", paper_tex_path=None, approved_axioms_path=tmpdir / "ax.json", allowed_import_prefixes=["Mathlib"], forbidden_keyword_allowlist=[], human_input_path=tmpdir / "h.md", input_request_path=tmpdir / "i.md"),
+            chat=ChatConfig(root_dir=tmpdir, repo_name="test", project_name="test", public_base_url="http://x"),
+            git=GitConfig(remote_url=None, remote_name="origin", branch="main", author_name="test", author_email="test@test"),
+            max_cycles=0, sleep_seconds=1.0, startup_timeout_seconds=60.0, burst_timeout_seconds=600.0,
+            policy_path=policy_path,
+        )
+        pm = PolicyManager(config)
+        policy = pm.current()
+        self.assertEqual(policy.verification.correspondence_agent_selectors, ("claude", "gemini", "codex"))
+        self.assertEqual(policy.verification.soundness_agent_selectors, ("gemini", "codex"))
+        self.assertEqual(policy.verification.soundness_disagree_bias, "reject")
 
 
 class TestConfigManager(unittest.TestCase):

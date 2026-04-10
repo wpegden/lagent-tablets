@@ -22,7 +22,9 @@ except ImportError:
     fcntl = None  # type: ignore[assignment]
 
 T = TypeVar("T")
-OPEN_REJECTION_PHASES = ("correspondence", "paper_faithfulness")
+OPEN_BLOCKER_PHASES = ("correspondence", "paper_faithfulness", "soundness")
+# Backward-compatible alias for older code/tests/state.
+OPEN_REJECTION_PHASES = OPEN_BLOCKER_PHASES
 ORPHAN_RESOLUTION_ACTIONS = ("remove", "keep_and_add_dependency")
 
 
@@ -97,12 +99,11 @@ def timestamp_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def normalize_open_rejections(raw: Any) -> List[Dict[str, str]]:
-    """Normalize stored theorem-stating rejection entries.
+def normalize_open_blockers(raw: Any) -> List[Dict[str, str]]:
+    """Normalize stored theorem-stating blocker entries.
 
-    Each entry tracks one currently open correspondence or paper-faithfulness
-    rejection that the theorem-stating worker must address before the phase can
-    advance.
+    Each entry tracks one currently open theorem-stating blocker that the
+    worker must address before the phase can advance.
     """
     if not isinstance(raw, list):
         return []
@@ -115,7 +116,7 @@ def normalize_open_rejections(raw: Any) -> List[Dict[str, str]]:
         node = str(item.get("node", "")).strip() or "(global)"
         phase = str(item.get("phase", "")).strip()
         reason = str(item.get("reason", "")).strip()
-        if phase not in OPEN_REJECTION_PHASES or not reason:
+        if phase not in OPEN_BLOCKER_PHASES or not reason:
             continue
         key = (node, phase)
         if key in seen:
@@ -127,6 +128,11 @@ def normalize_open_rejections(raw: Any) -> List[Dict[str, str]]:
             "reason": reason,
         })
     return normalized
+
+
+def normalize_open_rejections(raw: Any) -> List[Dict[str, str]]:
+    """Backward-compatible alias for legacy field naming."""
+    return normalize_open_blockers(raw)
 
 
 def normalize_orphan_resolutions(
@@ -225,7 +231,10 @@ class TabletNode:
     correspondence_status: str = "?"  # "?", "pass", "fail"
     soundness_status: str = "?"       # "?", "pass", "fail", "structural"
     verification_at_cycle: Optional[int] = None  # when status was last set
-    verification_content_hash: str = ""  # hash of .lean+.tex when status was set
+    correspondence_text_hash: str = ""  # conservative text-level hash for fast correspondence invalidation
+    correspondence_content_hash: str = ""  # statement-level hash when correspondence was set
+    soundness_content_hash: str = ""       # full NL-proof hash when soundness was set
+    verification_content_hash: str = ""    # legacy combined hash for backward compatibility
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -250,8 +259,18 @@ class TabletNode:
             d["soundness_status"] = self.soundness_status
         if self.verification_at_cycle is not None:
             d["verification_at_cycle"] = self.verification_at_cycle
+        if self.correspondence_text_hash:
+            d["correspondence_text_hash"] = self.correspondence_text_hash
+        if self.correspondence_content_hash:
+            d["correspondence_content_hash"] = self.correspondence_content_hash
+        if self.soundness_content_hash:
+            d["soundness_content_hash"] = self.soundness_content_hash
         if self.verification_content_hash:
             d["verification_content_hash"] = self.verification_content_hash
+        elif self.soundness_content_hash:
+            d["verification_content_hash"] = self.soundness_content_hash
+        elif self.correspondence_content_hash:
+            d["verification_content_hash"] = self.correspondence_content_hash
         return d
 
     @classmethod
@@ -259,6 +278,10 @@ class TabletNode:
         diff = str(raw.get("difficulty", "hard"))
         if diff not in ("easy", "hard"):
             diff = "hard"
+        legacy_hash = str(raw.get("verification_content_hash", ""))
+        correspondence_text_hash = str(raw.get("correspondence_text_hash", ""))
+        correspondence_hash = str(raw.get("correspondence_content_hash", legacy_hash))
+        soundness_hash = str(raw.get("soundness_content_hash", legacy_hash))
         return cls(
             name=name,
             kind=str(raw.get("kind", "helper_lemma")),
@@ -273,7 +296,10 @@ class TabletNode:
             correspondence_status=str(raw.get("correspondence_status", "?")),
             soundness_status=str(raw.get("soundness_status", "?")),
             verification_at_cycle=raw.get("verification_at_cycle"),
-            verification_content_hash=str(raw.get("verification_content_hash", "")),
+            correspondence_text_hash=correspondence_text_hash,
+            correspondence_content_hash=correspondence_hash,
+            soundness_content_hash=soundness_hash,
+            verification_content_hash=legacy_hash or soundness_hash or correspondence_hash,
         )
 
 
@@ -366,9 +392,12 @@ class SupervisorState:
     cycle: int = 0
     phase: str = "paper_check"
     active_node: str = ""
+    theorem_soundness_target: str = ""
+    theorem_target_edit_mode: str = "repair"
+    theorem_correspondence_blocked: bool = False
     last_worker_handoff: Optional[Dict[str, Any]] = None
     last_review: Optional[Dict[str, Any]] = None
-    open_rejections: List[Dict[str, str]] = field(default_factory=list)
+    open_blockers: List[Dict[str, str]] = field(default_factory=list)
     review_log: List[Dict[str, Any]] = field(default_factory=list)
     validation_summary: Optional[Dict[str, Any]] = None
     stuck_recovery_attempts: List[Dict[str, Any]] = field(default_factory=list)
@@ -384,9 +413,13 @@ class SupervisorState:
             "cycle": self.cycle,
             "phase": self.phase,
             "active_node": self.active_node,
+            "theorem_soundness_target": self.theorem_soundness_target,
+            "theorem_target_edit_mode": self.theorem_target_edit_mode,
+            "theorem_correspondence_blocked": self.theorem_correspondence_blocked,
             "last_worker_handoff": self.last_worker_handoff,
             "last_review": self.last_review,
-            "open_rejections": self.open_rejections,
+            "open_blockers": self.open_blockers,
+            "open_rejections": self.open_blockers,
             "review_log": self.review_log,
             "validation_summary": self.validation_summary,
             "stuck_recovery_attempts": self.stuck_recovery_attempts,
@@ -402,13 +435,21 @@ class SupervisorState:
     def from_dict(cls, raw: Any) -> SupervisorState:
         if not isinstance(raw, dict):
             return cls()
+        theorem_target_edit_mode = str(raw.get("theorem_target_edit_mode", "repair") or "repair")
+        if theorem_target_edit_mode not in {"repair", "restructure"}:
+            theorem_target_edit_mode = "repair"
         return cls(
             cycle=int(raw.get("cycle", 0)),
             phase=str(raw.get("phase", "paper_check")),
             active_node=str(raw.get("active_node", "")),
+            theorem_soundness_target=str(raw.get("theorem_soundness_target", "")),
+            theorem_target_edit_mode=theorem_target_edit_mode,
+            theorem_correspondence_blocked=bool(raw.get("theorem_correspondence_blocked", False)),
             last_worker_handoff=raw.get("last_worker_handoff"),
             last_review=raw.get("last_review"),
-            open_rejections=normalize_open_rejections(raw.get("open_rejections", [])),
+            open_blockers=normalize_open_blockers(
+                raw.get("open_blockers", raw.get("open_rejections", []))
+            ),
             review_log=list(raw.get("review_log", [])),
             validation_summary=raw.get("validation_summary"),
             stuck_recovery_attempts=list(raw.get("stuck_recovery_attempts", [])),
@@ -419,6 +460,15 @@ class SupervisorState:
             agent_token_usage=dict(raw.get("agent_token_usage", {})),
             resume_from=str(raw.get("resume_from", "")),
         )
+
+    @property
+    def open_rejections(self) -> List[Dict[str, str]]:
+        """Backward-compatible alias for legacy callers."""
+        return self.open_blockers
+
+    @open_rejections.setter
+    def open_rejections(self, value: List[Dict[str, str]]) -> None:
+        self.open_blockers = normalize_open_blockers(value)
 
 
 def state_path(config_or_state_dir: Any) -> Path:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import py_compile
 import tempfile
 import unittest
 from pathlib import Path
@@ -105,6 +106,16 @@ class TestScriptGeneration(unittest.TestCase):
         # Check they're executable
         import os
         self.assertTrue(os.access(state / "scripts" / "check_node.sh", os.X_OK))
+
+    def test_generated_check_py_compiles(self):
+        repo = Path(tempfile.mkdtemp())
+        state = Path(tempfile.mkdtemp())
+        write_scripts(
+            repo, state,
+            allowed_prefixes=["Mathlib"],
+            forbidden_keywords=FORBIDDEN_KEYWORDS_DEFAULT,
+        )
+        py_compile.compile(str(state / "scripts" / "check.py"), doraise=True)
 
     def test_scripts_include_custom_prefixes(self):
         repo = Path(tempfile.mkdtemp())

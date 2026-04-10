@@ -1,12 +1,8 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { execSync } = require('child_process');
-const {
-  buildVerifiedNodes,
-  createFsSnapshot,
-  createGitSnapshot,
-} = require('./state');
 
 const app = express();
 const PORT = process.env.PORT || 3300;
@@ -15,12 +11,43 @@ const BASE = process.env.BASE_PATH || '/lagent-tablets';
 // Default repo path
 const REPO_PATH = process.env.REPO_PATH || '/home/leanagent/math/connectivity_gnp_tablets';
 const STATE_DIR = path.join(REPO_PATH, '.agent-supervisor');
+const VIEWER_STATE_PATH = path.join(STATE_DIR, 'viewer_state.json');
 
 // Also write static files for nginx serving
 const STATIC_OUT = process.env.STATIC_OUT || '/home/leanagent/lagent-tablets-web';
 
+function repoCacheSlug() {
+  const digest = crypto.createHash('sha1').update(REPO_PATH).digest('hex').slice(0, 10);
+  return `${path.basename(REPO_PATH)}-${digest}`;
+}
+
+function backfillStateAtPath(cycle) {
+  return path.join(STATIC_OUT, 'api', 'backfill', repoCacheSlug(), 'state-at', `${cycle}.json`);
+}
+
+function readJsonFile(filePath) {
+  return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+}
+
 function git(args) {
   return execSync(`git ${args}`, { cwd: REPO_PATH, encoding: 'utf-8', timeout: 10000 }).trim();
+}
+
+function readLiveViewerState() {
+  return readJsonFile(VIEWER_STATE_PATH);
+}
+
+function readHistoricalViewerState(cycle) {
+  const tag = `cycle-${cycle}`;
+  try {
+    const raw = git(`show ${tag}:.agent-supervisor/viewer_state.json`);
+    return JSON.parse(raw);
+  } catch {}
+  const fallback = backfillStateAtPath(cycle);
+  if (fs.existsSync(fallback)) {
+    return readJsonFile(fallback);
+  }
+  throw new Error(`No viewer_state snapshot found for cycle ${cycle}`);
 }
 
 function getCyclesFromGit() {
@@ -78,22 +105,16 @@ function writeJsonIfChanged(filePath, value) {
 function writeStatic() {
   try {
     fs.mkdirSync(path.join(STATIC_OUT, 'api'), { recursive: true });
-    const liveSnapshot = createFsSnapshot(REPO_PATH);
+    const live = readLiveViewerState();
 
-    // State
-    const state = JSON.parse(fs.readFileSync(path.join(STATE_DIR, 'state.json'), 'utf-8'));
-    const tablet = JSON.parse(fs.readFileSync(path.join(STATE_DIR, 'tablet.json'), 'utf-8'));
-    writeJsonIfChanged(path.join(STATIC_OUT, 'api', 'state.json'), { state, tablet });
+    writeJsonIfChanged(path.join(STATIC_OUT, 'api', 'viewer-state.json'), live);
 
     // Cycles from git
     const cycles = getCyclesFromGit();
     writeJsonIfChanged(path.join(STATIC_OUT, 'api', 'cycles.json'), cycles);
 
-    // Nodes (with verification status)
-    const nodes = buildVerifiedNodes(tablet, liveSnapshot);
-    writeJsonIfChanged(path.join(STATIC_OUT, 'api', 'nodes.json'), nodes);
-
-    // Generate state-at files for each cycle in git
+    // Generate state-at files by copying committed viewer_state snapshots
+    // (or legacy backfill cache for pre-cutover cycles).
     const stateAtDir = path.join(STATIC_OUT, 'api', 'state-at');
     fs.mkdirSync(stateAtDir, { recursive: true });
     try {
@@ -102,13 +123,7 @@ function writeStatic() {
         const cycleNum = parseInt(tag.replace('cycle-', ''), 10);
         const outFile = path.join(stateAtDir, `${cycleNum}.json`);
         try {
-          const tabletRaw = git(`show ${tag}:.agent-supervisor/tablet.json`);
-          const stateRaw = git(`show ${tag}:.agent-supervisor/state.json`);
-          const histTablet = JSON.parse(tabletRaw);
-          const histState = JSON.parse(stateRaw);
-          const histSnapshot = createGitSnapshot(REPO_PATH, tag);
-          const histNodes = buildVerifiedNodes(histTablet, histSnapshot);
-          writeJsonIfChanged(outFile, { state: histState, tablet: histTablet, nodes: histNodes });
+          writeJsonIfChanged(outFile, readHistoricalViewerState(cycleNum));
         } catch {}
       }
     } catch {}
@@ -128,11 +143,9 @@ function writeStatic() {
 app.use(BASE, express.static(path.join(__dirname, 'public')));
 
 // API endpoints (also at base path)
-app.get(`${BASE}/api/state.json`, (req, res) => {
+app.get(`${BASE}/api/viewer-state.json`, (req, res) => {
   try {
-    const state = JSON.parse(fs.readFileSync(path.join(STATE_DIR, 'state.json'), 'utf-8'));
-    const tablet = JSON.parse(fs.readFileSync(path.join(STATE_DIR, 'tablet.json'), 'utf-8'));
-    res.json({ state, tablet });
+    res.json(readLiveViewerState());
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -142,25 +155,11 @@ app.get(`${BASE}/api/cycles.json`, (req, res) => {
   } catch { res.json([]); }
 });
 
-app.get(`${BASE}/api/nodes.json`, (req, res) => {
-  try {
-    const tablet = JSON.parse(fs.readFileSync(path.join(STATE_DIR, 'tablet.json'), 'utf-8'));
-    const nodes = buildVerifiedNodes(tablet, createFsSnapshot(REPO_PATH));
-    res.json(nodes);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
 app.get(`${BASE}/api/state-at/:cycle`, (req, res) => {
-  const cycle = parseInt(req.params.cycle, 10);
+  const cycle = parseInt(String(req.params.cycle).replace(/\.json$/, ''), 10);
   if (isNaN(cycle)) return res.status(400).json({ error: 'Invalid cycle' });
   try {
-    const tag = `cycle-${cycle}`;
-    const tabletRaw = git(`show ${tag}:.agent-supervisor/tablet.json`);
-    const stateRaw = git(`show ${tag}:.agent-supervisor/state.json`);
-    const tablet = JSON.parse(tabletRaw);
-    const state = JSON.parse(stateRaw);
-    const nodes = buildVerifiedNodes(tablet, createGitSnapshot(REPO_PATH, tag));
-    res.json({ state, tablet, nodes });
+    res.json(readHistoricalViewerState(cycle));
   } catch (e) {
     res.status(404).json({ error: `Cycle ${cycle} not found: ${e.message}` });
   }
@@ -322,7 +321,7 @@ app.get(`${BASE}/api/feedback`, (req, res) => {
     const awaiting = state.awaiting_human_input || false;
     const phase = state.phase || '';
     const lastReview = state.last_review || {};
-    const humanInput = '';
+    let humanInput = '';
     try { humanInput = fs.readFileSync(path.join(REPO_PATH, 'HUMAN_INPUT.md'), 'utf-8'); } catch {}
 
     res.json({

@@ -198,6 +198,7 @@ class TestEasyModePermissions(unittest.TestCase):
         # Create a minimal config mock
         config = type("Config", (), {
             "repo_path": self.repo,
+            "state_dir": self.repo / ".agent-supervisor",
             "tmux": type("Tmux", (), {"burst_user": "lagentworker"})(),
         })()
         setup_permissions(config, "active_node", easy_mode=True)
@@ -217,6 +218,7 @@ class TestEasyModePermissions(unittest.TestCase):
         from lagent_tablets.cycle import setup_permissions
         config = type("Config", (), {
             "repo_path": self.repo,
+            "state_dir": self.repo / ".agent-supervisor",
             "tmux": type("Tmux", (), {"burst_user": "lagentworker"})(),
         })()
         setup_permissions(config, "active_node", easy_mode=False)
@@ -232,6 +234,7 @@ class TestEasyModePermissions(unittest.TestCase):
         from lagent_tablets.cycle import setup_permissions
         config = type("Config", (), {
             "repo_path": self.repo,
+            "state_dir": self.repo / ".agent-supervisor",
             "tmux": type("Tmux", (), {"burst_user": "lagentworker"})(),
         })()
         setup_permissions(config, "active_node", easy_mode=True)
@@ -239,21 +242,20 @@ class TestEasyModePermissions(unittest.TestCase):
         self.assertEqual(preamble_mode, 0o644,
                          f"Preamble should be 0o644 in easy mode, got {oct(preamble_mode)}")
 
-    def test_easy_mode_active_node_writable(self):
-        """Active node files should still be group-writable in easy mode."""
+    def test_easy_mode_only_active_lean_is_writable(self):
+        """In easy mode, only the active .lean file should be group-writable."""
         if not self._can_test_permissions():
             self.skipTest("leanagent group not available")
 
         from lagent_tablets.cycle import setup_permissions
         config = type("Config", (), {
             "repo_path": self.repo,
+            "state_dir": self.repo / ".agent-supervisor",
             "tmux": type("Tmux", (), {"burst_user": "lagentworker"})(),
         })()
         setup_permissions(config, "active_node", easy_mode=True)
-        for fname in ("active_node.lean", "active_node.tex"):
-            mode = (self.tablet / fname).stat().st_mode & 0o777
-            self.assertEqual(mode, 0o664,
-                             f"{fname} should be 0o664 in easy mode, got {oct(mode)}")
+        self.assertEqual((self.tablet / "active_node.lean").stat().st_mode & 0o777, 0o664)
+        self.assertEqual((self.tablet / "active_node.tex").stat().st_mode & 0o777, 0o644)
 
     def test_hard_mode_preamble_writable(self):
         """In hard mode, Preamble.lean should be 0o664 (group-writable)."""
@@ -263,12 +265,69 @@ class TestEasyModePermissions(unittest.TestCase):
         from lagent_tablets.cycle import setup_permissions
         config = type("Config", (), {
             "repo_path": self.repo,
+            "state_dir": self.repo / ".agent-supervisor",
             "tmux": type("Tmux", (), {"burst_user": "lagentworker"})(),
         })()
         setup_permissions(config, "active_node", easy_mode=False)
         preamble_mode = (self.tablet / "Preamble.lean").stat().st_mode & 0o777
         self.assertEqual(preamble_mode, 0o664,
                          f"Preamble should be 0o664 in hard mode, got {oct(preamble_mode)}")
+
+
+class TestTheoremTargetRepairPermissions(unittest.TestCase):
+    """Test theorem-stating target repair permissions."""
+
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp())
+        self.repo = self.tmpdir / "repo"
+        self.tablet = self.repo / "Tablet"
+        self.tablet.mkdir(parents=True)
+        (self.tablet / "target.lean").write_text("theorem target := sorry")
+        (self.tablet / "target.tex").write_text("\\begin{theorem}...\\end{theorem}")
+        (self.tablet / "child.lean").write_text("theorem child := sorry")
+        (self.tablet / "child.tex").write_text("\\begin{lemma}...\\end{lemma}")
+        (self.tablet / "Preamble.lean").write_text("import Mathlib.Data.Nat.Basic")
+        (self.repo / ".agent-supervisor" / "staging").mkdir(parents=True)
+
+    def _can_test_permissions(self):
+        try:
+            grp.getgrnam("leanagent").gr_gid
+            return True
+        except KeyError:
+            return False
+
+    def test_repair_mode_locks_tablet_dir_and_only_target_tex_is_writable(self):
+        if not self._can_test_permissions():
+            self.skipTest("leanagent group not available")
+
+        from lagent_tablets.cycle import _setup_theorem_stating_permissions
+
+        config = type("Config", (), {
+            "repo_path": self.repo,
+            "state_dir": self.repo / ".agent-supervisor",
+        })()
+        _setup_theorem_stating_permissions(config, target="target", repair_mode=True)
+        self.assertFalse(self.tablet.stat().st_mode & stat.S_IWGRP)
+        self.assertEqual((self.tablet / "target.tex").stat().st_mode & 0o777, 0o664)
+        self.assertEqual((self.tablet / "target.lean").stat().st_mode & 0o777, 0o644)
+        self.assertEqual((self.tablet / "child.tex").stat().st_mode & 0o777, 0o644)
+        self.assertEqual((self.tablet / "Preamble.lean").stat().st_mode & 0o777, 0o644)
+
+    def test_restructure_mode_keeps_tablet_writable(self):
+        if not self._can_test_permissions():
+            self.skipTest("leanagent group not available")
+
+        from lagent_tablets.cycle import _setup_theorem_stating_permissions
+
+        config = type("Config", (), {
+            "repo_path": self.repo,
+            "state_dir": self.repo / ".agent-supervisor",
+        })()
+        _setup_theorem_stating_permissions(config, target="target", repair_mode=False)
+        self.assertTrue(self.tablet.stat().st_mode & stat.S_IWGRP)
+        self.assertEqual((self.tablet / "target.tex").stat().st_mode & 0o777, 0o664)
+        self.assertEqual((self.tablet / "target.lean").stat().st_mode & 0o777, 0o664)
+        self.assertEqual((self.tablet / "child.tex").stat().st_mode & 0o777, 0o664)
 
 
 # ---------------------------------------------------------------------------
@@ -464,6 +523,24 @@ class TestEasyModeImportValidation(unittest.TestCase):
         imports_after = set(extract_tablet_imports(content))
         new_imports = imports_after - imports_before
         self.assertEqual(new_imports, set())
+
+    def test_any_import_change_is_forbidden_in_easy_mode(self):
+        from lagent_tablets.tablet import extract_imports
+        before_content = (
+            "import Mathlib.Data.Nat.Basic\n"
+            "import Tablet.Preamble\n"
+            "import Tablet.child_a\n\n"
+            "theorem x : True := by\n  sorry\n"
+        )
+        after_content = (
+            "import Mathlib.Data.Nat.Basic\n"
+            "import Tablet.Preamble\n\n"
+            "theorem x : True := by\n  sorry\n"
+        )
+        self.assertNotEqual(
+            extract_imports(before_content),
+            extract_imports(after_content),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -746,6 +823,7 @@ class TestMultiCorrespondencePrompt(unittest.TestCase):
         # Minimal config mock
         config = type("Config", (), {
             "repo_path": repo,
+            "state_dir": repo / ".agent-supervisor",
             "goal_file": repo / "GOAL.md",
             "workflow": type("WF", (), {"paper_tex_path": None})(),
         })()

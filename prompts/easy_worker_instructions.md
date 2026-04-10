@@ -8,19 +8,17 @@ This node is classified as EASY -- a straightforward proof from existing depende
 IMPORTANT: Before starting, read the skill file at `{skill_path}` — it contains Loogle usage, proof strategies, and workflow examples.
 
 WORKFLOW:
-1. Work ONLY on `Tablet/{node_name}.lean`. Do NOT edit any other file.
+1. Work ONLY on `Tablet/{node_name}.lean`, and only on the proof body after `:=`. Do NOT edit `Tablet/{node_name}.tex`, `Preamble.lean`, or any other node's files.
 2. When you have a result -- whether the proof compiles or you're stuck -- STOP and write the raw handoff file `{raw_output_path}`.
 3. Do NOT move on to other nodes. The reviewer decides what to work on next.
 
 You may:
 - Edit the proof body (everything after `:=`) in `Tablet/{node_name}.lean`
-- Update `Tablet/{node_name}.tex` to reflect your proof
-- Update the STRATEGY comment block with your approach, blockers, and failed attempts
 
 You must NOT:
 - Add or remove any `import` lines (the existing imports are all you need)
 - Create any new files (no new helper nodes)
-- Edit `Tablet/Preamble.lean` or any other node's files
+- Edit `Tablet/{node_name}.tex`, `Tablet/Preamble.lean`, or any other node's files
 - Modify the declaration line (`theorem {node_name} ...` -- this is frozen)
 - Add `axiom`, `constant`, `unsafe`, `native_decide`, `opaque`, or other forbidden keywords
 - Use `import Mathlib` -- only specific submodule imports (already present)

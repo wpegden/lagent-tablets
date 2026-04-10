@@ -4,25 +4,35 @@
 REPO="${1:-/home/leanagent/math/extremal_vectors_tablets}"
 
 echo "=== Supervisor ==="
+SUPERVISOR_RUNNING=0
 if tmux has-session -t supervisor 2>/dev/null; then
+    SUPERVISOR_RUNNING=1
     echo "  tmux: running"
     LOG=$(ls -t /tmp/lagent_run_*.log /tmp/extremal_vectors_run*.log 2>/dev/null | head -1)
-    [ -n "$LOG" ] && tail -3 "$LOG"
+    [ -n "$LOG" ] && echo "  latest log: $LOG"
 else
     echo "  tmux: stopped"
 fi
 
 echo ""
 echo "=== State ==="
-python3 -c "
+STATE_INFO=$(python3 -c "
 import json
+from pathlib import Path
 s = json.load(open('$REPO/.agent-supervisor/state.json'))
 t = json.load(open('$REPO/.agent-supervisor/tablet.json'))
 nodes = [n for n in t['nodes'] if n != 'Preamble']
 closed = [n for n in nodes if t['nodes'][n].get('status') == 'closed']
 print(f'  cycle={s[\"cycle\"]} phase={s[\"phase\"]} resume={s.get(\"resume_from\",\"\")}')
 print(f'  tablet: {len(closed)}/{len(nodes)} closed')
-" 2>/dev/null
+" 2>/dev/null)
+echo "$STATE_INFO"
+
+LATEST_DIR=$(find "$REPO/.agent-supervisor/logs" -maxdepth 1 -type d -name 'cycle-*' 2>/dev/null | sed 's#.*/cycle-##' | sort -n | tail -1)
+STATE_CYCLE=$(python3 -c "import json; print(json.load(open('$REPO/.agent-supervisor/state.json')).get('cycle', 0))" 2>/dev/null)
+if [ "$SUPERVISOR_RUNNING" -eq 1 ] && [ -n "$LATEST_DIR" ] && [ -n "$STATE_CYCLE" ] && [ "$LATEST_DIR" -gt "$STATE_CYCLE" ] 2>/dev/null; then
+    echo "  in-flight artifacts: cycle=$((10#$LATEST_DIR))"
+fi
 
 echo ""
 echo "=== Agents ==="

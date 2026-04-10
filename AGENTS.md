@@ -38,7 +38,7 @@ If `A.lean` has `import Tablet.B`, then A depends on B. B's NL statement can be 
 - Project definitions should not duplicate Mathlib concepts
 
 ### Node Difficulty
-- **Easy**: straightforward proof from existing children. No new imports/files allowed. Filesystem-enforced.
+- **Easy**: straightforward proof from existing children. Only the active `.lean` proof body may change. No `.tex` edits, import changes, or new files. Filesystem-enforced.
 - **Hard**: may require new helper nodes, import changes, refactoring.
 - Auto-elevates from easy to hard after 2 failed attempts.
 - Different agent configs per difficulty (e.g., Gemini for easy, Codex for hard).
@@ -54,12 +54,23 @@ If `A.lean` has `import Tablet.B`, then A depends on B. B's NL statement can be 
 - 3 agents run in parallel, each independently reading files from disk
 - Each agent gets its OWN previous cycle's results as context (not other agents')
 - Correspondence is a **GATE** — if rejected, soundness is skipped entirely
+- Correspondence invalidation is statement-level: proof-only `.tex` edits do not reopen it; `.tex` statement changes propagate upward through importing nodes only for definition nodes; Lean-side reopening uses the semantic correspondence fingerprint rather than raw text diffs
+- Correspondence caching is Lean-aware: it tracks the node's `.tex` statement plus the elaborated semantic meaning of its own Lean declaration. Proof-only changes and imported theorem churn do not invalidate it; imported definition changes that the statement actually depends on do.
 
 **Stage 2: NL Proof Soundness** (per-node, only if correspondence passes)
 - Is each node's NL proof rigorous from its children's NL statements?
 - Each node checked individually with 3 agents
 - Verdicts: SOUND, UNSOUND (proof fixable), STRUCTURAL (DAG needs restructuring)
-- Batched: 3 nodes at a time × 3 agents = 9 concurrent
+- Scheduled one node at a time in deepest-first DAG order: if `A` imports `B`, then `B` is checked before `A`
+- In theorem_stating, each cycle holds on a single current soundness target until that node is accepted, unless correspondence/paper-faithfulness blockers reopen first; while correspondence is open, the soundness target is suspended
+- The 3 soundness agents still run concurrently on that one node
+- Accepted per-node results can be reused across verification restarts when the node's `.tex` proof context is unchanged
+
+### Theorem-Stating Target Modes
+- **repair**: modeled on proof-formalization easy mode. Only `Tablet/{target}.tex` is writable. If broader changes are needed, the worker should return `STUCK` and explain the restructure needed.
+- **restructure**: explicitly authorized by the reviewer when paper-faithful DAG enrichment or dependency changes are needed for the same target. Broader edits are allowed, but only inside that target's prerequisite slice.
+
+New or changed theorem-stating targets default back to `repair`.
 
 ### Verification Status Persistence
 - Stored per-node in `tablet.json`: `correspondence_status`, `soundness_status`
@@ -154,6 +165,9 @@ Runtime tuning at `{config}.policy.json`. Editable while supervisor runs:
 - `timing.burst_timeout_seconds` — max agent runtime
 - `difficulty.easy_max_retries` — attempts before auto-elevation
 - `prompt_notes.worker` — ad-hoc instructions injected into prompts
+- `verification.correspondence_agent_selectors` — ordered hot-settable subset of configured correspondence agents
+- `verification.soundness_agent_selectors` — ordered hot-settable subset of configured soundness agents
+- `verification.soundness_disagree_bias` — reviewer default on 2-agent soundness splits (`reject` or `approve`)
 
 ---
 
@@ -163,11 +177,16 @@ Runtime tuning at `{config}.policy.json`. Editable while supervisor runs:
 ```
 Cycle N:
   1. Worker creates/modifies nodes (.lean + .tex pairs)
+    - If theorem_stating is holding on a current soundness target in `repair` mode, only `Tablet/{target}.tex` is writable
+    - If correspondence/paper-faithfulness blockers are open, there is no active soundness target for that cycle; the worker is addressing the correspondence frontier instead
+     - Broader paper-faithful DAG changes require reviewer-authorized `restructure` mode
   2. Register new nodes in tablet, apply difficulty hints
   3. Correspondence + Faithfulness check (3 agents, gate)
      - If REJECT → skip soundness, go to reviewer
      - If APPROVE → proceed to soundness
-  4. Per-node NL Proof Soundness check (3 agents per node)
+  4. NL Proof Soundness check for the current target node only (3 agents on that node)
+     - Target chosen deterministically in deepest-first DAG order
+     - The same target stays active across cycles until its NL proof is accepted, but broad correspondence blockers suspend target-hold behavior until those are resolved
   5. Apply verification results to tablet (sticky per-node status)
   6. Reviewer evaluates, provides guidance
   7. Git commit with cycle tag
@@ -181,7 +200,7 @@ Cycle N:
   2. Route to easy_worker or hard_worker based on difficulty
   3. Worker eliminates sorry from one node
   4. Validation (compilation, imports, declaration integrity)
-  5. If easy mode: reject new imports/files, auto-elevate after 2 fails
+  5. If easy mode: reject any edit outside the active `.lean` proof body; auto-elevate after 2 fails
   6. NL verification on modified/new nodes
   7. Reviewer evaluates, picks next node
   8. Git commit

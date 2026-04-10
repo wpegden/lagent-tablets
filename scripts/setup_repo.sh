@@ -116,6 +116,7 @@ lake-packages/
 .agent-supervisor/nl_cache.json*
 .agent-supervisor/policy.json*
 .agent-supervisor/pause
+.agent-supervisor/restart
 # Signal files (ephemeral)
 human_approve.json
 human_feedback.json

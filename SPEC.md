@@ -25,7 +25,7 @@ A DAG of **nodes**, each a `.lean` + `.tex` pair in `Tablet/`. Children of node 
 
 ### Node Difficulty: Easy vs Hard
 Each node is classified as **easy** or **hard**:
-- **Easy**: prove using only existing children. No new imports, no new files. Filesystem-enforced (Tablet/ dir read-only, Preamble read-only).
+- **Easy**: prove using only existing children. Only the active `.lean` proof body may change. No `.tex` edits, import changes, or new files. Filesystem-enforced (Tablet/ dir read-only, active `.tex` read-only, Preamble read-only).
 - **Hard**: full flexibility — can create helper nodes, add imports, refactor.
 
 Classification is proposed by the theorem_stating worker and finalized by the reviewer. After `easy_max_retries` (default 2) failed easy attempts, auto-elevates to hard.
@@ -40,11 +40,22 @@ Two stages, correspondence is a **gate** for soundness:
    - Single result file per agent with `correspondence` and `paper_faithfulness` sections
    - Agents read .lean/.tex files from disk (prompt lists nodes, doesn't inline content)
    - If ANY agent rejects, soundness is skipped — reviewer gets rejection details
+   - Correspondence caching is Lean-aware: it hashes the node's `.tex` statement plus the elaborated semantic meaning of its own declaration, including definition/inductive context actually used by the statement. Proof-only changes and imported theorem churn do not invalidate it.
 
 2. **NL Proof Soundness** (per-node, multi-agent, parallel) — only if correspondence passes
    - Each node checked individually with its children's .tex as context
    - Verdicts: SOUND, UNSOUND (proof fixable), STRUCTURAL (DAG needs restructuring)
-   - Batched: 3 nodes at a time × 3 agents
+   - Scheduled one node at a time in deterministic deepest-first DAG order
+   - If `A` imports `B`, then `B` is checked before `A`
+   - In theorem_stating, each cycle holds on one current soundness target until that node is accepted
+   - The 3 soundness agents still run concurrently on that one node
+
+### Theorem-Stating Target Edit Modes
+When theorem_stating is holding on a current soundness target, the supervisor tracks a target edit mode:
+- **repair**: default. Modeled on proof-formalization easy mode. Only `Tablet/{target}.tex` is writable, and any broader change must be escalated as restructure.
+- **restructure**: explicitly authorized by the reviewer when the current target needs paper-faithful DAG enrichment, dependency changes, or statement changes.
+
+Newly selected targets reset to `repair`.
 
 Both stages use 3 agents in parallel (configurable via `correspondence_agents` and `soundness_agents`).
 
@@ -65,8 +76,8 @@ Status stored on each `TabletNode` in tablet.json:
 
 | Phase | Purpose |
 |-------|---------|
-| `theorem_stating` | Create all nodes (.lean + .tex pairs) decomposing the paper. Run correspondence verification. Reviewer approves → advance. |
-| `proof_formalization` | Eliminate sorry from nodes. Easy nodes get fast/cheap agent, hard nodes get powerful agent. |
+| `theorem_stating` | Build and refine the tablet DAG. Run correspondence on changed nodes and NL-proof soundness on one current target node at a time until every target is accepted. |
+| `proof_formalization` | Eliminate sorry from nodes. Easy nodes are locked to one active `.lean` proof body; hard nodes get broader refactoring freedom. |
 | `proof_complete_style_cleanup` | Final cleanup after all nodes closed. |
 
 Phase transitions require human approval via the web viewer (ADVANCE_PHASE → awaiting_human_input).
@@ -133,6 +144,11 @@ Phase transitions require human approval via the web viewer (ADVANCE_PHASE → a
 ### Policy JSON (hot-reloadable)
 Runtime tuning: retry delays, stuck recovery, prompt notes, difficulty settings.
 
+Verification rosters can also be hot-set:
+- `verification.correspondence_agent_selectors`
+- `verification.soundness_agent_selectors`
+- `verification.soundness_disagree_bias`
+
 ---
 
 ## 7. Git Versioning
@@ -197,7 +213,7 @@ Node.js server at port 3300, nginx serves static files.
 - Pan/zoom on DAG (mouse wheel + drag, touch gestures)
 
 ### Static file generation
-`writeStatic()` every 30s generates `api/state.json`, `api/nodes.json`, `api/cycles.json`, `api/state-at/N.json`.
+`writeStatic()` every 30s generates `api/viewer-state.json`, `api/cycles.json`, `api/state-at/N.json`.
 
 ---
 

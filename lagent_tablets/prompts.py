@@ -7,6 +7,7 @@ Templates use Python .format() substitution.
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -17,7 +18,7 @@ from lagent_tablets.state import (
     SupervisorState,
     TabletNode,
     TabletState,
-    normalize_open_rejections,
+    normalize_open_blockers,
     normalize_orphan_resolutions,
 )
 from lagent_tablets.tablet import (
@@ -46,6 +47,17 @@ def _human_input_section(state) -> str:
     return ""
 
 
+def _soundness_split_bias_note(policy: Policy, agent_results: Any) -> str:
+    if not isinstance(agent_results, list) or len(agent_results) != 2:
+        return ""
+    bias = getattr(policy.verification, "soundness_disagree_bias", "reject")
+    if bias == "reject":
+        return "With the current 2-agent soundness panel, a 1-1 split should default to CONTINUE/REJECT unless you have a concrete reason to override."
+    if bias == "approve":
+        return "With the current 2-agent soundness panel, a 1-1 split should default to APPROVE unless you have a concrete reason to override."
+    return ""
+
+
 def _load_template(name: str) -> str:
     """Load a prompt template from the prompts/ directory."""
     path = PROMPTS_DIR / name
@@ -54,11 +66,82 @@ def _load_template(name: str) -> str:
     return ""
 
 
+def _skill_path(repo_path: Path, filename: str) -> Path:
+    """Resolve a skill file, preferring a repo-local override when present."""
+    path = repo_path / ".agent-supervisor" / "skills" / filename
+    if path.exists():
+        return path
+    return Path(__file__).resolve().parent.parent / "skills" / filename
+
+
 def _read_file(path: Path, default: str = "") -> str:
     """Read a file, returning default if missing."""
     if path.exists():
         return path.read_text(encoding="utf-8", errors="replace")
     return default
+
+
+def _git_show_text(repo: Path, relpath: str, tag: str) -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(repo), "show", f"{tag}:{relpath}"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return ""
+
+
+def _extract_lean_statement_block(lean_content: str) -> str:
+    lines = lean_content.splitlines()
+    out: List[str] = []
+    for line in lines:
+        out.append(line)
+        stripped = line.strip()
+        if ":= sorry" in stripped or ":= by" in stripped or stripped.endswith(":="):
+            break
+    return "\n".join(out).strip()
+
+
+def _extract_tex_statement_block(tex_content: str) -> str:
+    proof_start = tex_content.find("\\begin{proof}")
+    if proof_start >= 0:
+        return tex_content[:proof_start].strip()
+    return tex_content.strip()
+
+
+def _correspondence_change_context(
+    config: Config,
+    tablet: TabletState,
+    node_name: str,
+) -> Optional[Dict[str, str]]:
+    node = tablet.nodes.get(node_name)
+    if not node or not node.verification_at_cycle:
+        return None
+    tag = f"cycle-{node.verification_at_cycle}"
+    old_lean = _git_show_text(config.repo_path, f"Tablet/{node_name}.lean", tag)
+    old_tex = _git_show_text(config.repo_path, f"Tablet/{node_name}.tex", tag)
+    if not old_lean and not old_tex:
+        return None
+
+    current_lean = _read_file(node_lean_path(config.repo_path, node_name))
+    current_tex = _read_file(node_tex_path(config.repo_path, node_name))
+
+    previous_lean = _extract_lean_statement_block(old_lean)
+    current_lean_stmt = _extract_lean_statement_block(current_lean)
+    previous_tex = _extract_tex_statement_block(old_tex)
+    current_tex_stmt = _extract_tex_statement_block(current_tex)
+
+    if previous_lean == current_lean_stmt and previous_tex == current_tex_stmt:
+        return None
+
+    return {
+        "tag": tag,
+        "previous_lean": previous_lean,
+        "current_lean": current_lean_stmt,
+        "previous_tex": previous_tex,
+        "current_tex": current_tex_stmt,
+    }
 
 
 def _trim(text: str, max_chars: int = 50000) -> str:
@@ -81,6 +164,11 @@ def _artifact_prompt_values(config: Config, canonical_name: str) -> Dict[str, st
         "done_path": str(paths["done"]),
         "check_script": str(_check_script_path(config)),
     }
+
+
+def _theorem_target_edit_mode(state: SupervisorState) -> str:
+    mode = str(getattr(state, "theorem_target_edit_mode", "repair") or "repair").strip().lower()
+    return mode if mode in {"repair", "restructure"} else "repair"
 
 
 # ---------------------------------------------------------------------------
@@ -224,21 +312,21 @@ def _tablet_file_reference_text(
     return "\n".join(lines)
 
 
-def _open_rejections_text(
-    open_rejections: Any,
+def _open_blockers_text(
+    open_blockers: Any,
     *,
-    header: str = "--- CURRENT OPEN REJECTIONS ---",
+    header: str = "--- CURRENT OPEN BLOCKERS ---",
     include_completion_note: bool = False,
 ) -> str:
-    """Render the persisted theorem-stating rejection list for prompts."""
-    rejections = normalize_open_rejections(open_rejections)
-    if not rejections:
+    """Render the persisted theorem-stating blocker list for prompts."""
+    blockers = normalize_open_blockers(open_blockers)
+    if not blockers:
         return ""
 
     lines = [header]
     if include_completion_note:
         lines.append("Theorem-stating continues until this list is empty. Resolve these items before treating the tablet as complete.")
-    for entry in rejections:
+    for entry in blockers:
         lines.append(f"- [{entry['phase']}] {entry['node']}: {entry['reason']}")
     lines.append("")
     return "\n".join(lines)
@@ -389,6 +477,78 @@ def _previous_cycle_feedback(
     return "\n".join(lines)
 
 
+def _theorem_soundness_target_text(
+    state: SupervisorState,
+    *,
+    reviewer: bool = False,
+    reviewer_target_resolved: bool = False,
+) -> str:
+    """Render the current theorem-stating soundness target, if any."""
+    target = state.theorem_soundness_target.strip()
+    if not target:
+        return ""
+    mode = _theorem_target_edit_mode(state)
+    if reviewer:
+        mode_text = (
+            "Current target mode: `repair` (the worker is hard-locked to `Tablet/{target}.tex`; broader edits require explicit restructure authorization)."
+            if mode == "repair"
+            else "Current target mode: `restructure` (broader edits within the target's paper-faithful prerequisite slice are currently authorized)."
+        ).format(target=target)
+        if reviewer_target_resolved:
+            status_text = (
+                "This target has passed NL proof soundness in the current cycle. Unless you explicitly reopen this same target by choosing `target_edit_mode: restructure`, the next cycle will move automatically to the next unresolved target in deepest-first order.\n"
+            )
+        else:
+            status_text = (
+                "Keep your guidance focused on getting this node accepted for NL proof soundness.\n"
+                "If you judge that prerequisites or richer dependencies are missing for this same target, say so explicitly and set `target_edit_mode` to `restructure`; then describe the prerequisite work needed for that same target.\n"
+            )
+        return (
+            "--- CURRENT TARGET UNDER REVIEW ---\n"
+            f"The supervisor is currently holding theorem-stating on `{target}`.\n"
+            f"{mode_text}\n"
+            f"{status_text}"
+        )
+    if mode == "repair":
+        return (
+            "--- CURRENT SOUNDNESS TARGET ---\n"
+            f"`{target}` is the current theorem-stating soundness target.\n"
+            "Do not shift to a different soundness target this cycle.\n"
+            "Current target mode: `repair`.\n"
+            f"Work ONLY on `Tablet/{target}.tex` in this cycle.\n"
+            "If you think this proof needs richer dependencies, meaningful intermediate nodes, or any statement/import changes, stop and request restructure instead of editing more files.\n"
+        )
+    return (
+        "--- CURRENT SOUNDNESS TARGET ---\n"
+        f"`{target}` is the current theorem-stating soundness target.\n"
+        "Do not shift to a different soundness target this cycle.\n"
+        "Current target mode: `restructure`.\n"
+        "Broader paper-faithful edits inside this target's prerequisite slice are authorized for this cycle.\n"
+    )
+
+
+def _theorem_target_worker_guidance(state: SupervisorState) -> str:
+    """Authoritative worker guidance when theorem-stating is holding on a soundness target."""
+    target = state.theorem_soundness_target.strip()
+    if not target:
+        return ""
+    mode = _theorem_target_edit_mode(state)
+    if mode == "repair":
+        return (
+            "REVIEWER GUIDANCE:\n"
+            f"Focus this cycle on `{target}`.\n"
+            f"This is a target-repair cycle: work ONLY on `Tablet/{target}.tex`.\n"
+            "Do not edit any `.lean` file, any child node, `Preamble.lean`, or create new nodes.\n"
+            "If you think this proof needs the DAG to be enriched with additional dependencies or intermediate nodes first, stop and return `status: STUCK` with a concrete restructure request.\n"
+        )
+    return (
+        "REVIEWER GUIDANCE:\n"
+        f"Focus this cycle on `{target}`.\n"
+        "Broader restructure is authorized inside this target's paper-faithful prerequisite slice.\n"
+        "Do not make broad cleanup edits outside that target slice.\n"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Worker prompt
 # ---------------------------------------------------------------------------
@@ -458,9 +618,7 @@ def build_worker_prompt(
     worker_handoff_artifacts = _artifact_prompt_values(config, "worker_handoff.json")
 
     # Skill file reference
-    skill_path = repo_path / ".agent-supervisor" / "skills" / "LEAN_WORKER.md"
-    if not skill_path.exists():
-        skill_path = Path(__file__).resolve().parent.parent / "skills" / "LEAN_WORKER.md"
+    skill_path = _skill_path(repo_path, "PROOF_FORMALIZATION_WORKER.md")
 
     template_name = "easy_worker_instructions.md" if difficulty == "easy" else "worker_instructions.md"
     instructions = _load_template(template_name).format(
@@ -525,15 +683,19 @@ def build_theorem_stating_prompt(
         sections.append(paper_focus)
 
     # 3. Feedback from previous cycle
-    if state.last_review:
+    if state.theorem_soundness_target:
+        target_guidance = _theorem_target_worker_guidance(state)
+        if target_guidance:
+            sections.append(f"{target_guidance}\n")
+    elif state.last_review:
         next_prompt = state.last_review.get("next_prompt", "")
         if next_prompt:
             sections.append(f"REVIEWER GUIDANCE:\n{next_prompt}\n")
-    open_rejections = state.open_rejections
-    if not open_rejections and state.last_review:
-        open_rejections = state.last_review.get("open_rejections", [])
-    rejections_text = _open_rejections_text(
-        open_rejections,
+    open_blockers = state.open_blockers
+    if not open_blockers and state.last_review:
+        open_blockers = state.last_review.get("open_blockers", state.last_review.get("open_rejections", []))
+    rejections_text = _open_blockers_text(
+        open_blockers,
         include_completion_note=True,
     )
     if rejections_text:
@@ -547,6 +709,9 @@ def build_theorem_stating_prompt(
     )
     if orphan_text:
         sections.append(orphan_text)
+    target_text = _theorem_soundness_target_text(state)
+    if target_text:
+        sections.append(target_text)
 
     # 4. Current tablet state (may be empty on first cycle)
     if tablet.nodes:
@@ -556,15 +721,25 @@ def build_theorem_stating_prompt(
         sections.append("The tablet is currently empty. You are creating it from scratch.\n")
 
     # 5. Preamble
-    # Skill file reference (theorem_stating uses its own skill file)
-    skill_path = repo_path / ".agent-supervisor" / "skills" / "LEAN_THEOREM_STATING.md"
-    if not skill_path.exists():
-        skill_path = Path(__file__).resolve().parent.parent / "skills" / "LEAN_THEOREM_STATING.md"
+    # Skill file reference (only used by the broad theorem-stating worker prompt)
+    skill_path = _skill_path(repo_path, "THEOREM_STATING_WORKER.md")
 
     # 6. Instructions
-    instructions = _load_template("theorem_stating_instructions.md").format(
+    target = state.theorem_soundness_target.strip()
+    mode = _theorem_target_edit_mode(state)
+    template_name = (
+        "theorem_stating_target_repair_instructions.md"
+        if target and mode == "repair"
+        else (
+            "theorem_stating_target_restructure_instructions.md"
+            if target and mode == "restructure"
+            else "theorem_stating_instructions.md"
+        )
+    )
+    instructions = _load_template(template_name).format(
         skill_path=skill_path,
         repo_path=repo_path,
+        target=target,
         **_artifact_prompt_values(config, "worker_handoff.json"),
     )
     sections.append(instructions)
@@ -592,6 +767,7 @@ def build_theorem_stating_reviewer_prompt(
 ) -> str:
     """Build the reviewer prompt for the theorem_stating phase."""
     sections = []
+    target_resolved = False
 
     sections.append(_load_template("basic_model.md"))
     sections.append("YOUR ROLE: **Reviewer** (theorem_stating phase). You evaluate whether the worker's tablet structure is correct and complete. You decide whether to continue refining or advance to proof_formalization. You are the final arbiter on NL verification disputes.\n")
@@ -612,6 +788,25 @@ def build_theorem_stating_reviewer_prompt(
     if tablet.nodes:
         sections.append(_tablet_status_text(tablet, config.repo_path))
         sections.append(_tablet_file_reference_text(tablet, config.repo_path))
+    if nl_verification and state.theorem_soundness_target:
+        target_name = state.theorem_soundness_target
+        for result in nl_verification:
+            if result.get("check") != "nl_proof":
+                continue
+            for verdict in result.get("node_verdicts", []) or []:
+                if verdict.get("node") == target_name and verdict.get("overall") == "APPROVE":
+                    target_resolved = True
+                    break
+            if target_resolved:
+                break
+
+    target_text = _theorem_soundness_target_text(
+        state,
+        reviewer=True,
+        reviewer_target_resolved=target_resolved,
+    )
+    if target_text:
+        sections.append(target_text)
 
     # Worker handoff
     if worker_handoff:
@@ -631,6 +826,26 @@ def build_theorem_stating_reviewer_prompt(
             sections.append(f"  {check_type}: {overall}")
             if summary:
                 sections.append(f"    {summary}")
+            if check_type == "nl_proof" and overall == "REJECT":
+                for verdict in result.get("node_verdicts", []):
+                    node_name = verdict.get("node", "?")
+                    structural_agents = []
+                    for agent_result in verdict.get("agent_results", []) or []:
+                        decision = str(
+                            ((agent_result.get("soundness") or {}).get("decision", ""))
+                        ).upper()
+                        if decision == "STRUCTURAL":
+                            structural_agents.append(agent_result.get("agent", "?"))
+                    if structural_agents:
+                        joined = ", ".join(str(name) for name in structural_agents)
+                        sections.append(
+                            f"    [soundness structural] {node_name}: STRUCTURAL objection from {joined}."
+                        )
+                    if verdict.get("panel_split"):
+                        bias_note = _soundness_split_bias_note(policy, verdict.get("agent_results"))
+                        sections.append(f"    [soundness split] {node_name}: 1-1 panel split.")
+                        if bias_note:
+                            sections.append(f"      {bias_note}")
             for key in ("correspondence", "paper_faithfulness", "soundness"):
                 sub = result.get(key, {})
                 if isinstance(sub, dict) and sub.get("issues"):
@@ -638,9 +853,9 @@ def build_theorem_stating_reviewer_prompt(
                         sections.append(f"    [{key}] {issue.get('node', '?')}: {issue.get('description', '')}")
         sections.append("")
 
-    previous_rejections = _open_rejections_text(
-        state.open_rejections,
-        header="--- PREVIOUS OPEN REJECTIONS ---",
+    previous_rejections = _open_blockers_text(
+        state.open_blockers,
+        header="--- PREVIOUS OPEN BLOCKERS ---",
     )
     if previous_rejections:
         sections.append(previous_rejections)
@@ -658,9 +873,7 @@ def build_theorem_stating_reviewer_prompt(
         sections.append("")
 
     # Skill file reference
-    skill_path = config.repo_path / ".agent-supervisor" / "skills" / "LEAN_REVIEWER.md"
-    if not skill_path.exists():
-        skill_path = Path(__file__).resolve().parent.parent / "skills" / "LEAN_REVIEWER.md"
+    skill_path = _skill_path(config.repo_path, "THEOREM_STATING_REVIEWER.md")
 
     # Recent reviews
     if state.review_log:
@@ -764,6 +977,10 @@ def build_reviewer_prompt(
                     sections.append(f"\n  {check_name}: **AGENTS DISAGREE** -- you must arbitrate")
                     if summary:
                         sections.append(f"  {summary}")
+                    if check_name == "nl_proof":
+                        bias_note = _soundness_split_bias_note(policy, agent_results)
+                        if bias_note:
+                            sections.append(f"  Default policy: {bias_note}")
                     for ar in agent_results:
                         agent_label = ar.get("agent", "?")
                         agent_overall = ar.get("overall", "?")
@@ -787,6 +1004,14 @@ def build_reviewer_prompt(
                     sections.append(f"\n  {check_name}: {overall}")
                     if summary:
                         sections.append(f"  Summary: {summary}")
+                    if check_name == "nl_proof" and overall == "REJECT":
+                        for verdict in result.get("node_verdicts", []):
+                            if verdict.get("panel_split"):
+                                node_name = verdict.get("node", "?")
+                                bias_note = _soundness_split_bias_note(policy, verdict.get("agent_results"))
+                                sections.append(f"  [soundness split] {node_name}: 1-1 panel split.")
+                                if bias_note:
+                                    sections.append(f"    {bias_note}")
                     for phase in ("correspondence", "paper_faithfulness", "soundness"):
                         phase_result = result.get(phase, {})
                         if isinstance(phase_result, dict):
@@ -817,9 +1042,7 @@ def build_reviewer_prompt(
         sections.append("")
 
     # Skill file reference
-    skill_path = config.repo_path / ".agent-supervisor" / "skills" / "LEAN_REVIEWER.md"
-    if not skill_path.exists():
-        skill_path = Path(__file__).resolve().parent.parent / "skills" / "LEAN_REVIEWER.md"
+    skill_path = _skill_path(config.repo_path, "PROOF_FORMALIZATION_REVIEWER.md")
 
     # Instructions
     instructions = _load_template("reviewer_instructions.md").format(
@@ -926,6 +1149,51 @@ def build_correspondence_prompt(
             imports_str = ", ".join(imports) if imports else "none"
             sections.append(f"- **{name}** (kind: {node.kind}, difficulty: {node.difficulty}) — imports: {imports_str}")
         sections.append("")
+
+        changed_contexts: List[tuple[str, Dict[str, str]]] = []
+        for name in sorted(node_names):
+            ctx = _correspondence_change_context(config, tablet, name)
+            if ctx:
+                changed_contexts.append((name, ctx))
+        if changed_contexts:
+            if len(changed_contexts) == 1:
+                changed_name, changed_ctx = changed_contexts[0]
+                sections.append("=== CHANGE CONTEXT FOR THE NODE THAT REOPENED THIS FRONTIER ===\n")
+                sections.append(
+                    "Review the full frontier together, but use the old-vs-new context below for the single local node change that caused correspondence to be reopened.\n"
+                )
+                sections.append(f"--- {changed_name} (last verified in {changed_ctx['tag']}) ---")
+                sections.append("Previous Lean statement/import block:")
+                sections.append(changed_ctx["previous_lean"] or "(missing)")
+                sections.append("")
+                sections.append("Current Lean statement/import block:")
+                sections.append(changed_ctx["current_lean"] or "(missing)")
+                sections.append("")
+                sections.append("Previous NL statement block:")
+                sections.append(changed_ctx["previous_tex"] or "(missing)")
+                sections.append("")
+                sections.append("Current NL statement block:")
+                sections.append(changed_ctx["current_tex"] or "(missing)")
+                sections.append("")
+            else:
+                sections.append("=== CHANGE CONTEXT FOR THE LOCAL NODES THAT REOPENED THIS FRONTIER ===\n")
+                sections.append(
+                    "Review the full frontier together. More than one local statement/declaration change contributed to reopening correspondence, so the old-vs-new context for each changed node is listed below.\n"
+                )
+                for name, ctx in changed_contexts:
+                    sections.append(f"--- {name} (last verified in {ctx['tag']}) ---")
+                    sections.append("Previous Lean statement/import block:")
+                    sections.append(ctx["previous_lean"] or "(missing)")
+                    sections.append("")
+                    sections.append("Current Lean statement/import block:")
+                    sections.append(ctx["current_lean"] or "(missing)")
+                    sections.append("")
+                    sections.append("Previous NL statement block:")
+                    sections.append(ctx["previous_tex"] or "(missing)")
+                    sections.append("")
+                    sections.append("Current NL statement block:")
+                    sections.append(ctx["current_tex"] or "(missing)")
+                    sections.append("")
 
     sections.append("You have read access to all files in `Tablet/`. Read each node's `.lean` and `.tex` files, and follow import chains to verify definitions.\n")
 
@@ -1045,7 +1313,7 @@ def build_node_soundness_prompt(
     )
     if human_input and human_input.strip():
         sections.append(f"--- HUMAN FEEDBACK ---\n{human_input}\n")
-    sections.append(_load_template("nl_proof_role.md"))
+    sections.append(_load_template("nl_proof_single_node_role.md"))
 
     node = tablet.nodes.get(node_name)
     if not node:

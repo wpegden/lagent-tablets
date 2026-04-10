@@ -17,6 +17,7 @@ sudo -n -u "$BURST_USER" pkill -f "gemini.*yolo" 2>/dev/null
 
 sleep 2
 rm -f "$REPO/.agent-supervisor/pause"
+rm -f "$REPO/.agent-supervisor/restart"
 # Note: result files (correspondence_result_*.json, etc.) are NOT deleted.
 # They are tracked in git and serve as context for the next cycle's verifiers.
 

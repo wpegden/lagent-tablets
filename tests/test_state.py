@@ -74,6 +74,8 @@ class TestTabletNode(unittest.TestCase):
             paper_provenance="Lemma 2.1",
             lean_statement_hash="sha256:abc",
             closed_at_cycle=23,
+            correspondence_content_hash="corr123",
+            soundness_content_hash="sound456",
         )
         d = node.to_dict()
         restored = TabletNode.from_dict("compactness_of_K", d)
@@ -83,6 +85,17 @@ class TestTabletNode(unittest.TestCase):
         self.assertEqual(restored.title, "Compactness of K")
         self.assertEqual(restored.paper_provenance, "Lemma 2.1")
         self.assertEqual(restored.closed_at_cycle, 23)
+        self.assertEqual(restored.correspondence_content_hash, "corr123")
+        self.assertEqual(restored.soundness_content_hash, "sound456")
+
+    def test_legacy_verification_hash_populates_split_hashes(self):
+        restored = TabletNode.from_dict("foo", {
+            "kind": "helper_lemma",
+            "status": "open",
+            "verification_content_hash": "legacyhash",
+        })
+        self.assertEqual(restored.correspondence_content_hash, "legacyhash")
+        self.assertEqual(restored.soundness_content_hash, "legacyhash")
 
     def test_minimal_node(self):
         node = TabletNode(name="helper", kind="helper_lemma", status="open")
@@ -148,6 +161,9 @@ class TestSupervisorState(unittest.TestCase):
         self.assertEqual(state.cycle, 0)
         self.assertEqual(state.phase, "paper_check")
         self.assertEqual(state.active_node, "")
+        self.assertEqual(state.theorem_soundness_target, "")
+        self.assertEqual(state.theorem_target_edit_mode, "repair")
+        self.assertFalse(state.theorem_correspondence_blocked)
         self.assertEqual(state.open_rejections, [])
         self.assertFalse(state.awaiting_human_input)
 
@@ -156,8 +172,11 @@ class TestSupervisorState(unittest.TestCase):
             cycle=42,
             phase="proof_formalization",
             active_node="uniqueness_thm",
+            theorem_soundness_target="paper_main",
+            theorem_target_edit_mode="restructure",
+            theorem_correspondence_blocked=True,
             last_review={"decision": "CONTINUE", "reason": "making progress"},
-            open_rejections=[{"node": "foo", "phase": "correspondence", "reason": "statement mismatch"}],
+            open_blockers=[{"node": "foo", "phase": "correspondence", "reason": "statement mismatch"}],
             review_log=[{"cycle": 41, "decision": "CONTINUE"}],
         )
         d = state.to_dict()
@@ -165,6 +184,9 @@ class TestSupervisorState(unittest.TestCase):
         self.assertEqual(restored.cycle, 42)
         self.assertEqual(restored.phase, "proof_formalization")
         self.assertEqual(restored.active_node, "uniqueness_thm")
+        self.assertEqual(restored.theorem_soundness_target, "paper_main")
+        self.assertEqual(restored.theorem_target_edit_mode, "restructure")
+        self.assertTrue(restored.theorem_correspondence_blocked)
         self.assertEqual(restored.last_review["decision"], "CONTINUE")
         self.assertEqual(restored.open_rejections[0]["node"], "foo")
         self.assertEqual(len(restored.review_log), 1)

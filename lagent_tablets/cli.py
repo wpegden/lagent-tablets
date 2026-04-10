@@ -48,6 +48,7 @@ from lagent_tablets.tablet import (
     regenerate_support_files,
     tablet_dir,
 )
+from lagent_tablets.viewer_state import viewer_state_path, write_live_viewer_state
 from lagent_tablets.git_ops import init_repo, rewind_to_cycle
 from lagent_tablets.verification import write_scripts, FORBIDDEN_KEYWORDS_DEFAULT
 
@@ -104,6 +105,24 @@ def _check_pause(config: Config) -> bool:
             pass
         return True
     return False
+
+
+def _check_restart_request(config: Config) -> bool:
+    """Check if a restart has been requested via the restart file."""
+    restart_path = config.state_dir / "restart"
+    if restart_path.exists():
+        try:
+            restart_path.unlink()
+        except OSError:
+            pass
+        return True
+    return False
+
+
+def _restart_supervisor_process(argv: list[str]) -> None:
+    """Replace the current process with a fresh supervisor process."""
+    print("Restart requested. Restarting supervisor now.")
+    os.execv(sys.executable, [sys.executable, "-u", "-m", "lagent_tablets.cli", *argv])
 
 
 def should_stop(
@@ -324,6 +343,14 @@ def main(argv: Optional[list] = None) -> int:
 
     # Regenerate support files
     regenerate_support_files(tablet, config.repo_path)
+    write_live_viewer_state(
+        viewer_state_path(config.state_dir),
+        config.repo_path,
+        tablet,
+        state,
+        source="startup",
+        fast=True,
+    )
 
     # Health monitor
     health_log = config.state_dir / "logs" / "health.jsonl"
@@ -382,6 +409,8 @@ def main(argv: Optional[list] = None) -> int:
                           stop_at_phase_boundary=args.stop_at_phase_boundary,
                           remaining_cycles=remaining_cycles):
                 break
+            if _check_restart_request(config):
+                _restart_supervisor_process(sys.argv[1:])
             sleep_secs = policy.timing.sleep_seconds
             if sleep_secs > 0:
                 time.sleep(sleep_secs)
@@ -438,6 +467,8 @@ def main(argv: Optional[list] = None) -> int:
                       stop_at_phase_boundary=args.stop_at_phase_boundary,
                       remaining_cycles=remaining_cycles):
             break
+        if _check_restart_request(config):
+            _restart_supervisor_process(sys.argv[1:])
 
         # Sleep between cycles
         sleep_secs = policy.timing.sleep_seconds

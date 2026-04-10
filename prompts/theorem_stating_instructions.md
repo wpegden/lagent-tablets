@@ -1,9 +1,9 @@
 --- INSTRUCTIONS ---
 
 PHASE: theorem_stating
-YOUR GOAL: Create the COMPLETE proof tablet in this cycle -- a DAG of Lean 4 declarations that decompose ALL of the paper's results into provable nodes.
+YOUR GOAL: Build and refine the proof tablet until it gives a complete DAG of Lean 4 declarations covering the paper's provable results.
 
-You must create ALL nodes in a single cycle. Do not stop after creating one node. Read the entire paper, plan the full decomposition, then create every node (.lean + .tex pair) before writing the raw handoff file `{raw_output_path}`.
+If the tablet is still missing major parts, create the needed nodes and decomposition. If the prompt includes a `CURRENT SOUNDNESS TARGET`, keep the cycle centered on that target and follow the target-mode rules below. If there is no current target, work in deterministic deepest-first DAG order and keep the cycle focused on one coherent unresolved slice rather than broad opportunistic rewrites across unrelated parts of the tablet.
 
 Read the skill file at `{skill_path}` for Loogle usage and Lean tips.
 
@@ -64,6 +64,11 @@ For each node, create two files:
 IMPORTANT RULES:
 - If the prompt includes a `CURRENT OPEN REJECTIONS` section, theorem-stating is NOT complete yet. Prioritize resolving every listed correspondence and paper-faithfulness rejection before treating the tablet as finished.
 - Theorem-stating continues until the open-rejection list is empty.
+- If the prompt includes a `CURRENT SOUNDNESS TARGET` section, do not switch to a different soundness target on your own.
+- When there is a `CURRENT SOUNDNESS TARGET`, follow the target mode shown in the prompt.
+- In target mode `repair`, you are hard-locked to the target node's `.tex` file only. If you think the proof needs the DAG to be enriched with additional dependencies or meaningful intermediate nodes first, do NOT do that inside the cycle; instead write the handoff with status `STUCK` and explain the restructure needed.
+- In target mode `restructure`, every node you create, delete, or edit must end up in that target's prerequisite chain by the end of the cycle. Do not touch unrelated nodes.
+- If there is no `CURRENT SOUNDNESS TARGET`, prefer the deepest unresolved theorem/helper slice in DAG order. Avoid editing unrelated nodes just because they also look improvable; keep the cycle local unless the prompt explicitly asks for a broader cleanup.
 - If the prompt includes an `ORPHAN NODE ACTIONS` section, carry out those reviewer decisions before treating the tablet structure as complete. A non-main orphan should either be removed or given a real downstream dependency/citation.
 - Every `.lean` must have a matching `.tex` with NL statement AND NL proof
 - Imports between nodes define the DAG: if node B uses node A, then B imports A
@@ -72,6 +77,7 @@ IMPORTANT RULES:
 - `sorry` is allowed ONLY as a proof body for theorems/lemmas. NEVER use `sorry` in definitions. All definitions must be concrete — no `opaque`, no axioms, no `sorry`'d definitions. If you need a mathematical object, define it using Mathlib types or build it from scratch.
 - `sorry` is expected for theorem proofs in this phase -- you are stating theorems, not proving them
 - The NL proof in each .tex must be rigorous, not a sketch or placeholder. Proofs here should be at least as detailed as those in the paper and generally moreso. In this theorem stating phase, it is natural to copy/paste the appropriate proofs from the paper into the node .tex files, carefully check them, and augment them with details.
+- In theorem_stating, paper-faithful DAG enrichment is generally good when it reflects real paper structure and will make later Lean work more tractable. Do not invent gratuitous helpers, but do request restructure when a richer intermediate-step decomposition is genuinely needed.
 - Use `\noderef{{name}}` to cite other nodes in NL proofs
 - Run `python3 {check_script} tablet {repo_path}` to verify the tablet structure and build state (sorry warnings are expected)
 - The supervisor auto-generates `Tablet.lean` -- do NOT create or edit it
@@ -86,7 +92,7 @@ For each node, classify it as "easy" or "hard":
 
 Include your classification in the handoff file as `difficulty_hints`.
 
-WHEN ALL NODES ARE CREATED: Write the raw handoff JSON to `{raw_output_path}` listing every node you created:
+WHEN YOU HAVE FINISHED THE CYCLE'S TABLET EDITS: Write the raw handoff JSON to `{raw_output_path}` listing every node you created this cycle:
 {{
   "summary": "Created N tablet nodes covering the paper's main results and key lemmas",
   "status": "NOT_STUCK | STUCK | DONE | NEED_INPUT",
@@ -98,4 +104,4 @@ Then run:
 If that passes, write the completion marker `{done_path}` and stop.
 
 The supervisor will rerun the same checker and then write the canonical result file `{canonical_output_path}`.
-Do NOT write the raw handoff file until you have created ALL nodes. Do not create one node and stop — create the entire tablet structure first, verify it with the checker, then write the handoff.
+Do NOT write the raw handoff file until you have finished the cycle's intended tablet edits and verified them with the checker.

@@ -177,6 +177,13 @@ class PromptNotesPolicy:
 
 
 @dataclass(frozen=True)
+class VerificationPolicy:
+    correspondence_agent_selectors: Tuple[str, ...] = ()
+    soundness_agent_selectors: Tuple[str, ...] = ()
+    soundness_disagree_bias: str = "reject"
+
+
+@dataclass(frozen=True)
 class Policy:
     stuck_recovery: StuckRecoveryPolicy = field(default_factory=StuckRecoveryPolicy)
     branching: BranchingPolicy = field(default_factory=BranchingPolicy)
@@ -185,6 +192,7 @@ class Policy:
     close_bypass: CloseBypassPolicy = field(default_factory=CloseBypassPolicy)
     prompt_notes: PromptNotesPolicy = field(default_factory=PromptNotesPolicy)
     difficulty: DifficultyPolicy = field(default_factory=DifficultyPolicy)
+    verification: VerificationPolicy = field(default_factory=VerificationPolicy)
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +508,7 @@ def _parse_policy(raw: Any, defaults: Policy, *, path: Path) -> Policy:
     cl = _block("close_bypass")
     pn = _block("prompt_notes")
     df = _block("difficulty")
+    vf = _block("verification")
 
     retry_raw = tm.get("agent_retry_delays_seconds", list(defaults.timing.agent_retry_delays_seconds))
     if not isinstance(retry_raw, list):
@@ -512,6 +521,23 @@ def _parse_policy(raw: Any, defaults: Policy, *, path: Path) -> Policy:
     recheck = tuple(_coerce_int(v, "branching.selection_recheck_increments_reviews[]", minimum=1) for v in recheck_raw)
     if not recheck:
         raise ConfigError(f"branching.selection_recheck_increments_reviews must be non-empty: {path}")
+
+    def _selectors(key: str, default: Tuple[str, ...]) -> Tuple[str, ...]:
+        raw_val = vf.get(key, list(default))
+        if raw_val in (None, ""):
+            return ()
+        if not isinstance(raw_val, list):
+            raise ConfigError(f"verification.{key} must be a list: {path}")
+        parsed = tuple(str(v).strip() for v in raw_val if str(v).strip())
+        return parsed
+
+    soundness_disagree_bias = str(
+        vf.get("soundness_disagree_bias", defaults.verification.soundness_disagree_bias)
+    ).strip().lower()
+    if soundness_disagree_bias not in {"reject", "approve"}:
+        raise ConfigError(
+            f"verification.soundness_disagree_bias must be 'reject' or 'approve': {path}"
+        )
 
     return Policy(
         stuck_recovery=StuckRecoveryPolicy(
@@ -550,6 +576,17 @@ def _parse_policy(raw: Any, defaults: Policy, *, path: Path) -> Policy:
         difficulty=DifficultyPolicy(
             easy_max_retries=_coerce_int(df.get("easy_max_retries", defaults.difficulty.easy_max_retries), "difficulty.easy_max_retries", minimum=1),
         ),
+        verification=VerificationPolicy(
+            correspondence_agent_selectors=_selectors(
+                "correspondence_agent_selectors",
+                defaults.verification.correspondence_agent_selectors,
+            ),
+            soundness_agent_selectors=_selectors(
+                "soundness_agent_selectors",
+                defaults.verification.soundness_agent_selectors,
+            ),
+            soundness_disagree_bias=soundness_disagree_bias,
+        ),
     )
 
 
@@ -563,6 +600,11 @@ def policy_to_dict(policy: Policy) -> Dict[str, Any]:
         "close_bypass": {"reviewer_interval": policy.close_bypass.reviewer_interval},
         "prompt_notes": {"worker": policy.prompt_notes.worker, "reviewer": policy.prompt_notes.reviewer, "verification": policy.prompt_notes.verification, "branching": policy.prompt_notes.branching},
         "difficulty": {"easy_max_retries": policy.difficulty.easy_max_retries},
+        "verification": {
+            "correspondence_agent_selectors": list(policy.verification.correspondence_agent_selectors),
+            "soundness_agent_selectors": list(policy.verification.soundness_agent_selectors),
+            "soundness_disagree_bias": policy.verification.soundness_disagree_bias,
+        },
     }
 
 

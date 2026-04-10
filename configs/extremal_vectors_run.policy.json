@@ -40,5 +40,17 @@
   },
   "difficulty": {
     "easy_max_retries": 2
+  },
+  "verification": {
+    "correspondence_agent_selectors": [
+      "claude",
+      "gemini",
+      "codex"
+    ],
+    "soundness_agent_selectors": [
+      "gemini",
+      "codex"
+    ],
+    "soundness_disagree_bias": "reject"
   }
 }
