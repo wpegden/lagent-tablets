@@ -2,8 +2,11 @@
 # Rewind to a specific cycle and stage, cleaning all artifacts.
 # Usage: ./scripts/rewind.sh <cycle> [stage] [repo_path]
 # Optional env:
-#   FRESH_THEOREM_TARGET=1  Clear the persisted theorem-stating soundness target
-#                           so the resumed run selects a fresh deepest unresolved node.
+#   PRESERVE_THEOREM_TARGET=1  When rewinding theorem_stating to verification,
+#                              keep the persisted soundness target instead of
+#                              selecting a fresh deepest unresolved node.
+#   FRESH_THEOREM_TARGET=1     Legacy alias that also forces clearing the
+#                              persisted theorem-stating soundness target.
 #   stage: verification (default), reviewer, or worker
 #
 # Example: ./scripts/rewind.sh 1 verification
@@ -16,6 +19,7 @@ STAGE="${2:-verification}"
 REPO="${3:-/home/leanagent/math/extremal_vectors_tablets}"
 BURST_USER="${BURST_USER:-lagentworker}"
 FRESH_THEOREM_TARGET="${FRESH_THEOREM_TARGET:-0}"
+PRESERVE_THEOREM_TARGET="${PRESERVE_THEOREM_TARGET:-0}"
 
 if [[ "$STAGE" != "verification" && "$STAGE" != "reviewer" && "$STAGE" != "worker" ]]; then
     echo "ERROR: stage must be 'verification', 'reviewer', or 'worker' (got '$STAGE')"
@@ -129,6 +133,7 @@ repo = Path(os.environ["REPO_ENV"])
 cycle = int(os.environ["CYCLE_ENV"])
 stage = os.environ["STAGE_ENV"]
 fresh_theorem_target = os.environ.get("FRESH_THEOREM_TARGET", "0") == "1"
+preserve_theorem_target = os.environ.get("PRESERVE_THEOREM_TARGET", "0") == "1"
 
 state_path = repo / ".agent-supervisor" / "state.json"
 state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -137,7 +142,14 @@ state["cycle"] = cycle
 state["resume_from"] = stage if stage != "worker" else ""
 state["agent_token_usage"] = {}
 state["awaiting_human_input"] = False
-if fresh_theorem_target and state.get("phase") == "theorem_stating":
+clear_theorem_target = (
+    state.get("phase") == "theorem_stating"
+    and (
+        fresh_theorem_target
+        or (stage == "verification" and not preserve_theorem_target)
+    )
+)
+if clear_theorem_target:
     state["theorem_soundness_target"] = ""
     state["theorem_target_edit_mode"] = "repair"
 

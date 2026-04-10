@@ -97,9 +97,13 @@ function writeJsonIfChanged(filePath, value) {
   const next = JSON.stringify(value);
   try {
     const current = fs.readFileSync(filePath, 'utf-8');
-    if (current === next) return;
+    if (current === next) {
+      fs.chmodSync(filePath, 0o644);
+      return;
+    }
   } catch {}
   fs.writeFileSync(filePath, next);
+  fs.chmodSync(filePath, 0o644);
 }
 
 function writeStatic() {
@@ -119,12 +123,21 @@ function writeStatic() {
     fs.mkdirSync(stateAtDir, { recursive: true });
     try {
       const tags = git('tag -l "cycle-*" --sort=version:refname').split('\n').filter(t => t);
+      const validCycles = new Set();
       for (const tag of tags) {
         const cycleNum = parseInt(tag.replace('cycle-', ''), 10);
+        if (Number.isNaN(cycleNum)) continue;
+        validCycles.add(String(cycleNum));
         const outFile = path.join(stateAtDir, `${cycleNum}.json`);
         try {
           writeJsonIfChanged(outFile, readHistoricalViewerState(cycleNum));
         } catch {}
+      }
+      for (const entry of fs.readdirSync(stateAtDir)) {
+        const match = entry.match(/^(\d+)\.json$/);
+        if (!match) continue;
+        if (validCycles.has(match[1])) continue;
+        try { fs.unlinkSync(path.join(stateAtDir, entry)); } catch {}
       }
     } catch {}
 

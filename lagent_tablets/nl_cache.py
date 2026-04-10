@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -21,6 +22,7 @@ from lagent_tablets.tablet import extract_tablet_imports, node_lean_path, node_t
 
 
 _LEAN_CORRESPONDENCE_CACHE: Dict[Tuple[str, Tuple[Tuple[str, str], ...], str], Optional[str]] = {}
+_LEAN_FINGERPRINT_PRIME_BATCH_SIZE = max(1, int(os.environ.get("LAGENT_LEAN_FINGERPRINT_BATCH_SIZE", "1")))
 
 
 def _hash_content(content: str) -> str:
@@ -286,7 +288,13 @@ def _lean_semantic_statement_payload(repo: Path, node_name: str) -> Optional[str
 
 
 def prime_correspondence_fingerprints(repo: Path, node_names: List[str]) -> None:
-    """Warm the Lean semantic fingerprint cache for a batch of nodes."""
+    """Warm the Lean semantic fingerprint cache in bounded batches.
+
+    A single giant `lake env lean --run ...` invocation can retain a huge
+    environment closure and spike RAM badly on real repos. Since this is only a
+    cache warmup path, we deliberately trade latency for memory safety and keep
+    each Lean invocation small.
+    """
     if not node_names or not _has_lake_project(repo):
         return
     snapshot_key = _lean_project_snapshot_key(repo)
@@ -297,9 +305,12 @@ def prime_correspondence_fingerprints(repo: Path, node_names: List[str]) -> None
     ]
     if not to_compute:
         return
-    payloads = _run_lean_correspondence_payloads(repo, to_compute)
-    for name in to_compute:
-        _LEAN_CORRESPONDENCE_CACHE[(repo_key, snapshot_key, name)] = payloads.get(name)
+    batch_size = _LEAN_FINGERPRINT_PRIME_BATCH_SIZE
+    for start in range(0, len(to_compute), batch_size):
+        batch = to_compute[start:start + batch_size]
+        payloads = _run_lean_correspondence_payloads(repo, batch)
+        for name in batch:
+            _LEAN_CORRESPONDENCE_CACHE[(repo_key, snapshot_key, name)] = payloads.get(name)
 
 
 class NLCache:

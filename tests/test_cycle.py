@@ -17,6 +17,7 @@ from lagent_tablets.cycle import (
     _backfill_legacy_correspondence_hashes,
     _changed_tablet_nodes_since_snapshot,
     _correspondence_gate_open,
+    _normalize_theorem_stating_replay_state,
     _enforce_theorem_stating_orphan_candidates,
     _enforce_theorem_stating_open_rejections,
     _node_content_hash,
@@ -29,6 +30,7 @@ from lagent_tablets.cycle import (
     _snapshot_tablet_dir,
     _snapshot_tablet_node_hashes,
     _suspend_theorem_soundness_target,
+    _theorem_stating_preflight_error,
     _theorem_stating_correspondence_frontier,
     _theorem_target_scope,
     _validate_easy_proof_repair_changes,
@@ -68,6 +70,72 @@ class TestTheoremStatingOpenRejections(unittest.TestCase):
         self.assertEqual(suspended.theorem_target_edit_mode, "repair")
         self.assertTrue(suspended.theorem_correspondence_blocked)
         self.assertEqual(state.theorem_soundness_target, "binary_weight_extremal_main")
+
+    def test_normalize_theorem_stating_replay_state_clears_target_when_correspondence_blockers_exist(self):
+        state = SupervisorState(
+            cycle=8,
+            phase="theorem_stating",
+            theorem_soundness_target="affine_rank_row_extension",
+            theorem_target_edit_mode="restructure",
+            open_blockers=[
+                {
+                    "node": "collection_rank",
+                    "phase": "correspondence",
+                    "reason": "Use Set.finrank instead.",
+                }
+            ],
+        )
+
+        notes = _normalize_theorem_stating_replay_state(state)
+
+        self.assertEqual(state.theorem_soundness_target, "")
+        self.assertEqual(state.theorem_target_edit_mode, "repair")
+        self.assertTrue(state.theorem_correspondence_blocked)
+        self.assertTrue(any("correspondence blockers" in note for note in notes))
+
+    def test_normalize_theorem_stating_replay_state_strips_stale_proof_phase_carryover(self):
+        state = SupervisorState(
+            cycle=8,
+            phase="theorem_stating",
+            open_blockers=[
+                {
+                    "node": "main_thm",
+                    "phase": "correspondence",
+                    "reason": "Restore the missing quantifier.",
+                }
+            ],
+            last_review={
+                "decision": "CONTINUE",
+                "next_prompt": "Begin proof_formalization on `nonzero_orthogonal_count`.",
+                "next_active_node": "nonzero_orthogonal_count",
+                "paper_focus_ranges": [{"start_line": 1, "end_line": 2, "reason": "proof phase"}],
+            },
+        )
+
+        notes = _normalize_theorem_stating_replay_state(state)
+
+        self.assertNotIn("next_prompt", state.last_review)
+        self.assertNotIn("next_active_node", state.last_review)
+        self.assertNotIn("paper_focus_ranges", state.last_review)
+        self.assertTrue(any("stale theorem-stating reviewer carryover" in note for note in notes))
+
+    def test_theorem_stating_preflight_rejects_active_target_while_correspondence_blockers_open(self):
+        state = SupervisorState(
+            cycle=8,
+            phase="theorem_stating",
+            theorem_soundness_target="affine_rank_row_extension",
+            open_blockers=[
+                {
+                    "node": "main_thm",
+                    "phase": "correspondence",
+                    "reason": "Restore the missing quantifier.",
+                }
+            ],
+        )
+
+        error = _theorem_stating_preflight_error(state)
+
+        self.assertIn("Open correspondence blockers", error)
 
     def test_reconcile_prefers_reviewer_reason_and_drops_stale_entries(self):
         nl_verification = [{
@@ -976,6 +1044,42 @@ class TestTheoremTargetScope(unittest.TestCase):
             initial_scope = _theorem_target_scope(repo, "target")
             (tablet_dir / "helper.tex").write_text(
                 "\\begin{lemma}[helper]\nTrue.\n\\end{lemma}\n\\begin{proof}\nNew prerequisite proof.\n\\end{proof}\n",
+                encoding="utf-8",
+            )
+
+            error = _validate_theorem_target_edit_scope(
+                repo, "target", before, initial_scope=initial_scope
+            )
+            self.assertIsNone(error)
+
+    def test_target_scope_allows_downstream_consumer_edits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            tablet_dir = repo / "Tablet"
+            tablet_dir.mkdir(parents=True, exist_ok=True)
+            (tablet_dir / "target.lean").write_text(
+                "theorem target : True := by\n  trivial\n",
+                encoding="utf-8",
+            )
+            (tablet_dir / "target.tex").write_text(
+                "\\begin{theorem}[target]\nTrue.\n\\end{theorem}\n\\begin{proof}\nDone.\n\\end{proof}\n",
+                encoding="utf-8",
+            )
+            (tablet_dir / "consumer.lean").write_text(
+                "import Tablet.target\n\ntheorem consumer : True := by\n  trivial\n",
+                encoding="utf-8",
+            )
+            (tablet_dir / "consumer.tex").write_text(
+                "\\begin{lemma}[consumer]\nTrue.\n\\end{lemma}\n\\begin{proof}\nBy \\noderef{target}.\n\\end{proof}\n",
+                encoding="utf-8",
+            )
+
+            before = _snapshot_tablet_node_hashes(repo)
+            initial_scope = _theorem_target_scope(repo, "target")
+            self.assertIn("consumer", initial_scope)
+
+            (tablet_dir / "consumer.tex").write_text(
+                "\\begin{lemma}[consumer]\nTrue.\n\\end{lemma}\n\\begin{proof}\nUpdated after target interface change.\n\\end{proof}\n",
                 encoding="utf-8",
             )
 

@@ -380,6 +380,7 @@ class TestTheoremStatingPrompts(unittest.TestCase):
         )
 
         prompt = build_theorem_stating_prompt(config, state, tablet, Policy())
+        self.assertIn("Fix the statement.", prompt)
         self.assertIn("CURRENT OPEN BLOCKERS", prompt)
         self.assertIn("Theorem-stating continues until this list is empty", prompt)
         self.assertIn("[correspondence] main_thm: The Lean statement drops a quantifier.", prompt)
@@ -550,6 +551,34 @@ class TestTheoremStatingPrompts(unittest.TestCase):
         self.assertNotIn("DECOMPOSITION STRATEGY:", prompt)
         self.assertNotIn("For each node, create two files", prompt)
 
+    def test_worker_prompt_with_target_restructure_includes_scoped_region_check(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open", title="Main"),
+        })
+        state = SupervisorState(
+            cycle=2,
+            phase="theorem_stating",
+            theorem_soundness_target="main_thm",
+            theorem_target_edit_mode="restructure",
+        )
+
+        prompt = build_theorem_stating_prompt(
+            config,
+            state,
+            tablet,
+            Policy(),
+            authorized_region=["main_thm", "consumer"],
+            scoped_tablet_check_payload_path=Path("/tmp/theorem_target_scope_check.json"),
+        )
+        self.assertIn("AUTHORIZED IMPACT REGION", prompt)
+        self.assertIn("main_thm, consumer", prompt)
+        self.assertIn("tablet-scoped", prompt)
+        self.assertIn("--scope-json /tmp/theorem_target_scope_check.json", prompt)
+
     def test_worker_prompt_with_target_hides_stale_freeform_next_prompt(self):
         repo = Path(tempfile.mkdtemp())
         _setup_repo(repo)
@@ -568,6 +597,50 @@ class TestTheoremStatingPrompts(unittest.TestCase):
         prompt = build_theorem_stating_prompt(config, state, tablet, Policy())
         self.assertIn("Focus this cycle on `main_thm`", prompt)
         self.assertNotIn("Start with some unrelated slice first.", prompt)
+
+    def test_worker_prompt_without_target_hides_stale_proof_phase_guidance(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        (repo / "paper.tex").write_text(
+            "INTRO\nDEFN\nUNIQUE_TARGET_THEOREM\nTAIL\n"
+        )
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open", title="Main"),
+        })
+        state = SupervisorState(
+            cycle=8,
+            phase="theorem_stating",
+            last_review={
+                "decision": "CONTINUE",
+                "next_prompt": "Begin proof_formalization on `nonzero_orthogonal_count`.",
+                "next_active_node": "nonzero_orthogonal_count",
+                "paper_focus_ranges": [
+                    {"start_line": 2, "end_line": 3, "reason": "proof target lines"}
+                ],
+                "open_blockers": [
+                    {
+                        "node": "main_thm",
+                        "phase": "correspondence",
+                        "reason": "The Lean statement drops a quantifier.",
+                    }
+                ],
+            },
+            open_blockers=[
+                {
+                    "node": "main_thm",
+                    "phase": "correspondence",
+                    "reason": "The Lean statement drops a quantifier.",
+                }
+            ],
+        )
+
+        prompt = build_theorem_stating_prompt(config, state, tablet, Policy())
+        self.assertNotIn("Begin proof_formalization", prompt)
+        self.assertNotIn("nonzero_orthogonal_count", prompt)
+        self.assertNotIn("RELEVANT PAPER EXCERPTS", prompt)
+        self.assertIn("CURRENT OPEN BLOCKERS", prompt)
 
     def test_reviewer_prompt_requires_open_blockers(self):
         repo = Path(tempfile.mkdtemp())

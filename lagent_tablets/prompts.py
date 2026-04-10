@@ -492,7 +492,7 @@ def _theorem_soundness_target_text(
         mode_text = (
             "Current target mode: `repair` (the worker is hard-locked to `Tablet/{target}.tex`; broader edits require explicit restructure authorization)."
             if mode == "repair"
-            else "Current target mode: `restructure` (broader edits within the target's paper-faithful prerequisite slice are currently authorized)."
+            else "Current target mode: `restructure` (broader edits within the target's authorized paper-faithful impact region are currently authorized)."
         ).format(target=target)
         if reviewer_target_resolved:
             status_text = (
@@ -523,7 +523,7 @@ def _theorem_soundness_target_text(
         f"`{target}` is the current theorem-stating soundness target.\n"
         "Do not shift to a different soundness target this cycle.\n"
         "Current target mode: `restructure`.\n"
-        "Broader paper-faithful edits inside this target's prerequisite slice are authorized for this cycle.\n"
+        "Broader paper-faithful edits inside this target's authorized impact region are authorized for this cycle.\n"
     )
 
 
@@ -544,9 +544,88 @@ def _theorem_target_worker_guidance(state: SupervisorState) -> str:
     return (
         "REVIEWER GUIDANCE:\n"
         f"Focus this cycle on `{target}`.\n"
-        "Broader restructure is authorized inside this target's paper-faithful prerequisite slice.\n"
-        "Do not make broad cleanup edits outside that target slice.\n"
+        "Broader restructure is authorized inside this target's paper-faithful impact region.\n"
+        "Do not make broad cleanup edits outside that target-centered region.\n"
     )
+
+
+def _theorem_stating_open_blockers(state: SupervisorState) -> List[Dict[str, str]]:
+    open_blockers = state.open_blockers
+    if not open_blockers and state.last_review:
+        open_blockers = state.last_review.get(
+            "open_blockers",
+            state.last_review.get("open_rejections", []),
+        )
+    return open_blockers
+
+
+def _has_stale_theorem_stating_review_guidance(state: SupervisorState) -> bool:
+    """Detect stale proof-formalization carryover inside theorem-stating state.
+
+    Historical rewinds can preserve a theorem-stating `last_review` record whose
+    free-form guidance was originally drafted for phase advancement. When that
+    happens, we must not leak proof-formalization instructions back into a fresh
+    theorem-stating worker cycle.
+    """
+    if state.phase != "theorem_stating" or not state.last_review:
+        return False
+
+    review = state.last_review
+    decision = str(review.get("decision", "") or "").upper()
+    next_active_node = str(review.get("next_active_node", "") or "").strip()
+    next_prompt = str(review.get("next_prompt", "") or "")
+    lowered = next_prompt.lower()
+    open_blockers = _theorem_stating_open_blockers(state)
+
+    if open_blockers and decision == "ADVANCE_PHASE":
+        return True
+    if next_active_node and decision != "ADVANCE_PHASE":
+        return True
+    if open_blockers and (
+        "proof_formalization" in lowered
+        or lowered.startswith("begin proof_formalization")
+    ):
+        return True
+    return False
+
+
+def _theorem_stating_safe_next_prompt(state: SupervisorState) -> str:
+    if not state.last_review or _has_stale_theorem_stating_review_guidance(state):
+        return ""
+    return str(state.last_review.get("next_prompt", "") or "")
+
+
+def _theorem_stating_safe_paper_focus_ranges(state: SupervisorState) -> List[Dict[str, Any]]:
+    if not state.last_review or _has_stale_theorem_stating_review_guidance(state):
+        return []
+    ranges = state.last_review.get("paper_focus_ranges", [])
+    return ranges if isinstance(ranges, list) else []
+
+
+def _authorized_region_note(authorized_region: Optional[List[str]]) -> str:
+    if not authorized_region:
+        return ""
+    preview = ", ".join(authorized_region[:12])
+    if len(authorized_region) > 12:
+        preview += ", ..."
+    return (
+        "AUTHORIZED IMPACT REGION:\n"
+        "You may edit target-local prerequisites and downstream consumers only within this target-centered region.\n"
+        f"Allowed nodes this cycle: {preview}\n"
+    )
+
+
+def _scoped_tablet_check_command(
+    config: Config,
+    scoped_tablet_check_payload_path: Optional[Path],
+) -> str:
+    check_script = _check_script_path(config)
+    if scoped_tablet_check_payload_path:
+        return (
+            f"python3 {check_script} tablet-scoped {config.repo_path} "
+            f"--scope-json {scoped_tablet_check_payload_path}"
+        )
+    return f"python3 {check_script} tablet {config.repo_path}"
 
 
 # ---------------------------------------------------------------------------
@@ -600,7 +679,7 @@ def build_worker_prompt(
         sections.append(paper_ref)
     paper_focus = _paper_focus_excerpt_text(
         config,
-        state.last_review.get("paper_focus_ranges", []) if state.last_review else [],
+        _theorem_stating_safe_paper_focus_ranges(state),
     )
     if paper_focus:
         sections.append(paper_focus)
@@ -647,6 +726,8 @@ def build_theorem_stating_prompt(
     policy: Policy,
     *,
     previous_outcome: Optional[Dict[str, Any]] = None,
+    authorized_region: Optional[List[str]] = None,
+    scoped_tablet_check_payload_path: Optional[Path] = None,
 ) -> str:
     """Build the worker prompt for the theorem_stating phase.
 
@@ -677,7 +758,7 @@ def build_theorem_stating_prompt(
         sections.append(paper_ref)
     paper_focus = _paper_focus_excerpt_text(
         config,
-        state.last_review.get("paper_focus_ranges", []) if state.last_review else [],
+        _theorem_stating_safe_paper_focus_ranges(state),
     )
     if paper_focus:
         sections.append(paper_focus)
@@ -688,12 +769,10 @@ def build_theorem_stating_prompt(
         if target_guidance:
             sections.append(f"{target_guidance}\n")
     elif state.last_review:
-        next_prompt = state.last_review.get("next_prompt", "")
+        next_prompt = _theorem_stating_safe_next_prompt(state)
         if next_prompt:
             sections.append(f"REVIEWER GUIDANCE:\n{next_prompt}\n")
-    open_blockers = state.open_blockers
-    if not open_blockers and state.last_review:
-        open_blockers = state.last_review.get("open_blockers", state.last_review.get("open_rejections", []))
+    open_blockers = _theorem_stating_open_blockers(state)
     rejections_text = _open_blockers_text(
         open_blockers,
         include_completion_note=True,
@@ -740,6 +819,10 @@ def build_theorem_stating_prompt(
         skill_path=skill_path,
         repo_path=repo_path,
         target=target,
+        authorized_region_note=_authorized_region_note(authorized_region),
+        scoped_tablet_check_command=_scoped_tablet_check_command(
+            config, scoped_tablet_check_payload_path,
+        ),
         **_artifact_prompt_values(config, "worker_handoff.json"),
     )
     sections.append(instructions)

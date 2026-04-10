@@ -11,6 +11,7 @@ snapshot builder, with era-specific handling for older metadata shapes.
 
 from __future__ import annotations
 
+import os
 import hashlib
 import json
 import re
@@ -85,6 +86,20 @@ class GitSnapshot:
 
 def viewer_state_path(state_dir: Path) -> Path:
     return state_dir / "viewer_state.json"
+
+
+def _static_live_viewer_state_path() -> Path:
+    static_out = Path(os.environ.get("LAGENT_VIEWER_STATIC_OUT", "/home/leanagent/lagent-tablets-web"))
+    return static_out / "api" / "viewer-state.json"
+
+
+def _mirror_static_live_viewer_state(payload: Dict[str, Any]) -> None:
+    try:
+        out = _static_live_viewer_state_path()
+        save_json(out, payload)
+        os.chmod(out, 0o644)
+    except Exception:
+        pass
 
 
 def repo_cache_slug(repo_path: Path) -> str:
@@ -560,6 +575,7 @@ def write_live_viewer_state(
         fast=fast,
     )
     save_json(path, payload)
+    _mirror_static_live_viewer_state(payload)
     return payload
 
 
@@ -590,6 +606,7 @@ def write_cycle_viewer_state(
             if name in payload["nodes"]:
                 payload["nodes"][name]["verification"] = status
     save_json(path, payload)
+    _mirror_static_live_viewer_state(payload)
     return payload
 
 

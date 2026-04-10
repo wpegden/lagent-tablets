@@ -24,7 +24,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -592,7 +592,10 @@ def validate_worker_handoff_data(data: Any, *, phase: str, repo: Optional[Path] 
         errors.extend(diff_errors)
         extra_hint_nodes = sorted(set(difficulty_hints) - set(new_nodes))
         if extra_hint_nodes:
-            errors.append(f"difficulty_hints keys must be listed in new_nodes: {extra_hint_nodes}")
+            errors.append(
+                "difficulty_hints keys must be listed in new_nodes "
+                f"(only genuinely new nodes may be hinted): {extra_hint_nodes}"
+            )
         normalized["difficulty_hints"] = difficulty_hints
     if repo is not None:
         for name in new_nodes:
@@ -603,6 +606,61 @@ def validate_worker_handoff_data(data: Any, *, phase: str, repo: Optional[Path] 
             if not tex_path.exists():
                 errors.append(f"new_nodes entry {name} is missing {tex_path}")
     return {"ok": not errors, "errors": errors, "data": normalized if not errors else None}
+
+
+def _tablet_check_known_nodes(repo: Path) -> Set[str]:
+    tablet_dir = repo / "Tablet"
+    names = {p.stem for p in tablet_dir.glob("*.lean")}
+    names |= {p.stem for p in tablet_dir.glob("*.tex")}
+    return {n for n in names if n not in {"Preamble", "Axioms", "header"}}
+
+
+def _tablet_error_owner(error: str, known_nodes: Set[str]) -> Optional[str]:
+    prefix = error.split(":", 1)[0].strip()
+    return prefix if prefix in known_nodes else None
+
+
+def check_tablet_scoped(
+    repo: Path,
+    *,
+    allowed_prefixes: List[str],
+    forbidden_keywords: List[str],
+    baseline_errors: Sequence[str],
+    allowed_nodes: Sequence[str],
+    approved_axioms_path: Optional[Path] = None,
+    timeout_secs: float = 300,
+) -> Dict[str, Any]:
+    """Run tablet checks, but only fail on newly introduced relevant errors.
+
+    Relevant means either:
+    - a node-level error on one of the allowed nodes, or
+    - any new global error (for example a fresh build failure).
+    """
+    baseline = set(str(err) for err in baseline_errors)
+    allowed = set(str(name) for name in allowed_nodes)
+    full = check_tablet(
+        repo,
+        allowed_prefixes=allowed_prefixes,
+        forbidden_keywords=forbidden_keywords,
+        approved_axioms_path=approved_axioms_path,
+        timeout_secs=timeout_secs,
+    )
+    known_nodes = _tablet_check_known_nodes(repo)
+    new_relevant_errors: List[str] = []
+    for err in full["errors"]:
+        if err in baseline:
+            continue
+        owner = _tablet_error_owner(err, known_nodes)
+        if owner is None or owner in allowed:
+            new_relevant_errors.append(err)
+    return {
+        "ok": not new_relevant_errors,
+        "errors": new_relevant_errors,
+        "warnings": full["warnings"],
+        "all_errors": full["errors"],
+        "allowed_nodes": sorted(allowed),
+        "build_output": full.get("build_output", ""),
+    }
 
 
 def validate_reviewer_decision_data(data: Any, *, phase: str) -> Dict[str, Any]:
@@ -992,6 +1050,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     command_names = {
         "node",
         "tablet",
+        "tablet-scoped",
         "worker-handoff",
         "reviewer-decision",
         "correspondence-result",
@@ -1011,6 +1070,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     tablet_parser = subparsers.add_parser("tablet", help="Check the whole tablet structure")
     tablet_parser.add_argument("repo_path", nargs="?", default=".")
+
+    tablet_scoped_parser = subparsers.add_parser(
+        "tablet-scoped",
+        help="Check the tablet, failing only on newly introduced relevant errors",
+    )
+    tablet_scoped_parser.add_argument("repo_path", nargs="?", default=".")
+    tablet_scoped_parser.add_argument("--scope-json", required=True)
 
     handoff_parser = subparsers.add_parser("worker-handoff", help="Validate a worker handoff raw JSON file")
     handoff_parser.add_argument("path")
@@ -1088,6 +1154,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"WARNING: {warn}")
         if result["ok"]:
             print("OK: tablet passes deterministic checks")
+            return 0
+        return 1
+
+    if args.command == "tablet-scoped":
+        repo = Path(args.repo_path).resolve()
+        scope_path = Path(args.scope_json).resolve()
+        allowed_prefixes, forbidden_keywords, approved_axioms_path = _default_check_context(repo)
+        try:
+            scope = json.loads(scope_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"FAIL: could not read scope json {scope_path}: {exc}")
+            return 1
+        baseline_errors = scope.get("baseline_errors", [])
+        allowed_nodes = set(scope.get("allowed_nodes", []))
+        target_name = str(scope.get("target", "") or "").strip()
+        if target_name:
+            from lagent_tablets.tablet import compute_target_impact_region
+            allowed_nodes |= compute_target_impact_region(repo, target_name)
+        print(f"=== Checking tablet (scoped): {repo} ===")
+        result = check_tablet_scoped(
+            repo,
+            allowed_prefixes=allowed_prefixes,
+            forbidden_keywords=forbidden_keywords,
+            baseline_errors=baseline_errors,
+            allowed_nodes=sorted(allowed_nodes),
+            approved_axioms_path=approved_axioms_path,
+        )
+        for err in result["errors"]:
+            print(f"FAIL: {err}")
+        for warn in result["warnings"]:
+            print(f"WARNING: {warn}")
+        if result["ok"]:
+            print("OK: no new relevant deterministic errors in scoped region")
             return 0
         return 1
 

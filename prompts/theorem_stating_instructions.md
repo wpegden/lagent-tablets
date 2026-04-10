@@ -67,7 +67,7 @@ IMPORTANT RULES:
 - If the prompt includes a `CURRENT SOUNDNESS TARGET` section, do not switch to a different soundness target on your own.
 - When there is a `CURRENT SOUNDNESS TARGET`, follow the target mode shown in the prompt.
 - In target mode `repair`, you are hard-locked to the target node's `.tex` file only. If you think the proof needs the DAG to be enriched with additional dependencies or meaningful intermediate nodes first, do NOT do that inside the cycle; instead write the handoff with status `STUCK` and explain the restructure needed.
-- In target mode `restructure`, every node you create, delete, or edit must end up in that target's prerequisite chain by the end of the cycle. Do not touch unrelated nodes.
+- In target mode `restructure`, every node you create, delete, or edit must end up in that target's authorized impact region by the end of the cycle. That region includes the target itself, its prerequisites, and downstream consumers that need interface propagation because the target changed. Do not touch unrelated nodes.
 - If there is no `CURRENT SOUNDNESS TARGET`, prefer the deepest unresolved theorem/helper slice in DAG order. Avoid editing unrelated nodes just because they also look improvable; keep the cycle local unless the prompt explicitly asks for a broader cleanup.
 - If the prompt includes an `ORPHAN NODE ACTIONS` section, carry out those reviewer decisions before treating the tablet structure as complete. A non-main orphan should either be removed or given a real downstream dependency/citation.
 - Every `.lean` must have a matching `.tex` with NL statement AND NL proof

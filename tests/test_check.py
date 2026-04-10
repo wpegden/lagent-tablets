@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from lagent_tablets.check import (
     check_node,
+    check_tablet_scoped,
     run_print_axioms,
     validate_correspondence_result_data,
     validate_node_soundness_result_data,
@@ -206,6 +207,40 @@ class TestArtifactValidation(unittest.TestCase):
             "difficulty_hints": {"helper": "easy"},
         }, phase="theorem_stating", repo=repo)
         self.assertTrue(result["ok"])
+
+    def test_scoped_tablet_check_ignores_unrelated_baseline_debt(self):
+        repo = Path(tempfile.mkdtemp())
+        tablet = repo / "Tablet"
+        tablet.mkdir()
+        (tablet / "target.lean").write_text("-- [TABLET NODE: target]\ntheorem target : True := by\n  trivial\n")
+        (tablet / "target.tex").write_text("\\begin{theorem}True\\end{theorem}\n")
+        (tablet / "other.lean").write_text("-- [TABLET NODE: other]\ntheorem other : True := by\n  trivial\n")
+        (tablet / "other.tex").write_text("\\begin{theorem}True\\end{theorem}\n")
+
+        with patch(
+            "lagent_tablets.check.check_tablet",
+            return_value={
+                "ok": False,
+                "errors": [
+                    "other: .tex format errors: ['Missing statement environment (theorem/lemma/definition/proposition)']",
+                    "target: Compilation failed",
+                ],
+                "warnings": [],
+                "build_output": "",
+            },
+        ):
+            result = check_tablet_scoped(
+                repo,
+                allowed_prefixes=["Mathlib"],
+                forbidden_keywords=["sorry", "axiom"],
+                baseline_errors=[
+                    "other: .tex format errors: ['Missing statement environment (theorem/lemma/definition/proposition)']",
+                ],
+                allowed_nodes=["target"],
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["errors"], ["target: Compilation failed"])
 
 
 if __name__ == "__main__":

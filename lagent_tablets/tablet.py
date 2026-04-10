@@ -466,6 +466,53 @@ def compute_import_closure(
     return closure
 
 
+def compute_reverse_import_closure(
+    repo_path: Path,
+    node_name: str,
+) -> Set[str]:
+    """Compute the transitive set of Tablet nodes that (directly or indirectly) import a node."""
+    tablet_dir = repo_path / "Tablet"
+    if not tablet_dir.exists():
+        return set()
+
+    importers: Dict[str, Set[str]] = {}
+    for lean_path in tablet_dir.glob("*.lean"):
+        name = lean_path.stem
+        if name in (PREAMBLE_NAME, AXIOMS_NAME):
+            continue
+        content = lean_path.read_text(encoding="utf-8")
+        for dep in extract_tablet_imports(content):
+            importers.setdefault(dep, set()).add(name)
+
+    closure: Set[str] = set()
+    stack = list(importers.get(node_name, set()))
+    while stack:
+        parent = stack.pop()
+        if parent in closure:
+            continue
+        closure.add(parent)
+        stack.extend(sorted(importers.get(parent, set())))
+    return closure
+
+
+def compute_target_impact_region(
+    repo_path: Path,
+    node_name: str,
+) -> Set[str]:
+    """Compute the target-centered edit region for theorem-stating restructures.
+
+    The impact region includes the target itself, its prerequisite closure, and
+    every downstream consumer that imports the target directly or transitively.
+    """
+    if not node_name or not node_lean_path(repo_path, node_name).exists():
+        return set()
+    return (
+        {node_name}
+        | compute_import_closure(repo_path, node_name)
+        | compute_reverse_import_closure(repo_path, node_name)
+    )
+
+
 def find_orphan_nodes(tablet: TabletState, repo_path: Path) -> List[str]:
     """Find nodes that are not imported by any other node and are not paper_main_result."""
     imported_by_something: Set[str] = set()

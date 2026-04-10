@@ -32,7 +32,13 @@ from lagent_tablets.config import (
     load_config,
     PHASES,
 )
-from lagent_tablets.cycle import CycleOutcome, run_cycle, run_theorem_stating_cycle
+from lagent_tablets.cycle import (
+    CycleOutcome,
+    _normalize_theorem_stating_replay_state,
+    preview_next_cycle,
+    run_cycle,
+    run_theorem_stating_cycle,
+)
 from lagent_tablets.state import (
     SupervisorState,
     TabletState,
@@ -241,6 +247,8 @@ def main(argv: Optional[list] = None) -> int:
     )
     parser.add_argument("--config", required=True, type=Path, help="Path to config.json")
     parser.add_argument("--dry-run", action="store_true", help="Validate config and exit")
+    parser.add_argument("--preview-next-cycle", action="store_true",
+                        help="Render the next worker cycle prompt/state without launching any agents")
     parser.add_argument("--cycles", type=int, default=None,
                         help="Run at most N cycles then stop (overrides config max_cycles)")
     parser.add_argument("--stop-at-phase-boundary", action="store_true",
@@ -318,6 +326,24 @@ def main(argv: Optional[list] = None) -> int:
     # Policy manager
     policy_manager = PolicyManager(config)
     policy = policy_manager.current()
+
+    startup_notes = _normalize_theorem_stating_replay_state(state)
+    if startup_notes:
+        for note in startup_notes:
+            print(f"  normalized: {note}")
+        save_state(state_path(config), state)
+
+    if args.preview_next_cycle:
+        preview = preview_next_cycle(config, state, tablet, policy)
+        summary = {
+            k: v for k, v in preview.items()
+            if k != "worker_prompt"
+        }
+        print(json.dumps(summary, indent=2))
+        if preview.get("worker_prompt"):
+            print("\n--- WORKER PROMPT ---\n")
+            print(preview["worker_prompt"])
+        return 1 if preview.get("preflight_error") else 0
 
     # Config manager (for hot-reload)
     config_manager = ConfigManager(config)

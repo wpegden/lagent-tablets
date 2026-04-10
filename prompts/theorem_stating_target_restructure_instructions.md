@@ -3,16 +3,19 @@
 PHASE: theorem_stating
 MODE: target restructure
 
-YOUR GOAL: Strengthen the current soundness target by making paper-faithful DAG changes inside that target's prerequisite slice only.
+YOUR GOAL: Strengthen the current soundness target by making paper-faithful DAG changes inside that target's authorized impact region only.
+
+{authorized_region_note}
 
 WHAT YOU MAY EDIT:
 - `Tablet/{target}.tex`
 - `Tablet/{target}.lean`
 - Existing prerequisite nodes of `{target}` when they genuinely need statement/proof/dependency changes for this same target
+- Existing downstream consumers of `{target}` when they need mechanical interface or proof updates because this target changed
 - New nodes, only when they become genuine prerequisites of `{target}` by the end of the cycle
 
 WHAT YOU MUST NOT EDIT:
-- Unrelated nodes outside `{target}`'s final prerequisite slice
+- Unrelated nodes outside `{target}`'s authorized impact region
 - `Tablet/Preamble.lean` unless the restructure genuinely requires a new specific Mathlib import
 - `Tablet.lean`
 - Any generated support file
@@ -23,7 +26,8 @@ RESTRUCTURE EXPECTATIONS:
 - Prefer paper-facing intermediate claims that make the DAG richer and later Lean formalization cleaner
 - Do not invent gratuitous helpers; every new node should reflect real paper structure
 - If you add or revise prerequisite nodes, make the dependency chain explicit in `.lean` imports and `.tex` citations
-- Every node you touch or create must end up in `{target}`'s prerequisite chain by the end of the cycle
+- If the target's statement or interface changes, update any downstream consumers only as far as needed to keep the target-centered region internally consistent
+- Every node you touch or create must remain in `{target}`'s authorized impact region by the end of the cycle
 
 TABLET / NODE RULES:
 - Every node must still have matching `.lean` and `.tex` files
@@ -33,7 +37,8 @@ TABLET / NODE RULES:
 - The paper's detail level is a floor, not a ceiling
 
 MANDATORY BEFORE SUBMITTING:
-- Run `python3 {check_script} tablet {repo_path}` and fix any deterministic errors
+- Run `{scoped_tablet_check_command}` and fix any newly introduced deterministic errors in the authorized impact region
+- Pre-existing unrelated deterministic errors outside that authorized region do not need to be fixed in this cycle
 
 WHEN DONE:
 Write the raw handoff JSON to `{raw_output_path}`:
@@ -41,7 +46,7 @@ Write the raw handoff JSON to `{raw_output_path}`:
   "summary": "brief description of the restructure or proof improvement",
   "status": "NOT_STUCK | STUCK | DONE | NEED_INPUT",
   "new_nodes": ["list any genuinely new prerequisite nodes you added"],
-  "difficulty_hints": {{"node_name": "easy | hard"}}
+  "difficulty_hints": {{"new_node_name": "easy | hard"}}
 }}
 
 Then run:

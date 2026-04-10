@@ -4,8 +4,10 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
+from lagent_tablets import nl_cache
 from lagent_tablets.nl_cache import correspondence_fingerprint
 
 
@@ -121,3 +123,23 @@ class TestLeanAwareCorrespondenceFingerprint(unittest.TestCase):
         after = correspondence_fingerprint(repo, "main")
 
         self.assertNotEqual(before, after)
+
+
+class TestPrimeCorrespondenceFingerprints(unittest.TestCase):
+    def test_prime_uses_bounded_batches(self) -> None:
+        repo = Path("/tmp/fake-repo")
+        snapshot = (("Tablet/A.lean", "h"),)
+        calls = []
+
+        def fake_run(_repo: Path, node_names: list[str]) -> dict[str, str]:
+            calls.append(list(node_names))
+            return {name: f"payload:{name}" for name in node_names}
+
+        with mock.patch.object(nl_cache, "_has_lake_project", return_value=True), \
+            mock.patch.object(nl_cache, "_lean_project_snapshot_key", return_value=snapshot), \
+            mock.patch.object(nl_cache, "_run_lean_correspondence_payloads", side_effect=fake_run), \
+            mock.patch.object(nl_cache, "_LEAN_FINGERPRINT_PRIME_BATCH_SIZE", 1), \
+            mock.patch.dict(nl_cache._LEAN_CORRESPONDENCE_CACHE, {}, clear=True):
+            nl_cache.prime_correspondence_fingerprints(repo, ["a", "b", "c"])
+
+        self.assertEqual(calls, [["a"], ["b"], ["c"]])

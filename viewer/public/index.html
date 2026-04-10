@@ -52,6 +52,7 @@ svg { width: 100%; height: 100%; }
 .node.error rect { fill: #3d1a1a; stroke: #ff5555; }
 .node.selected rect { stroke-width: 3; }
 .node.correspondence-working rect { stroke: #f1fa8c !important; stroke-width: 3; }
+.node.worker-working rect { stroke: #f1fa8c !important; stroke-width: 3; }
 .edge { fill: none; stroke-width: 1.5; pointer-events: none; }
 .edge.edge-failed { stroke: #444; }
 .edge.edge-unknown { stroke: #a2a2a2; }
@@ -186,34 +187,53 @@ function layoutDAG(nodes, edges) {
 
 let allNodes = {}, allCycles = [], timelineSlots = [], selectedNode = null, hoveredNode = null, currentState = {};
 
+function appBasePath() {
+  const path = (window.location.pathname || '/').replace(/\/index\.html$/, '');
+  if (!path || path === '/') return '';
+  return path.endsWith('/') ? path.slice(0, -1) : path;
+}
+
+function apiPath(rel) {
+  return `${appBasePath()}/api/${rel}`.replace(/^\/\//, '/');
+}
+
 async function fetchViewerState(url) {
   const res = await fetch(url);
+  if (!res.ok) throw new Error(`${url} -> ${res.status}`);
   return res.json();
 }
 
 async function fetchData() {
-  const [viewerRes, cyclesRes] = await Promise.all([
-    fetchViewerState('api/viewer-state.json'),
-    fetch('api/cycles.json').then(r => r.json()),
-  ]);
-  allNodes = viewerRes.nodes || {};
-  currentState = viewerRes;
-  allCycles = cyclesRes;
+  try {
+    const [viewerRes, cyclesRes] = await Promise.all([
+      fetchViewerState(apiPath('viewer-state.json')),
+      fetch(apiPath('cycles.json')).then(async r => {
+        if (!r.ok) throw new Error(`cycles.json -> ${r.status}`);
+        return r.json();
+      }),
+    ]);
+    allNodes = viewerRes.nodes || {};
+    currentState = viewerRes;
+    allCycles = cyclesRes;
 
-  document.getElementById('header-status').textContent =
-    `Cycle ${viewerRes.state.cycle} | Phase: ${viewerRes.state.phase} | ${Object.values(allNodes).filter(n => n.status === 'closed').length}/${Object.keys(allNodes).length} closed`;
+    document.getElementById('header-status').textContent =
+      `Cycle ${viewerRes.state.cycle} | Phase: ${viewerRes.state.phase} | ${Object.values(allNodes).filter(n => n.status === 'closed').length}/${Object.keys(allNodes).length} closed`;
 
-  // Setup slider
-  const slider = document.getElementById('cycle-slider');
-  const cycleNums = Array.from(new Set(allCycles.map(c => c.cycle))).sort((a, b) => a - b);
-  timelineSlots = [...cycleNums, 'current'];
-  slider.min = 0;
-  slider.max = Math.max(timelineSlots.length - 1, 0);
-  slider.value = slider.max;
-  updateCycleInfo();
+    // Setup slider
+    const slider = document.getElementById('cycle-slider');
+    const cycleNums = Array.from(new Set(allCycles.map(c => c.cycle))).sort((a, b) => a - b);
+    timelineSlots = [...cycleNums, 'current'];
+    slider.min = 0;
+    slider.max = Math.max(timelineSlots.length - 1, 0);
+    slider.value = slider.max;
+    updateCycleInfo();
 
-  renderDAG();
-  renderFeedbackPanel();
+    renderDAG();
+    renderFeedbackPanel();
+  } catch (err) {
+    document.getElementById('header-status').textContent = `Viewer load failed: ${err.message}`;
+    console.error(err);
+  }
 }
 
 function isRecursivelyClosed(name, nodes) {
@@ -232,6 +252,15 @@ function getNodeClass(name, nodes) {
   if (isRecursivelyClosed(name, nodes)) return 'recursive-closed';
   if (node.status === 'closed') return 'closed';
   return 'open';
+}
+
+function getWorkerFocusName() {
+  const state = currentState?.state || {};
+  const meta = currentState?.meta || {};
+  if (meta.source !== 'worker') return '';
+  if (state.phase === 'theorem_stating') return state.theorem_soundness_target || '';
+  if (state.phase === 'proof_formalization') return state.active_node || '';
+  return '';
 }
 
 function renderDAG() {
@@ -263,6 +292,7 @@ function renderDAG() {
   svg.setAttribute('viewBox', `0 0 ${maxX - minX + 280} ${maxY - minY + 120}`);
 
   const ns = 'http://www.w3.org/2000/svg';
+  const workerFocusName = getWorkerFocusName();
 
   // Arrow marker
   const defs = document.createElementNS(ns, 'defs');
@@ -317,6 +347,7 @@ function renderDAG() {
       'class',
       `node ${cls} ${diffCls}`
       + (selectedNode === name ? ' selected' : '')
+      + (workerFocusName === name ? ' worker-working' : '')
       + (node.activity?.correspondence ? ' correspondence-working' : '')
     );
     g.setAttribute('transform', `translate(${pos.x - 90}, ${pos.y - 20})`);
@@ -467,7 +498,7 @@ async function updateCycleInfo() {
   if (isLatest) {
     // Show current live state
     info.textContent = `Current (live, state cycle ${currentState.state?.cycle ?? '?'})`;
-    const live = await fetchViewerState('api/viewer-state.json');
+    const live = await fetchViewerState(apiPath('viewer-state.json'));
     allNodes = live.nodes || {};
     currentState = live;
     renderDAG();
@@ -484,7 +515,7 @@ async function updateCycleInfo() {
 
   // Load historical state from git
   try {
-    const resp = await fetch(`api/state-at/${val}.json`);
+    const resp = await fetch(apiPath(`state-at/${val}.json`));
     if (resp.ok) {
       const data = await resp.json();
       allNodes = data.nodes || {};
@@ -509,6 +540,7 @@ function renderFeedbackPanel() {
   // Show feedback panel only when the supervisor is awaiting human input
   const awaiting = currentState?.state?.awaiting_human_input || false;
   if (awaiting || decision === 'NEED_INPUT' || decision === 'ADVANCE_PHASE') {
+    const downloadUrl = apiPath('download-tablet');
     // On mobile, auto-open the detail pane when feedback is needed
     document.getElementById('detail-pane').classList.add('mobile-open');
     container.innerHTML = `
@@ -519,7 +551,7 @@ function renderFeedbackPanel() {
             decision === 'NEED_INPUT' ? 'Reviewer requested human input.' :
             'Review the tablet structure and provide feedback.'}
         </p>
-        <p style="margin-bottom:8px"><a href="api/download-tablet" style="color:#8be9fd; font-size:12px">Download tablet snapshot (.zip)</a></p>
+        <p style="margin-bottom:8px"><a href="${downloadUrl}" style="color:#8be9fd; font-size:12px">Download tablet snapshot (.zip)</a></p>
         <textarea id="feedback-text" placeholder="Enter feedback for the worker (or leave empty to approve)..."></textarea>
         <div>
           <button class="btn btn-approve" onclick="submitFeedback('approve')">✓ Approve & Advance</button>
@@ -537,7 +569,7 @@ async function submitFeedback(action) {
   const text = document.getElementById('feedback-text')?.value || '';
   const msg = document.getElementById('feedback-msg');
   try {
-    const resp = await fetch('api/feedback', {
+    const resp = await fetch(apiPath('feedback'), {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ action, feedback: text }),

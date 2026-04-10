@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import time
+import copy
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -52,6 +53,7 @@ from lagent_tablets.state import (
 from lagent_tablets.tablet import (
     PREAMBLE_NAME,
     compute_import_closure,
+    compute_target_impact_region,
     declaration_hash,
     extract_imports,
     extract_tablet_imports,
@@ -75,6 +77,7 @@ from lagent_tablets.tablet import (
 from lagent_tablets.check import (
     check_node as run_check_node,
     check_tablet as run_check_tablet,
+    check_tablet_scoped as run_check_tablet_scoped,
     validate_json_artifact,
 )
 from lagent_tablets.nl_cache import (
@@ -336,6 +339,139 @@ def _suspend_theorem_soundness_target(state: SupervisorState) -> SupervisorState
         theorem_target_edit_mode="repair",
         theorem_correspondence_blocked=True,
     )
+
+
+def _theorem_stating_open_blockers(state: SupervisorState) -> List[Dict[str, str]]:
+    blockers = normalize_open_blockers(state.open_blockers)
+    if blockers:
+        return blockers
+    if isinstance(state.last_review, dict):
+        return normalize_open_blockers(
+            state.last_review.get("open_blockers", state.last_review.get("open_rejections", []))
+        )
+    return []
+
+
+def _theorem_stating_has_correspondence_blockers(state: SupervisorState) -> bool:
+    return any(entry.get("phase") == "correspondence" for entry in _theorem_stating_open_blockers(state))
+
+
+def _has_stale_theorem_stating_phase_carryover(state: SupervisorState) -> bool:
+    if state.phase != "theorem_stating" or not isinstance(state.last_review, dict):
+        return False
+    review = state.last_review
+    decision = str(review.get("decision", "") or "").upper()
+    next_prompt = str(review.get("next_prompt", "") or "")
+    next_active_node = str(review.get("next_active_node", "") or "").strip()
+    lowered = next_prompt.lower()
+    has_open_blockers = bool(_theorem_stating_open_blockers(state))
+
+    if has_open_blockers and decision == "ADVANCE_PHASE":
+        return True
+    if next_active_node:
+        return True
+    if "proof_formalization" in lowered or lowered.startswith("begin proof_formalization"):
+        return True
+    return False
+
+
+def _normalize_theorem_stating_replay_state(state: SupervisorState) -> List[str]:
+    """Normalize persisted theorem-stating state before cycle dispatch.
+
+    Rewinds can preserve stale reviewer carryover and stale target fields from
+    an older interpretation of theorem-stating. Normalize those here so worker
+    prompts and scheduling start from a coherent state.
+    """
+    notes: List[str] = []
+    if state.phase != "theorem_stating":
+        return notes
+
+    blockers = _theorem_stating_open_blockers(state)
+    if blockers != state.open_blockers:
+        state.open_blockers = blockers
+        notes.append("synchronized theorem-stating open blockers from persisted review state")
+
+    if _has_stale_theorem_stating_phase_carryover(state) and isinstance(state.last_review, dict):
+        cleared_keys: List[str] = []
+        for key in ("next_prompt", "next_active_node", "paper_focus_ranges"):
+            if key in state.last_review:
+                state.last_review.pop(key, None)
+                cleared_keys.append(key)
+        if cleared_keys:
+            notes.append(
+                "cleared stale theorem-stating reviewer carryover: "
+                + ", ".join(cleared_keys)
+            )
+
+    if _theorem_stating_has_correspondence_blockers(state):
+        if state.theorem_soundness_target:
+            notes.append(
+                "cleared theorem-stating soundness target because correspondence blockers remain open"
+            )
+        state.theorem_correspondence_blocked = True
+        state.theorem_soundness_target = ""
+        state.theorem_target_edit_mode = "repair"
+    elif state.theorem_correspondence_blocked and not state.resume_from:
+        state.theorem_correspondence_blocked = False
+        notes.append("cleared stale theorem correspondence-blocked flag")
+
+    if not state.theorem_soundness_target:
+        state.theorem_target_edit_mode = "repair"
+
+    return notes
+
+
+def _prepare_theorem_stating_worker_state(
+    config: Config,
+    state: SupervisorState,
+    tablet: TabletState,
+    policy: Policy,
+    *,
+    nl_cache: Any,
+) -> List[str]:
+    """Mutate theorem-stating state into the worker-facing shape for the next cycle."""
+    notes = _normalize_theorem_stating_replay_state(state)
+    previous_soundness_target = state.theorem_soundness_target
+
+    if state.theorem_correspondence_blocked or _theorem_stating_has_correspondence_blockers(state):
+        state.theorem_correspondence_blocked = True
+        state.theorem_soundness_target = ""
+        state.theorem_target_edit_mode = "repair"
+        return notes
+
+    state.theorem_correspondence_blocked = False
+    soundness_candidates = _eligible_soundness_nodes(config, tablet)
+    soundness_candidates = nl_cache.filter_uncached(config.repo_path, soundness_candidates, "soundness")
+    active_soundness_agents = _effective_soundness_agents(config, policy)
+    state.theorem_soundness_target = _select_theorem_soundness_target(
+        config,
+        tablet,
+        soundness_candidates,
+        soundness_agents=active_soundness_agents,
+        disagree_bias=policy.verification.soundness_disagree_bias,
+        preferred=state.theorem_soundness_target,
+    )
+    if not state.theorem_soundness_target or state.theorem_soundness_target != previous_soundness_target:
+        state.theorem_target_edit_mode = "repair"
+    return notes
+
+
+def _theorem_stating_preflight_error(state: SupervisorState) -> str:
+    if state.phase != "theorem_stating":
+        return ""
+    if _theorem_stating_has_correspondence_blockers(state) and state.theorem_soundness_target:
+        return (
+            "Open correspondence blockers are incompatible with an active theorem-stating "
+            f"soundness target ({state.theorem_soundness_target})."
+        )
+    if not state.theorem_soundness_target and _theorem_target_edit_mode(state) == "restructure":
+        return "Theorem-stating target mode `restructure` requires an active soundness target."
+    if _has_stale_theorem_stating_phase_carryover(state):
+        return (
+            "Stale proof-formalization carryover remained in theorem-stating review state "
+            "after normalization."
+        )
+    return ""
 
 
 def _default_theorem_stating_next_prompt() -> str:
@@ -2032,9 +2168,7 @@ def _snapshot_tablet_node_hashes(repo_path: Path) -> Dict[str, str]:
 
 
 def _theorem_target_scope(repo_path: Path, target: str) -> Set[str]:
-    if not target or not node_lean_path(repo_path, target).exists():
-        return set()
-    return {target} | compute_import_closure(repo_path, target)
+    return compute_target_impact_region(repo_path, target)
 
 
 def _theorem_target_edit_mode(state: SupervisorState) -> str:
@@ -2085,9 +2219,41 @@ def _validate_theorem_target_edit_scope(
         f"Out-of-scope theorem-stating edits for target `{target}`: "
         f"{', '.join(out_of_scope)}. "
         "When a current soundness target is set, changes must stay within that target's "
-        "prerequisite closure (before or after the cycle). "
+        "authorized impact region (target, prerequisites, and downstream consumers, "
+        "before or after the cycle). "
         f"Allowed scope: {allowed_preview or '(empty)'}."
     )
+
+
+def _scoped_tablet_check_payload_path(log_dir: Path) -> Path:
+    return log_dir / "theorem_target_scope_check.json"
+
+
+def _write_scoped_tablet_check_payload(
+    config: Config,
+    log_dir: Path,
+    target: str,
+    allowed_nodes: Set[str],
+) -> Path:
+    repo = config.repo_path
+    forbidden = [
+        kw for kw in FORBIDDEN_KEYWORDS_DEFAULT
+        if kw not in config.workflow.forbidden_keyword_allowlist
+    ]
+    baseline = run_check_tablet(
+        repo,
+        allowed_prefixes=config.workflow.allowed_import_prefixes,
+        forbidden_keywords=forbidden,
+        approved_axioms_path=config.workflow.approved_axioms_path,
+    )
+    payload = {
+        "target": target,
+        "allowed_nodes": sorted(allowed_nodes),
+        "baseline_errors": list(baseline.get("errors", [])),
+    }
+    out = _scoped_tablet_check_payload_path(log_dir)
+    save_json(out, payload, mode=0o644)
+    return out
 
 
 def _validate_theorem_target_repair_changes(
@@ -2642,28 +2808,31 @@ def run_theorem_stating_cycle(
     log_dir = config.state_dir / "logs" / f"cycle-{cycle:04d}"
     worker_handoff: Optional[Dict[str, Any]] = None
 
-    previous_soundness_target = state.theorem_soundness_target
-    if state.theorem_correspondence_blocked:
-        state.theorem_soundness_target = ""
-        state.theorem_target_edit_mode = "repair"
-    else:
-        soundness_candidates = _eligible_soundness_nodes(config, tablet)
-        soundness_candidates = nl_cache.filter_uncached(repo, soundness_candidates, "soundness")
-        active_soundness_agents = _effective_soundness_agents(config, policy)
-        state.theorem_soundness_target = _select_theorem_soundness_target(
-            config,
-            tablet,
-            soundness_candidates,
-            soundness_agents=active_soundness_agents,
-            disagree_bias=policy.verification.soundness_disagree_bias,
-            preferred=state.theorem_soundness_target,
+    prep_notes = _prepare_theorem_stating_worker_state(
+        config,
+        state,
+        tablet,
+        policy,
+        nl_cache=nl_cache,
+    )
+    for note in prep_notes:
+        print(f"  normalize: {note}")
+    preflight_error = _theorem_stating_preflight_error(state)
+    if preflight_error:
+        print(f"  INVALID: {preflight_error}")
+        save_state(state_path(config), state)
+        return CycleOutcome(
+            outcome="INVALID",
+            detail=preflight_error,
         )
-        if not state.theorem_soundness_target or state.theorem_soundness_target != previous_soundness_target:
-            state.theorem_target_edit_mode = "repair"
     target_repair_mode = bool(
         state.theorem_soundness_target and _theorem_target_edit_mode(state) == "repair"
     )
+    target_restructure_mode = bool(
+        state.theorem_soundness_target and _theorem_target_edit_mode(state) == "restructure"
+    )
     target_scope_before_worker = _theorem_target_scope(repo, state.theorem_soundness_target)
+    scoped_tablet_check_payload_path: Optional[Path] = None
     node_hashes_before_worker = _snapshot_tablet_node_hashes(repo) if not resume_from else {}
     tablet_snapshot_before_worker = _snapshot_tablet_dir(repo) if not resume_from else {}
 
@@ -2682,8 +2851,18 @@ def run_theorem_stating_cycle(
             repair_mode=target_repair_mode,
         )
 
+        if target_restructure_mode and state.theorem_soundness_target:
+            scoped_tablet_check_payload_path = _write_scoped_tablet_check_payload(
+                config,
+                log_dir,
+                state.theorem_soundness_target,
+                target_scope_before_worker,
+            )
+
         worker_prompt = build_theorem_stating_prompt(
             config, state, tablet, policy, previous_outcome=previous_outcome,
+            authorized_region=sorted(target_scope_before_worker),
+            scoped_tablet_check_payload_path=scoped_tablet_check_payload_path,
         )
         worker_artifacts = _clear_artifact_files(config, "worker_handoff.json")
 
@@ -2766,6 +2945,34 @@ def run_theorem_stating_cycle(
                 outcome="INVALID",
                 detail=scope_error,
             )
+
+        if target_restructure_mode and state.theorem_soundness_target:
+            allowed_nodes = sorted(
+                target_scope_before_worker | _theorem_target_scope(repo, state.theorem_soundness_target)
+            )
+            forbidden = [
+                kw for kw in FORBIDDEN_KEYWORDS_DEFAULT
+                if kw not in config.workflow.forbidden_keyword_allowlist
+            ]
+            scoped_result = run_check_tablet_scoped(
+                repo,
+                allowed_prefixes=config.workflow.allowed_import_prefixes,
+                forbidden_keywords=forbidden,
+                baseline_errors=(
+                    load_json(scoped_tablet_check_payload_path, {}).get("baseline_errors", [])
+                    if scoped_tablet_check_payload_path else []
+                ),
+                allowed_nodes=allowed_nodes,
+                approved_axioms_path=config.workflow.approved_axioms_path,
+            )
+            if scoped_result["errors"]:
+                print(f"  INVALID: scoped deterministic check failed: {scoped_result['errors'][0]}")
+                save_state(state_path(config), state)
+                return CycleOutcome(
+                    outcome="INVALID",
+                    detail=scoped_result["errors"][0],
+                    build_output=scoped_result.get("build_output", ""),
+                )
 
         # Read difficulty hints from worker handoff (if present)
         difficulty_hints: Dict[str, str] = {}
@@ -2940,6 +3147,7 @@ def run_theorem_stating_cycle(
 
     correspondence_blocked = _correspondence_gate_open(nl_verification_results)
     reviewer_state = _suspend_theorem_soundness_target(state) if correspondence_blocked else state
+    _save_live_viewer_state(config, tablet, reviewer_state, source="reviewer")
 
     reviewer_prompt = build_theorem_stating_reviewer_prompt(
         config, reviewer_state, tablet, policy,
@@ -3063,6 +3271,7 @@ def run_theorem_stating_cycle(
         state.last_review = decision
         state.review_log.append({"cycle": cycle, **decision})
         print(f"  Reviewer: {decision.get('decision', '?')} -- {decision.get('reason', '')[:100]}")
+        _save_live_viewer_state(config, tablet, state, source="reviewer")
     else:
         print(f"  Reviewer: could not validate decision ({decision_error or 'missing raw/done artifact'})")
 
@@ -3094,6 +3303,95 @@ def run_theorem_stating_cycle(
     )
 
     return outcome
+
+
+def preview_next_cycle(
+    config: Config,
+    state: SupervisorState,
+    tablet: TabletState,
+    policy: Policy,
+) -> Dict[str, Any]:
+    """Preview the next worker cycle without launching any agents."""
+    preview_state: SupervisorState = copy.deepcopy(state)
+    preview_tablet: TabletState = copy.deepcopy(tablet)
+    next_cycle = preview_state.cycle + 1 if not (preview_state.resume_from or "") else preview_state.cycle
+
+    if preview_state.phase == "theorem_stating":
+        from lagent_tablets.prompts import build_theorem_stating_prompt
+        from lagent_tablets.nl_cache import NLCache
+
+        nl_cache = NLCache(config.state_dir / "nl_cache.json")
+        notes = _prepare_theorem_stating_worker_state(
+            config,
+            preview_state,
+            preview_tablet,
+            policy,
+            nl_cache=nl_cache,
+        )
+        error = _theorem_stating_preflight_error(preview_state)
+        target = preview_state.theorem_soundness_target.strip()
+        mode = _theorem_target_edit_mode(preview_state)
+        authorized_region = sorted(_theorem_target_scope(config.repo_path, target)) if target else []
+        prompt = build_theorem_stating_prompt(
+            config,
+            preview_state,
+            preview_tablet,
+            policy,
+            authorized_region=authorized_region,
+            scoped_tablet_check_payload_path=(
+                Path("<preview-scope.json>") if target and mode == "restructure" else None
+            ),
+        )
+        return {
+            "phase": preview_state.phase,
+            "cycle": next_cycle,
+            "resume_from": preview_state.resume_from,
+            "normalized": notes,
+            "preflight_error": error,
+            "state": {
+                "theorem_soundness_target": preview_state.theorem_soundness_target,
+                "theorem_target_edit_mode": preview_state.theorem_target_edit_mode,
+                "theorem_correspondence_blocked": preview_state.theorem_correspondence_blocked,
+                "open_blockers": _theorem_stating_open_blockers(preview_state),
+            },
+            "worker_prompt": prompt,
+        }
+
+    if preview_state.phase in ("proof_formalization", "proof_complete_style_cleanup"):
+        from lagent_tablets.prompts import build_worker_prompt
+
+        active_node = preview_state.active_node or preview_tablet.active_node
+        node_meta = preview_tablet.nodes.get(active_node)
+        node_difficulty = node_meta.difficulty if node_meta else "hard"
+        prompt = build_worker_prompt(
+            config,
+            preview_state,
+            preview_tablet,
+            policy,
+            difficulty=node_difficulty,
+        )
+        return {
+            "phase": preview_state.phase,
+            "cycle": next_cycle,
+            "resume_from": preview_state.resume_from,
+            "normalized": [],
+            "preflight_error": "",
+            "state": {
+                "active_node": active_node,
+                "difficulty": node_difficulty,
+            },
+            "worker_prompt": prompt,
+        }
+
+    return {
+        "phase": preview_state.phase,
+        "cycle": next_cycle,
+        "resume_from": preview_state.resume_from,
+        "normalized": [],
+        "preflight_error": f"Preview is not implemented for phase {preview_state.phase}",
+        "state": {},
+        "worker_prompt": "",
+    }
 
 
 def run_cycle(
