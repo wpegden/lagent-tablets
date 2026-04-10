@@ -26,6 +26,7 @@ OPEN_BLOCKER_PHASES = ("correspondence", "paper_faithfulness", "soundness")
 # Backward-compatible alias for older code/tests/state.
 OPEN_REJECTION_PHASES = OPEN_BLOCKER_PHASES
 ORPHAN_RESOLUTION_ACTIONS = ("remove", "keep_and_add_dependency")
+DEFAULT_JSON_FILE_MODE = 0o664
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +63,7 @@ def load_json(path: Path, default: Any = None) -> Any:
 def save_json(path: Path, data: Any, *, mode: Optional[int] = None) -> None:
     """Atomically write a JSON file (temp + rename)."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    target_mode = mode if mode is not None else DEFAULT_JSON_FILE_MODE
     with _exclusive_lock(path):
         fd, tmp_name = tempfile.mkstemp(
             prefix=path.name + ".", suffix=".tmp", dir=str(path.parent)
@@ -72,8 +74,8 @@ def save_json(path: Path, data: Any, *, mode: Optional[int] = None) -> None:
                 f.write("\n")
                 f.flush()
                 os.fsync(f.fileno())
-            if mode is not None:
-                os.chmod(tmp_name, mode)
+            if target_mode is not None:
+                os.chmod(tmp_name, target_mode)
             os.replace(tmp_name, path)
         finally:
             try:

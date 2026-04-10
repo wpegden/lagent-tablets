@@ -184,6 +184,8 @@ def run_worker_burst(
             return run(config, prompt, role="worker", work_dir=work_dir,
                       burst_user=burst_user, timeout=timeout_seconds,
                       port=port,
+                      log_dir=log_dir,
+                      artifact_prefix=prefix,
                       done_file=handoff_file)
 
         # Unknown providers: script-based headless (-p mode)
@@ -236,6 +238,8 @@ def run_reviewer_burst(
             return run(config, prompt, role="reviewer", work_dir=work_dir,
                       burst_user=burst_user, timeout=timeout_seconds,
                       port=port, fresh=fresh,
+                      log_dir=log_dir,
+                      artifact_prefix=prefix,
                       done_file=done_file or work_dir / "reviewer_decision.json")
 
         # Unknown providers: script-based headless

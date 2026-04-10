@@ -3,57 +3,50 @@
 #
 # Usage:
 #   ./scripts/setup_repo.sh [--reset] <repo_path> <paper_tex_path> [project_slug]
-#
-# This is intended to be the one-shot project bootstrap:
-# - create or recreate the repo
-# - initialize git, supervisor state, deterministic checker scripts, config, and viewer registration
-# - prewarm Lean dependencies as the burst user so later worker cycles do not hit mixed-user
-#   permission failures in .lake
-# - run both worker-side and supervisor-side deterministic validation before returning
 
 set -euo pipefail
 umask 0002
 
 usage() {
-    cat <<'EOF'
+  cat <<'EOF'
 Usage: ./scripts/setup_repo.sh [--reset] <repo_path> <paper_tex_path> [project_slug]
 
-  --reset         Remove any existing repo/config/static payload for this project first
+  --reset         Stop any existing project process and recreate the repo from scratch
   repo_path       Where to create the formalization repo
   paper_tex_path  Path to the source paper .tex file
-  project_slug    Optional viewer/config slug (defaults to basename(repo_path))
+  project_slug    Optional viewer/session slug (defaults to basename(repo_path))
 EOF
 }
 
 RESET=0
 while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --reset|--force)
-            RESET=1
-            shift
-            ;;
-        -h|--help)
-            usage
-            exit 0
-            ;;
-        --)
-            shift
-            break
-            ;;
-        -*)
-            echo "ERROR: Unknown option: $1" >&2
-            usage >&2
-            exit 1
-            ;;
-        *)
-            break
-            ;;
-    esac
+  case "$1" in
+    --reset|--force)
+      RESET=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "ERROR: Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      break
+      ;;
+  esac
 done
 
 if [ $# -lt 2 ]; then
-    usage >&2
-    exit 1
+  usage >&2
+  exit 1
 fi
 
 REPO="$1"
@@ -62,9 +55,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 DEFAULT_SLUG="$(basename "$REPO" | sed -E 's/_tablets?$//')"
 PROJECT_SLUG="${3:-${PROJECT_SLUG:-$DEFAULT_SLUG}}"
-VIEWER_PROJECTS_FILE="${VIEWER_PROJECTS_FILE:-$SOURCE_ROOT/viewer/projects.json}"
 CONFIG_TEMPLATE="${CONFIG_TEMPLATE:-$SOURCE_ROOT/configs/extremal_vectors_run.json}"
-CONFIG_OUT="${CONFIG_OUT:-$SOURCE_ROOT/configs/${PROJECT_SLUG}_run.json}"
+POLICY_TEMPLATE="${POLICY_TEMPLATE:-${CONFIG_TEMPLATE%.json}.policy.json}"
+CONFIG_OUT="$REPO/lagent.config.json"
+POLICY_OUT="$REPO/lagent.policy.json"
 STATIC_OUT="${STATIC_OUT:-/home/leanagent/lagent-tablets-web}"
 PROJECT_STATIC_DIR="$STATIC_OUT/$PROJECT_SLUG"
 BURST_USER="${BURST_USER:-lagentworker}"
@@ -76,12 +70,12 @@ NODE_BIN="${NODE_BIN:-/home/leanagent/.nvm/versions/node/v22.22.2/bin}"
 BURST_PATH="${BURST_PATH:-/home/leanagent/.local/bin:$ELAN_HOME/bin:$NODE_BIN:/usr/local/bin:/usr/bin:/bin}"
 
 if [ ! -f "$PAPER" ]; then
-    echo "ERROR: Paper not found: $PAPER" >&2
-    exit 1
+  echo "ERROR: Paper not found: $PAPER" >&2
+  exit 1
 fi
 if [ ! -f "$CONFIG_TEMPLATE" ]; then
-    echo "ERROR: Config template not found: $CONFIG_TEMPLATE" >&2
-    exit 1
+  echo "ERROR: Config template not found: $CONFIG_TEMPLATE" >&2
+  exit 1
 fi
 
 PAPER_NAME="$(basename "$PAPER")"
@@ -93,24 +87,28 @@ echo "  Burst user: $BURST_USER"
 echo "  Burst group: $BURST_GROUP"
 echo "  Config out: $CONFIG_OUT"
 
+if ! sudo -n -u "$BURST_USER" true >/dev/null 2>&1; then
+  echo "ERROR: passwordless sudo to $BURST_USER is required for setup and runtime bursts." >&2
+  echo "       Expected: sudo -n -u $BURST_USER true" >&2
+  exit 1
+fi
+
 if [ "$RESET" -eq 1 ]; then
-    echo "  Resetting existing project artifacts..."
-    rm -rf "$REPO"
-    rm -f "$CONFIG_OUT"
-    rm -rf "$PROJECT_STATIC_DIR"
+  echo "  Resetting existing project artifacts..."
+  "$SCRIPT_DIR/stop.sh" "$REPO" >/dev/null 2>&1 || true
+  tmux kill-session -t "$PROJECT_SLUG" >/dev/null 2>&1 || true
+  rm -rf "$REPO"
+  rm -rf "$PROJECT_STATIC_DIR"
 fi
 
 if [ -e "$REPO" ]; then
-    echo "ERROR: Repo path already exists. Re-run with --reset to recreate it." >&2
-    exit 1
+  echo "ERROR: Repo path already exists. Re-run with --reset to recreate it." >&2
+  exit 1
 fi
 
-mkdir -p "$REPO/paper"
-mkdir -p "$REPO/Tablet"
-mkdir -p "$REPO/.agent-supervisor/logs"
-mkdir -p "$REPO/.agent-supervisor/scripts"
-mkdir -p "$REPO/.agent-supervisor/checkpoints"
-mkdir -p "$REPO/.agent-supervisor/staging"
+mkdir -p "$REPO/paper" "$REPO/Tablet"
+mkdir -p "$REPO/.agent-supervisor/logs" "$REPO/.agent-supervisor/scripts" "$REPO/.agent-supervisor/checkpoints"
+mkdir -p "$REPO/.agent-supervisor/staging" "$REPO/.agent-supervisor/viewer/state-at" "$REPO/.agent-supervisor/chats" "$REPO/.agent-supervisor/scratch"
 
 cp "$PAPER" "$REPO/paper/$PAPER_NAME"
 echo "  Copied paper to $REPO/paper/$PAPER_NAME"
@@ -162,25 +160,27 @@ cat > "$REPO/INPUT_REQUEST.md" <<'REQUEST'
 The supervisor will write explicit requests for human input here when needed.
 REQUEST
 
-PYTHONPATH="$SOURCE_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - "$REPO" "$VIEWER_PROJECTS_FILE" "$PROJECT_SLUG" "$CONFIG_TEMPLATE" "$CONFIG_OUT" "$PAPER_NAME" <<'PY'
+PYTHONPATH="$SOURCE_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - "$REPO" "$CONFIG_TEMPLATE" "$CONFIG_OUT" "$POLICY_TEMPLATE" "$POLICY_OUT" "$PAPER_NAME" "$PROJECT_SLUG" <<'PY'
 import json
+import shutil
 import sys
-from collections import OrderedDict
 from pathlib import Path
 
 from lagent_tablets.check import write_scripts
 from lagent_tablets.config import FORBIDDEN_KEYWORDS_DEFAULT, load_config
 from lagent_tablets.git_ops import init_repo
+from lagent_tablets.project_paths import project_chats_dir, project_scratch_dir
 from lagent_tablets.state import SupervisorState, TabletState, save_state, save_tablet, state_path, tablet_path
 from lagent_tablets.tablet import regenerate_support_files
 from lagent_tablets.viewer_state import viewer_state_path, write_live_viewer_state
 
 repo = Path(sys.argv[1]).resolve()
-viewer_projects_file = Path(sys.argv[2]).resolve()
-slug = sys.argv[3]
-config_template = Path(sys.argv[4]).resolve()
-config_out = Path(sys.argv[5]).resolve()
+config_template = Path(sys.argv[2]).resolve()
+config_out = Path(sys.argv[3]).resolve()
+policy_template = Path(sys.argv[4]).resolve()
+policy_out = Path(sys.argv[5]).resolve()
 paper_name = sys.argv[6]
+slug = sys.argv[7]
 state_dir = repo / ".agent-supervisor"
 
 init_repo(repo)
@@ -188,26 +188,13 @@ save_state(state_path(state_dir), SupervisorState(cycle=0, phase="theorem_statin
 save_tablet(tablet_path(state_dir), TabletState())
 regenerate_support_files(TabletState(), repo)
 
-projects = OrderedDict()
-if viewer_projects_file.exists():
-    try:
-        parsed = json.loads(viewer_projects_file.read_text(encoding="utf-8"))
-        if isinstance(parsed, dict):
-            for key, value in parsed.items():
-                if isinstance(key, str) and isinstance(value, str):
-                    projects[key] = value
-    except Exception:
-        pass
-projects[slug] = str(repo)
-viewer_projects_file.parent.mkdir(parents=True, exist_ok=True)
-viewer_projects_file.write_text(json.dumps(projects, indent=2) + "\n", encoding="utf-8")
-
-data = {}
 parsed = json.loads(config_template.read_text(encoding="utf-8"))
-if isinstance(parsed, dict):
-    data = parsed
+if not isinstance(parsed, dict):
+    raise SystemExit("Config template must be a JSON object")
+data = parsed
 data["repo_path"] = str(repo)
 data["state_dir"] = ".agent-supervisor"
+data["policy_path"] = "lagent.policy.json"
 
 tmux = data.setdefault("tmux", {})
 tmux["session_name"] = slug
@@ -219,7 +206,7 @@ workflow["human_input_path"] = "HUMAN_INPUT.md"
 workflow["input_request_path"] = "INPUT_REQUEST.md"
 
 chat = data.setdefault("chat", {})
-chat["root_dir"] = f"/tmp/lagent-{slug}-chats"
+chat["root_dir"] = str(project_chats_dir(state_dir))
 chat["repo_name"] = slug
 chat["project_name"] = slug.replace("_", " ").title() + " Formalization"
 
@@ -230,8 +217,10 @@ git_cfg.setdefault("branch", "master")
 git_cfg.setdefault("author_name", "lagent-supervisor")
 git_cfg.setdefault("author_email", "lagent@localhost")
 
-config_out.parent.mkdir(parents=True, exist_ok=True)
 config_out.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+if policy_template.exists():
+    shutil.copyfile(policy_template, policy_out)
 
 config = load_config(config_out)
 forbidden = [
@@ -253,13 +242,33 @@ write_live_viewer_state(
     source="setup",
     fast=True,
 )
+
+scratch_dir = project_scratch_dir(state_dir)
+scratch_dir.mkdir(parents=True, exist_ok=True)
+readme_path = scratch_dir / "README.md"
+if not readme_path.exists():
+    readme_path.write_text(
+        "# Worker Scratchpad\n\n"
+        "Use this directory for repo-local Lean experiments and temporary notes.\n"
+        "Files here are intentionally excluded from the main formalization history.\n",
+        encoding="utf-8",
+    )
+example_path = scratch_dir / "example.lean"
+example_path.write_text(
+    "import Tablet.Preamble\n"
+    "import Mathlib.Data.Nat.Basic\n\n"
+    "-- Example scratch file: project-local, ignored by the main repo, and buildable with\n"
+    "--   lake env lean .agent-supervisor/scratch/example.lean\n"
+    "#check Nat.succ\n"
+    "example : Nat.succ 0 = 1 := rfl\n",
+    encoding="utf-8",
+)
 PY
 echo "  Initialized state, config, scripts, and viewer payload"
 
 python3 - "$REPO" "$BURST_GROUP" <<'PY'
 import grp
 import os
-import stat
 import sys
 from pathlib import Path
 
@@ -303,35 +312,55 @@ echo "  Normalized working-tree permissions for shared use"
 
 git -C "$REPO" config core.sharedRepository group
 
+echo "  Initializing nested local chats git repo..."
+git -C "$REPO/.agent-supervisor/chats" init >/dev/null 2>&1
+git -C "$REPO/.agent-supervisor/chats" config user.name "lagent-chats" >/dev/null 2>&1
+git -C "$REPO/.agent-supervisor/chats" config user.email "lagent-chats@localhost" >/dev/null 2>&1
+cat > "$REPO/.agent-supervisor/chats/README.md" <<'CHATREADME'
+# Local Chat History
+
+This nested git repo stores project-local chat/session history.
+It is intentionally outside the parent formalization repo history.
+CHATREADME
+git -C "$REPO/.agent-supervisor/chats" add README.md >/dev/null 2>&1
+git -C "$REPO/.agent-supervisor/chats" commit -m "Initialize local chat history repo" >/dev/null 2>&1 || true
+
 echo "  Prewarming Lean dependencies and build artifacts as $BURST_USER..."
 sudo -n -u "$BURST_USER" env \
-    HOME="$BURST_HOME" \
-    ELAN_HOME="$ELAN_HOME" \
-    PATH="$BURST_PATH" \
-    bash -lc "
-        set -euo pipefail
-        umask 0002
-        git config --global --add safe.directory '$REPO' >/dev/null 2>&1 || true
-        cd '$REPO'
-        lake update
-        lake build Tablet
-        python3 .agent-supervisor/scripts/check.py tablet '$REPO'
-    "
+  HOME="$BURST_HOME" \
+  ELAN_HOME="$ELAN_HOME" \
+  PATH="$BURST_PATH" \
+  bash -lc "
+    set -euo pipefail
+    umask 0002
+    git config --global --add safe.directory '$REPO' >/dev/null 2>&1 || true
+    cd '$REPO'
+    lake update
+    lake exe cache get >/dev/null 2>&1 || true
+    lake build Tablet.Preamble
+    lake build Tablet
+    python3 .agent-supervisor/scripts/check.py tablet '$REPO'
+  "
 
-PYTHONPATH="$SOURCE_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - "$REPO" "$CONFIG_OUT" <<'PY'
+PYTHONPATH="$SOURCE_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - "$REPO" "$BURST_USER" <<'PY'
 import sys
 from pathlib import Path
 
 from lagent_tablets.health import fix_lake_permissions
 
 repo = Path(sys.argv[1]).resolve()
-fix_lake_permissions(repo)
+burst_user = sys.argv[2]
+fix_lake_permissions(repo, burst_user=burst_user, include_package_builds=True)
 PY
-echo "  Fixed shared .lake/build permissions for supervisor access"
+echo "  Fixed shared Lean build permissions for supervisor access"
 
 echo "  Validating supervisor-side deterministic checks..."
 python3 "$REPO/.agent-supervisor/scripts/check.py" tablet "$REPO"
-PYTHONPATH="$SOURCE_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -m lagent_tablets.cli --config "$CONFIG_OUT" --preview-next-cycle >/dev/null
+
+mkdir -p "$PROJECT_STATIC_DIR"
+ln -sfn "$REPO/.agent-supervisor/viewer" "$PROJECT_STATIC_DIR/api"
+ln -sfn "$SOURCE_ROOT/viewer/public/index.html" "$PROJECT_STATIC_DIR/index.html"
+echo "  Linked project viewer route to repo-local viewer data"
 
 find "$REPO/.agent-supervisor" -name '*.lock' -delete 2>/dev/null || true
 git -C "$REPO" add -A

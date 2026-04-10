@@ -42,7 +42,7 @@
     "input_request_path": "INPUT_REQUEST.md"
   },
   "chat": {
-    "root_dir": "/tmp/lagent-gnp-chats",
+    "root_dir": ".agent-supervisor/chats",
     "repo_name": "connectivity-gnp-gemini-pro",
     "project_name": "Connectivity Threshold G(n,p) - Gemini Pro"
   },

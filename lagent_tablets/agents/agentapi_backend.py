@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from lagent_tablets.adapters import BurstResult, ProviderConfig
+from lagent_tablets.chat_history import copy_chat_artifact, ensure_chat_file_link
 
 WORKER_PATH = "/home/leanagent/.local/bin:/home/leanagent/.elan/bin:/home/leanagent/.nvm/versions/node/v22.22.2/bin:/usr/local/bin:/usr/bin:/bin"
 WORKER_ELAN_HOME = "/home/leanagent/.elan"
@@ -712,15 +713,16 @@ def _save_transcript(
     work_dir: Path,
     dest_dir: Path,
     role: str,
+    *,
+    artifact_prefix: Optional[str] = None,
 ) -> Optional[Path]:
     """Copy the latest agent transcript to the supervisor's log directory."""
     src = _find_latest_transcript(provider, burst_user, work_dir)
     if not src or not src.exists():
         return None
 
-    dest_dir.mkdir(parents=True, exist_ok=True)
     ext = src.suffix  # .jsonl for Claude, .json for Gemini
-    dest = dest_dir / f"{role}-transcript{ext}"
+    prefix = artifact_prefix or role
 
     try:
         # Use sudo to read if the file is owned by burst_user
@@ -730,12 +732,30 @@ def _save_transcript(
                 capture_output=True, timeout=10,
             )
             if result.returncode == 0:
-                dest.write_bytes(result.stdout)
-                return dest
+                tmp = dest_dir / f".{prefix}-transcript{ext}.tmp"
+                tmp.write_bytes(result.stdout)
+                try:
+                    return copy_chat_artifact(
+                        work_dir,
+                        log_dir=dest_dir,
+                        artifact_prefix=prefix,
+                        role=role,
+                        source_path=tmp,
+                        canonical_name=f"transcript{ext}",
+                        symlink_name=f"{prefix}-transcript{ext}",
+                    )
+                finally:
+                    tmp.unlink(missing_ok=True)
         else:
-            import shutil
-            shutil.copy2(src, dest)
-            return dest
+            return copy_chat_artifact(
+                work_dir,
+                log_dir=dest_dir,
+                artifact_prefix=prefix,
+                role=role,
+                source_path=src,
+                canonical_name=f"transcript{ext}",
+                symlink_name=f"{prefix}-transcript{ext}",
+            )
     except Exception:
         pass
     return None
@@ -752,6 +772,8 @@ def run(
     port: Optional[int] = None,
     fresh: bool = False,
     done_file: Optional[Path] = None,
+    log_dir: Optional[Path] = None,
+    artifact_prefix: Optional[str] = None,
 ) -> BurstResult:
     """Run a burst via agentapi: start server, handle dialogs, send message, wait for response.
 
@@ -760,6 +782,10 @@ def run(
     Default (fresh=False) reuses an existing session if one is running.
     """
     start = time.monotonic()
+    if log_dir is None:
+        log_dir = work_dir / ".agent-supervisor" / "logs" / "bursts"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    prefix = artifact_prefix or role
 
     try:
         if fresh:
@@ -800,6 +826,17 @@ def run(
         return BurstResult(ok=False, exit_code=None, captured_output="",
                           duration_seconds=time.monotonic() - start,
                           error="Agent server not responding after startup")
+
+    prompt_path = ensure_chat_file_link(
+        work_dir,
+        log_dir=log_dir,
+        artifact_prefix=prefix,
+        role=role,
+        log_filename=f"{prefix}-prompt.txt",
+        canonical_name="prompt.txt",
+    )
+    prompt_path.write_text(prompt, encoding="utf-8")
+    prompt_path.chmod(0o644)
 
     # Send the prompt
     ok = send_message(port, prompt, timeout=timeout)
@@ -863,9 +900,9 @@ def run(
     duration = time.monotonic() - start
 
     # Save the full agent transcript (includes thinking/thoughts)
-    log_dir = work_dir / ".agent-supervisor" / "logs"
     transcript_path = _save_transcript(
         config.provider, burst_user, work_dir, log_dir, role,
+        artifact_prefix=prefix,
     )
 
     # Don't stop the server -- leave it running for the next message

@@ -199,7 +199,7 @@ Walltime tracked on all multi-agent results.
 
 ## 11. Web Viewer
 
-Node.js server at port 3300, nginx serves static files.
+Node.js server at port 3300. Project-specific viewer API files live in `.agent-supervisor/viewer/` inside each formalization repo, and the web route for a project points at that repo-local data.
 
 ### Features
 - DAG visualization with node status colors
@@ -212,8 +212,13 @@ Node.js server at port 3300, nginx serves static files.
 - Mobile responsive (pinch zoom, slide-up detail sheet)
 - Pan/zoom on DAG (mouse wheel + drag, touch gestures)
 
-### Static file generation
-`writeStatic()` every 30s generates `api/viewer-state.json`, `api/cycles.json`, `api/state-at/N.json`.
+### Viewer data
+The canonical live/history payloads are project-local:
+- `.agent-supervisor/viewer/viewer-state.json`
+- `.agent-supervisor/viewer/cycles.json`
+- `.agent-supervisor/viewer/state-at/N.json`
+
+The viewer route `/lagent-tablets/<project>/` resolves directly to the repo at `<projects-root>/<project>/`.
 
 ---
 
@@ -221,11 +226,11 @@ Node.js server at port 3300, nginx serves static files.
 
 | Script | Purpose |
 |--------|---------|
-| `scripts/setup_repo.sh <path> <paper.tex>` | Create new formalization repo |
+| `scripts/setup_repo.sh <path> <paper.tex>` | Create new formalization repo with repo-local config/policy/viewer/chat state |
 | `scripts/pause.sh [repo]` | Graceful stop after current cycle |
 | `scripts/stop.sh [repo]` | Force kill all processes |
 | `scripts/rewind.sh <cycle> [stage] [repo]` | Rewind to cycle+stage, clean artifacts |
-| `scripts/resume.sh <config> [args...]` | Start supervisor in tmux |
+| `scripts/resume.sh <repo-or-config> [args...]` | Start supervisor in tmux |
 | `scripts/status.sh [repo]` | Show all agents, results, thoughts |
 
 ---

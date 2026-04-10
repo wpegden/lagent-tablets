@@ -59,6 +59,11 @@ from lagent_tablets.tablet import (
 )
 from lagent_tablets.viewer_state import viewer_state_path, write_live_viewer_state
 from lagent_tablets.git_ops import init_repo, rewind_to_cycle
+from lagent_tablets.project_paths import (
+    project_chats_dir,
+    project_scratch_dir,
+    project_viewer_dir,
+)
 from lagent_tablets.check import write_scripts
 
 
@@ -69,6 +74,9 @@ def ensure_directories(config: Config) -> None:
     (config.state_dir / "scripts").mkdir(parents=True, exist_ok=True)
     (config.state_dir / "staging").mkdir(parents=True, exist_ok=True)
     (config.state_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+    project_viewer_dir(config.state_dir).mkdir(parents=True, exist_ok=True)
+    project_chats_dir(config.state_dir).mkdir(parents=True, exist_ok=True)
+    project_scratch_dir(config.state_dir).mkdir(parents=True, exist_ok=True)
     tablet_dir(config.repo_path).mkdir(parents=True, exist_ok=True)
 
     try:
@@ -83,6 +91,9 @@ def ensure_directories(config: Config) -> None:
         config.state_dir / "scripts": 0o2755,
         config.state_dir / "staging": 0o2775,
         config.state_dir / "checkpoints": 0o2755,
+        project_viewer_dir(config.state_dir): 0o2775,
+        project_chats_dir(config.state_dir): 0o2775,
+        project_scratch_dir(config.state_dir): 0o2775,
     }
     for path, mode in dir_modes.items():
         try:
@@ -511,7 +522,11 @@ def main(argv: Optional[list] = None) -> int:
 
     # Fix .lake permissions for multi-user access
     from lagent_tablets.health import fix_lake_permissions, HealthMonitor
-    fix_lake_permissions(config.repo_path)
+    fix_lake_permissions(
+        config.repo_path,
+        burst_user=config.tmux.burst_user,
+        include_package_builds=True,
+    )
 
     # Reconcile tablet status with actual file state
     from lagent_tablets.cycle import reconcile_tablet_status
@@ -579,7 +594,7 @@ def main(argv: Optional[list] = None) -> int:
             )
             health.on_cycle_outcome(state.cycle, outcome.outcome, outcome.detail)
             previous_outcome = outcome
-            fix_lake_permissions(config.repo_path)
+            fix_lake_permissions(config.repo_path, burst_user=config.tmux.burst_user)
             _apply_trusted_main_result_review_gate(config, state, tablet)
 
             if remaining_cycles is not None:
@@ -654,7 +669,7 @@ def main(argv: Optional[list] = None) -> int:
         _apply_trusted_main_result_review_gate(config, state, tablet)
 
         # Fix .lake permissions after each cycle
-        fix_lake_permissions(config.repo_path)
+        fix_lake_permissions(config.repo_path, burst_user=config.tmux.burst_user)
 
         if remaining_cycles is not None:
             remaining_cycles -= 1

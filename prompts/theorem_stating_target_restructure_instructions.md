@@ -21,6 +21,10 @@ WHAT YOU MUST NOT EDIT:
 - Any generated support file
 - Broad cleanup edits outside the target slice
 
+SCRATCH WORK:
+- If you need a temporary Lean experiment or note file, use `{scratch_dir}` rather than `/tmp`
+- `example.lean` in that directory is a trivial buildable starting point
+
 RESTRUCTURE EXPECTATIONS:
 - Keep the cycle centered on `{target}`; do not switch to a different soundness target
 - Prefer paper-facing intermediate claims that make the DAG richer and later Lean formalization cleaner

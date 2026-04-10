@@ -100,7 +100,7 @@ def action_worker(args):
     from lagent_tablets.health import fix_lake_permissions
     from lagent_tablets.tablet import regenerate_support_files
 
-    fix_lake_permissions(config.repo_path)
+    fix_lake_permissions(config.repo_path, burst_user=config.tmux.burst_user, include_package_builds=True)
     setup_permissions(config, active)
     regenerate_support_files(tablet, config.repo_path)
 

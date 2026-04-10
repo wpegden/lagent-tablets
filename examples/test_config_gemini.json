@@ -37,7 +37,7 @@
     "forbidden_keyword_allowlist": []
   },
   "chat": {
-    "root_dir": "/tmp/lagent-test-chats",
+    "root_dir": ".agent-supervisor/chats",
     "repo_name": "test-project",
     "project_name": "Test Project"
   },

@@ -1,48 +1,60 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
 const { execSync } = require('child_process');
 
 const app = express();
 const PORT = process.env.PORT || 3300;
 const BASE = process.env.BASE_PATH || '/lagent-tablets';
 const STATIC_OUT = process.env.STATIC_OUT || '/home/leanagent/lagent-tablets-web';
-const PROJECTS_FILE = process.env.VIEWER_PROJECTS_FILE || path.join(__dirname, 'projects.json');
-const LEGACY_REPO_PATH = process.env.REPO_PATH || '/home/leanagent/math/connectivity_gnp_tablets';
-const LEGACY_PROJECT_SLUG = process.env.PROJECT_SLUG || path.basename(LEGACY_REPO_PATH).replace(/_tablets?$/, '');
+const PROJECTS_ROOT = process.env.PROJECTS_ROOT || '/home/leanagent/math';
+const DEFAULT_PROJECT_SLUG = process.env.DEFAULT_PROJECT_SLUG || '';
+const LEGACY_REPO_PATH = process.env.REPO_PATH || '';
 
-function projectMap() {
-  try {
-    if (fs.existsSync(PROJECTS_FILE)) {
-      const raw = JSON.parse(fs.readFileSync(PROJECTS_FILE, 'utf-8'));
-      if (raw && typeof raw === 'object') return raw;
-    }
-  } catch (err) {
-    console.error('Failed to read viewer projects file:', err.message);
+function isValidProjectSlug(slug) {
+  return typeof slug === 'string' && /^[A-Za-z0-9._-]+$/.test(slug);
+}
+
+function configPathForRepo(repoPath) {
+  return path.join(repoPath, 'lagent.config.json');
+}
+
+function viewerApiDir(repoPath) {
+  return path.join(repoPath, '.agent-supervisor', 'viewer');
+}
+
+function chatsRepoDir(repoPath) {
+  return path.join(repoPath, '.agent-supervisor', 'chats');
+}
+
+function discoverProjects() {
+  if (LEGACY_REPO_PATH) {
+    return [{ slug: path.basename(LEGACY_REPO_PATH), repoPath: LEGACY_REPO_PATH }];
   }
-  return { [LEGACY_PROJECT_SLUG]: LEGACY_REPO_PATH };
+  if (!fs.existsSync(PROJECTS_ROOT)) return [];
+  return fs.readdirSync(PROJECTS_ROOT, { withFileTypes: true })
+    .filter(entry => entry.isDirectory() && isValidProjectSlug(entry.name))
+    .map(entry => ({ slug: entry.name, repoPath: path.join(PROJECTS_ROOT, entry.name) }))
+    .filter(entry => fs.existsSync(configPathForRepo(entry.repoPath)))
+    .sort((a, b) => a.slug.localeCompare(b.slug));
 }
 
 function defaultProjectSlug() {
-  return Object.keys(projectMap())[0] || LEGACY_PROJECT_SLUG;
+  if (DEFAULT_PROJECT_SLUG) return DEFAULT_PROJECT_SLUG;
+  const projects = discoverProjects();
+  return projects.length ? projects[0].slug : '';
 }
 
 function resolveRepoPath(project) {
   const slug = project || defaultProjectSlug();
-  const mapping = projectMap();
-  const repoPath = mapping[slug];
-  if (!repoPath) throw new Error(`Unknown project: ${slug}`);
+  if (!isValidProjectSlug(slug)) throw new Error(`Invalid project: ${project}`);
+  const repoPath = LEGACY_REPO_PATH && slug === path.basename(LEGACY_REPO_PATH)
+    ? LEGACY_REPO_PATH
+    : path.join(PROJECTS_ROOT, slug);
+  if (!(LEGACY_REPO_PATH && repoPath === LEGACY_REPO_PATH) && !fs.existsSync(configPathForRepo(repoPath))) {
+    throw new Error(`Unknown project: ${slug}`);
+  }
   return { slug, repoPath, stateDir: path.join(repoPath, '.agent-supervisor') };
-}
-
-function repoCacheSlug(repoPath) {
-  const digest = crypto.createHash('sha1').update(repoPath).digest('hex').slice(0, 10);
-  return `${path.basename(repoPath)}-${digest}`;
-}
-
-function backfillStateAtPath(repoPath, cycle) {
-  return path.join(STATIC_OUT, 'api', 'backfill', repoCacheSlug(repoPath), 'state-at', `${cycle}.json`);
 }
 
 function readJsonFile(filePath) {
@@ -59,15 +71,264 @@ function readLiveViewerState(repoPath) {
 
 function readHistoricalViewerState(repoPath, cycle) {
   const tag = `cycle-${cycle}`;
+  const raw = git(repoPath, `show ${tag}:.agent-supervisor/viewer_state.json`);
+  return JSON.parse(raw);
+}
+
+function chatCycleDir(cycle) {
+  return `cycle-${String(cycle).padStart(4, '0')}`;
+}
+
+function readTextFileSafe(filePath) {
   try {
-    const raw = git(repoPath, `show ${tag}:.agent-supervisor/viewer_state.json`);
-    return JSON.parse(raw);
-  } catch {}
-  const fallback = backfillStateAtPath(repoPath, cycle);
-  if (fs.existsSync(fallback)) {
-    return readJsonFile(fallback);
+    return fs.readFileSync(filePath, 'utf-8');
+  } catch {
+    return '';
   }
-  throw new Error(`No viewer_state snapshot found for cycle ${cycle}`);
+}
+
+function listWorkingTreeChatArtifacts(repoPath, cycle) {
+  const root = path.join(chatsRepoDir(repoPath), chatCycleDir(cycle));
+  if (!fs.existsSync(root)) return [];
+  return sortArtifactNames(fs.readdirSync(root, { withFileTypes: true })
+    .filter(entry => entry.isDirectory())
+    .map(entry => entry.name)
+  );
+}
+
+function listGitChatArtifacts(repoPath, cycle) {
+  const chatsRepo = chatsRepoDir(repoPath);
+  if (!fs.existsSync(path.join(chatsRepo, '.git'))) return [];
+  const prefix = chatCycleDir(cycle) + '/';
+  try {
+    const files = git(chatsRepo, `ls-tree -r --name-only cycle-${cycle} -- ${prefix}`)
+      .split('\n')
+      .filter(Boolean);
+    return sortArtifactNames(Array.from(new Set(
+      files
+        .filter(name => name.startsWith(prefix))
+        .map(name => name.slice(prefix.length).split('/')[0])
+        .filter(Boolean)
+    )));
+  } catch {
+    return [];
+  }
+}
+
+function readWorkingTreeChatFiles(repoPath, cycle, artifact) {
+  const dir = path.join(chatsRepoDir(repoPath), chatCycleDir(cycle), artifact);
+  return {
+    prompt: readTextFileSafe(path.join(dir, 'prompt.txt')),
+    output: readTextFileSafe(path.join(dir, 'output.log')),
+    transcriptJsonl: readTextFileSafe(path.join(dir, 'transcript.jsonl')),
+    transcriptJson: readTextFileSafe(path.join(dir, 'transcript.json')),
+  };
+}
+
+function readGitChatFiles(repoPath, cycle, artifact) {
+  const chatsRepo = chatsRepoDir(repoPath);
+  const base = `${chatCycleDir(cycle)}/${artifact}`;
+  const read = (name) => {
+    try {
+      return git(chatsRepo, `show cycle-${cycle}:${base}/${name}`);
+    } catch {
+      return '';
+    }
+  };
+  return {
+    prompt: read('prompt.txt'),
+    output: read('output.log'),
+    transcriptJsonl: read('transcript.jsonl'),
+    transcriptJson: read('transcript.json'),
+  };
+}
+
+function artifactTitle(name) {
+  let attempt = null;
+  let base = name;
+  let m = name.match(/^(.*)_attempt_(\d+)$/);
+  if (m) {
+    base = m[1];
+    attempt = Number(m[2]);
+  }
+  if (base === 'worker_handoff') return attempt ? `Worker attempt ${attempt}` : 'Worker';
+  if (base === 'reviewer_decision') return attempt ? `Reviewer attempt ${attempt}` : 'Reviewer';
+  m = base.match(/^correspondence_result_(\d+)$/);
+  if (m) return attempt ? `Correspondence ${Number(m[1]) + 1} attempt ${attempt}` : `Correspondence ${Number(m[1]) + 1}`;
+  m = base.match(/^nl_proof_(.+)_(\d+)$/);
+  if (m) {
+    const title = `Soundness ${m[1]} (${Number(m[2]) + 1})`;
+    return attempt ? `${title} attempt ${attempt}` : title;
+  }
+  const fallback = base.replace(/_/g, ' ');
+  return attempt ? `${fallback} attempt ${attempt}` : fallback;
+}
+
+function artifactSortKey(name) {
+  let attempt = 0;
+  let base = name;
+  let m = name.match(/^(.*)_attempt_(\d+)$/);
+  if (m) {
+    base = m[1];
+    attempt = Number(m[2]);
+  }
+  if (base === 'worker_handoff') return [0, 0, '', attempt, name];
+  if (base === 'reviewer_decision') return [3, 0, '', attempt, name];
+  m = base.match(/^correspondence_result_(\d+)$/);
+  if (m) return [1, Number(m[1]), '', attempt, name];
+  m = base.match(/^nl_proof_(.+)_(\d+)$/);
+  if (m) return [2, Number(m[2]), String(m[1]), attempt, name];
+  return [4, 0, base, attempt, name];
+}
+
+function sortArtifactNames(names) {
+  return [...names].sort((a, b) => {
+    const ka = artifactSortKey(a);
+    const kb = artifactSortKey(b);
+    for (let i = 0; i < ka.length; i++) {
+      if (ka[i] < kb[i]) return -1;
+      if (ka[i] > kb[i]) return 1;
+    }
+    return 0;
+  });
+}
+
+function collectTextParts(value, parts) {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (trimmed) parts.push(trimmed);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectTextParts(item, parts);
+    return;
+  }
+  if (!value || typeof value !== 'object') return;
+  if (typeof value.text === 'string') {
+    const trimmed = value.text.trim();
+    if (trimmed) parts.push(trimmed);
+  }
+  for (const key of ['content', 'parts', 'chunks', 'value']) {
+    if (key in value) collectTextParts(value[key], parts);
+  }
+}
+
+function normalizeTranscriptEntry(role, text, kind = 'message', title = '') {
+  const trimmed = (text || '').trim();
+  if (!trimmed) return null;
+  return { role: role || 'entry', kind, title: title || '', text: trimmed };
+}
+
+function parseCodexOutputEntries(text) {
+  const entries = [];
+  for (const rawLine of (text || '').split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    let rec;
+    try {
+      rec = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (rec.type === 'item.completed' && rec.item && rec.item.type === 'agent_message') {
+      const entry = normalizeTranscriptEntry('assistant', rec.item.text || '', 'message', 'Assistant');
+      if (entry) entries.push(entry);
+      continue;
+    }
+    if (rec.item && rec.item.type === 'command_execution' && (rec.type === 'item.completed' || rec.type === 'item.started')) {
+      const command = String(rec.item.command || '').trim();
+      const output = String(rec.item.aggregated_output || '').trim();
+      const label = rec.type === 'item.started' ? 'Command (running)' : 'Command';
+      const combined = [command, output].filter(Boolean).join('\n\n');
+      const entry = normalizeTranscriptEntry('tool', combined, 'command', label);
+      if (entry) entries.push(entry);
+    }
+  }
+  return entries;
+}
+
+function parseJsonlTranscriptEntries(text) {
+  const entries = [];
+  for (const rawLine of (text || '').split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    let rec;
+    try {
+      rec = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const msg = rec.message && typeof rec.message === 'object' ? rec.message : rec;
+    const role = msg.role || rec.role || rec.type || '';
+    const parts = [];
+    collectTextParts(msg.content ?? rec.content ?? msg, parts);
+    const entry = normalizeTranscriptEntry(role, parts.join('\n\n'), 'message', role || 'Entry');
+    if (entry) entries.push(entry);
+  }
+  return entries;
+}
+
+function parseJsonTranscriptEntries(text) {
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    return [];
+  }
+  const entries = [];
+  const messages = Array.isArray(data?.messages) ? data.messages : [];
+  for (const msg of messages) {
+    const role = msg.role || msg.author || msg.speaker || '';
+    const parts = [];
+    collectTextParts(msg.content ?? msg.parts ?? msg, parts);
+    const entry = normalizeTranscriptEntry(role, parts.join('\n\n'), 'message', role || 'Entry');
+    if (entry) entries.push(entry);
+  }
+  if (entries.length) return entries;
+  const parts = [];
+  collectTextParts(data, parts);
+  const fallback = normalizeTranscriptEntry('entry', parts.join('\n\n'), 'message', 'Transcript');
+  return fallback ? [fallback] : [];
+}
+
+function buildArtifactChatData(name, files) {
+  const entries = [];
+  if (files.prompt) {
+    entries.push({
+      role: 'prompt',
+      kind: 'prompt',
+      title: 'Prompt',
+      text: files.prompt.trim(),
+    });
+  }
+  if (files.output) entries.push(...parseCodexOutputEntries(files.output));
+  else if (files.transcriptJsonl) entries.push(...parseJsonlTranscriptEntries(files.transcriptJsonl));
+  else if (files.transcriptJson) entries.push(...parseJsonTranscriptEntries(files.transcriptJson));
+  return {
+    id: name,
+    title: artifactTitle(name),
+    entries,
+    hasTranscript: Boolean(files.output || files.transcriptJsonl || files.transcriptJson),
+  };
+}
+
+function currentInFlightCycle(repoPath) {
+  const viewer = readLiveViewerState(repoPath);
+  return Number(viewer?.meta?.in_flight_cycle || viewer?.state?.cycle || 0);
+}
+
+function readLiveChats(repoPath) {
+  const cycle = currentInFlightCycle(repoPath);
+  if (!cycle) return { cycle: 0, source: 'live', artifacts: [] };
+  const artifacts = listWorkingTreeChatArtifacts(repoPath, cycle)
+    .map(name => buildArtifactChatData(name, readWorkingTreeChatFiles(repoPath, cycle, name)));
+  return { cycle, source: 'live', artifacts };
+}
+
+function readHistoricalChats(repoPath, cycle) {
+  const artifacts = listGitChatArtifacts(repoPath, cycle)
+    .map(name => buildArtifactChatData(name, readGitChatFiles(repoPath, cycle, name)));
+  return { cycle, source: 'git', artifacts };
 }
 
 function getCyclesFromGit(repoPath) {
@@ -113,65 +374,36 @@ function getCycleDiff(repoPath, cycle) {
   }
 }
 
-function writeJsonIfChanged(filePath, value) {
-  const next = JSON.stringify(value);
+function ensureSymlink(linkPath, targetPath) {
+  fs.mkdirSync(path.dirname(linkPath), { recursive: true });
   try {
-    const current = fs.readFileSync(filePath, 'utf-8');
-    if (current === next) {
-      fs.chmodSync(filePath, 0o644);
-      return;
-    }
+    const existing = fs.lstatSync(linkPath);
+    if (existing.isSymbolicLink() && fs.readlinkSync(linkPath) === targetPath) return;
+    fs.rmSync(linkPath, { recursive: true, force: true });
   } catch {}
-  fs.writeFileSync(filePath, next);
-  fs.chmodSync(filePath, 0o644);
+  fs.symlinkSync(targetPath, linkPath);
 }
 
 function writeProjectStatic(projectSlug, repoPath, { writeRoot = false } = {}) {
-  const live = readLiveViewerState(repoPath);
-  const cycles = getCyclesFromGit(repoPath);
   const roots = [path.join(STATIC_OUT, projectSlug)];
   if (writeRoot) roots.unshift(STATIC_OUT);
+  const apiTarget = viewerApiDir(repoPath);
+  const htmlSrc = path.join(__dirname, 'public', 'index.html');
 
   for (const root of roots) {
-    const apiRoot = path.join(root, 'api');
-    const stateAtDir = path.join(apiRoot, 'state-at');
-    fs.mkdirSync(apiRoot, { recursive: true });
-    fs.mkdirSync(stateAtDir, { recursive: true });
-    writeJsonIfChanged(path.join(apiRoot, 'viewer-state.json'), live);
-    writeJsonIfChanged(path.join(apiRoot, 'cycles.json'), cycles);
-
-    const validCycles = new Set();
-    for (const entry of cycles) {
-      const cycleNum = entry.cycle;
-      if (!Number.isInteger(cycleNum)) continue;
-      validCycles.add(String(cycleNum));
-      const outFile = path.join(stateAtDir, `${cycleNum}.json`);
-      try {
-        writeJsonIfChanged(outFile, readHistoricalViewerState(repoPath, cycleNum));
-      } catch {}
-    }
-    for (const entry of fs.readdirSync(stateAtDir)) {
-      const match = entry.match(/^(\d+)\.json$/);
-      if (!match) continue;
-      if (validCycles.has(match[1])) continue;
-      try { fs.unlinkSync(path.join(stateAtDir, entry)); } catch {}
-    }
-
-    const htmlSrc = path.join(__dirname, 'public', 'index.html');
-    const htmlDest = path.join(root, 'index.html');
+    fs.mkdirSync(root, { recursive: true });
+    ensureSymlink(path.join(root, 'api'), apiTarget);
     if (fs.existsSync(htmlSrc)) {
-      fs.mkdirSync(root, { recursive: true });
-      fs.copyFileSync(htmlSrc, htmlDest);
-      fs.chmodSync(htmlDest, 0o644);
+      ensureSymlink(path.join(root, 'index.html'), htmlSrc);
     }
   }
 }
 
 function writeStatic() {
   try {
-    const projects = projectMap();
+    const projects = discoverProjects();
     const defaultSlug = defaultProjectSlug();
-    for (const [slug, repoPath] of Object.entries(projects)) {
+    for (const { slug, repoPath } of projects) {
       writeProjectStatic(slug, repoPath, { writeRoot: slug === defaultSlug });
     }
   } catch (e) {
@@ -370,6 +602,46 @@ app.get(`${BASE}/:project/api/state-at/:cycle`, (req, res) => {
   }
 });
 
+app.get(`${BASE}/api/chats.json`, (req, res) => {
+  try {
+    const { repoPath } = resolveRepoPath(defaultProjectSlug());
+    res.json(readLiveChats(repoPath));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get(`${BASE}/:project/api/chats.json`, (req, res) => {
+  try {
+    const { repoPath } = resolveRepoPath(projectFromRequest(req));
+    res.json(readLiveChats(repoPath));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get(`${BASE}/api/chats-at/:cycle`, (req, res) => {
+  const cycle = parseInt(String(req.params.cycle).replace(/\.json$/, ''), 10);
+  if (isNaN(cycle)) return res.status(400).json({ error: 'Invalid cycle' });
+  try {
+    const { repoPath } = resolveRepoPath(defaultProjectSlug());
+    res.json(readHistoricalChats(repoPath, cycle));
+  } catch (e) {
+    res.status(404).json({ error: `Chat cycle ${cycle} not found: ${e.message}` });
+  }
+});
+
+app.get(`${BASE}/:project/api/chats-at/:cycle`, (req, res) => {
+  const cycle = parseInt(String(req.params.cycle).replace(/\.json$/, ''), 10);
+  if (isNaN(cycle)) return res.status(400).json({ error: 'Invalid cycle' });
+  try {
+    const { repoPath } = resolveRepoPath(projectFromRequest(req));
+    res.json(readHistoricalChats(repoPath, cycle));
+  } catch (e) {
+    res.status(404).json({ error: `Chat cycle ${cycle} not found: ${e.message}` });
+  }
+});
+
 app.get(`${BASE}/api/diff/:cycle`, (req, res) => {
   const cycle = parseInt(req.params.cycle, 10);
   if (isNaN(cycle)) return res.status(400).send('Invalid cycle');
@@ -442,7 +714,7 @@ app.get(`${BASE}/:project/api/feedback`, (req, res) => {
 function startServer() {
   return app.listen(PORT, () => {
     console.log(`Tablet viewer at http://localhost:${PORT}${BASE}/${defaultProjectSlug()}/`);
-    console.log(`Projects: ${JSON.stringify(projectMap())}`);
+    console.log(`Projects root: ${PROJECTS_ROOT}`);
   });
 }
 
@@ -452,6 +724,14 @@ if (require.main === module) {
 
 module.exports = {
   app,
+  buildArtifactChatData,
+  parseCodexOutputEntries,
+  parseJsonlTranscriptEntries,
+  parseJsonTranscriptEntries,
+  readHistoricalViewerState,
+  readHistoricalChats,
+  readLiveViewerState,
+  readLiveChats,
   startServer,
   writeStatic,
 };

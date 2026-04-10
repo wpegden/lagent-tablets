@@ -17,6 +17,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from lagent_tablets.adapters import ProviderConfig
+from lagent_tablets.project_paths import (
+    PROJECT_CONFIG_FILENAME,
+    project_chats_dir,
+    project_policy_path,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -425,8 +430,14 @@ def load_config(path: Path) -> Config:
     chat_raw = raw.get("chat", {})
     if not isinstance(chat_raw, dict):
         raise ConfigError("config.chat must be a dict")
+    chat_root_raw = str(chat_raw.get("root_dir", project_chats_dir(state_dir)))
+    chat_root = (
+        Path(chat_root_raw).resolve()
+        if Path(chat_root_raw).is_absolute()
+        else (repo_path / chat_root_raw).resolve()
+    )
     chat = ChatConfig(
-        root_dir=Path(str(chat_raw.get("root_dir", Path.home() / "lagent-chats"))).resolve(),
+        root_dir=chat_root,
         repo_name=_sanitize_name(str(chat_raw.get("repo_name", repo_path.name))),
         project_name=str(chat_raw.get("project_name", "") or chat_raw.get("repo_name", repo_path.name)),
         public_base_url=str(chat_raw.get("public_base_url", "https://example.com/lagent-chats/")),
@@ -459,7 +470,12 @@ def load_config(path: Path) -> Config:
     if policy_path_raw:
         policy_path: Optional[Path] = Path(policy_path_raw).resolve() if Path(policy_path_raw).is_absolute() else (path.parent / policy_path_raw).resolve()
     else:
-        policy_path = path.with_suffix(".policy.json").resolve()
+        if path.name == PROJECT_CONFIG_FILENAME:
+            policy_path = project_policy_path(repo_path).resolve()
+        elif path.name.endswith(".config.json"):
+            policy_path = path.with_name(path.name.replace(".config.json", ".policy.json")).resolve()
+        else:
+            policy_path = path.with_suffix(".policy.json").resolve()
 
     return Config(
         repo_path=repo_path,

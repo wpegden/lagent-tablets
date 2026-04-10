@@ -442,6 +442,34 @@ class TestArtifactValidation(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["data"]["proof_edit_mode"], "coarse_restructure")
 
+    def test_validates_theorem_reviewer_reset_to_checkpoint(self):
+        result = validate_reviewer_decision_data({
+            "decision": "CONTINUE",
+            "reason": "Reset to a known-good checkpoint.",
+            "next_prompt": "Try again from the valid checkpoint.",
+            "next_active_node": "",
+            "reset_to_checkpoint": "cycle-4",
+            "paper_focus_ranges": [],
+            "orphan_resolutions": [],
+            "open_blockers": [],
+        }, phase="theorem_stating")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"]["reset_to_checkpoint"], "cycle-4")
+
+    def test_rejects_theorem_reviewer_reset_without_continue(self):
+        result = validate_reviewer_decision_data({
+            "decision": "ADVANCE_PHASE",
+            "reason": "Advance.",
+            "next_prompt": "",
+            "next_active_node": "",
+            "reset_to_checkpoint": "cycle-4",
+            "paper_focus_ranges": [],
+            "orphan_resolutions": [],
+            "open_blockers": [],
+        }, phase="theorem_stating")
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("reset_to_checkpoint is only allowed" in err for err in result["errors"]))
+
     def test_validates_cleanup_reviewer_decision(self):
         result = validate_reviewer_decision_data({
             "decision": "DONE",
@@ -501,7 +529,7 @@ class TestArtifactValidation(unittest.TestCase):
             return_value={
                 "ok": False,
                 "errors": [
-                    "other: .tex format errors: ['Missing statement environment (theorem/lemma/definition/proposition)']",
+                    "other: .tex format errors: ['Missing statement environment (theorem/lemma/definition/corollary)']",
                     "target: Compilation failed",
                 ],
                 "warnings": [],
@@ -513,7 +541,7 @@ class TestArtifactValidation(unittest.TestCase):
                 allowed_prefixes=["Mathlib"],
                 forbidden_keywords=["sorry", "axiom"],
                 baseline_errors=[
-                    "other: .tex format errors: ['Missing statement environment (theorem/lemma/definition/proposition)']",
+                    "other: .tex format errors: ['Missing statement environment (theorem/lemma/definition/corollary)']",
                 ],
                 allowed_nodes=["target"],
             )

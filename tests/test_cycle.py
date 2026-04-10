@@ -2050,29 +2050,205 @@ class TestTheoremTargetScope(unittest.TestCase):
 
             with patch("lagent_tablets.health.fix_lake_permissions"):
                 with patch("lagent_tablets.cycle._setup_theorem_stating_permissions"):
-                    with patch("lagent_tablets.prompts.build_theorem_stating_prompt", return_value="prompt"):
-                        with patch("lagent_tablets.cycle.run_worker_burst", side_effect=fake_worker_burst):
-                            with patch(
-                                "lagent_tablets.cycle._accept_validated_artifact",
-                                return_value=({"summary": "changed foo tex", "status": "DONE", "new_nodes": [], "difficulty_hints": {}}, None),
-                            ):
-                                with patch("lagent_tablets.cycle.run_check_tablet", return_value={"errors": []}):
-                                    with patch(
-                                        "lagent_tablets.cycle.run_check_tablet_scoped",
-                                        return_value={
-                                            "errors": [
-                                                "foo: .tex format errors: ['Missing statement environment (theorem/lemma/definition/proposition)']"
+                    with patch("lagent_tablets.cycle._save_live_viewer_state"):
+                        with patch("lagent_tablets.prompts.build_theorem_stating_prompt", return_value="prompt"):
+                            with patch("lagent_tablets.prompts.build_theorem_stating_reviewer_prompt", return_value="reviewer prompt"):
+                                with patch("lagent_tablets.cycle.run_worker_burst", side_effect=fake_worker_burst):
+                                    with patch("lagent_tablets.cycle.run_reviewer_burst", return_value=SimpleNamespace(ok=True, transcript_path=None, error="", captured_output="", usage=None)):
+                                        with patch(
+                                            "lagent_tablets.cycle._accept_validated_artifact",
+                                            side_effect=[
+                                                ({"summary": "changed foo tex", "status": "DONE", "new_nodes": [], "difficulty_hints": {}}, None),
+                                                ({"decision": "CONTINUE", "reason": "repair it", "next_prompt": "Fix the tex env.", "next_active_node": "", "reset_to_checkpoint": ""}, None),
                                             ],
-                                            "build_output": "",
-                                        },
-                                    ) as mock_scoped:
-                                        outcome = run_theorem_stating_cycle(config, state, tablet, Policy())
+                                        ):
+                                            with patch("lagent_tablets.cycle.run_check_tablet", return_value={"errors": []}):
+                                                with patch(
+                                                    "lagent_tablets.cycle.run_check_tablet_scoped",
+                                                    return_value={
+                                                        "errors": [
+                                                            "foo: .tex format errors: ['Missing statement environment (theorem/lemma/definition/corollary)']"
+                                                        ],
+                                                        "build_output": "",
+                                                    },
+                                                ) as mock_scoped:
+                                                    with patch("lagent_tablets.chat_history.commit_chat_attempt", return_value=None):
+                                                        outcome = run_theorem_stating_cycle(config, state, tablet, Policy())
 
             self.assertEqual(outcome.outcome, "INVALID")
             self.assertIn("foo: .tex format errors", outcome.detail)
             self.assertEqual(mock_scoped.call_count, 1)
             self.assertEqual(mock_scoped.call_args.kwargs["allowed_nodes"], ["foo"])
             self.assertEqual(mock_scoped.call_args.kwargs["baseline_errors"], [])
+
+    def test_theorem_stating_invalid_preserves_worktree_for_reviewer_and_keeps_cycle_uncommitted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True, capture_output=True, text=True)
+            state_dir = repo / ".agent-supervisor"
+            state_dir.mkdir()
+            tablet_dir = repo / "Tablet"
+            tablet_dir.mkdir()
+            (tablet_dir / "Preamble.lean").write_text("import Mathlib.Data.Nat.Basic\n", encoding="utf-8")
+            (tablet_dir / "README.md").write_text("readme\n", encoding="utf-8")
+            (tablet_dir / "INDEX.md").write_text("index\n", encoding="utf-8")
+            (tablet_dir / "header.tex").write_text("% header\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True, text=True)
+
+            state = SupervisorState(cycle=8, phase="theorem_stating")
+            tablet = TabletState(nodes={"Preamble": TabletNode(name="Preamble", kind="preamble", status="closed")})
+            config = SimpleNamespace(
+                repo_path=repo,
+                state_dir=state_dir,
+                worker=SimpleNamespace(provider="codex", model="gpt-5.4"),
+                reviewer=SimpleNamespace(provider="codex", model="gpt-5.4"),
+                verification=SimpleNamespace(soundness_agents=[], correspondence_agents=[]),
+                tmux=SimpleNamespace(session_name="test", burst_user="worker"),
+                startup_timeout_seconds=60.0,
+                workflow=SimpleNamespace(
+                    allowed_import_prefixes=["Mathlib"],
+                    forbidden_keyword_allowlist=[],
+                    approved_axioms_path=None,
+                    paper_tex_path=None,
+                ),
+                goal_file=repo / "GOAL.txt",
+            )
+            config.goal_file.write_text("", encoding="utf-8")
+
+            def fake_worker_burst(*args, **kwargs):
+                (tablet_dir / "bar.lean").write_text(
+                    "import Tablet.Preamble\n\n-- [TABLET NODE: bar]\n\nlemma bar : True := by\n  sorry\n",
+                    encoding="utf-8",
+                )
+                (tablet_dir / "bar.tex").write_text(
+                    "\\begin{lemma}[Bar]\nTrue.\n\\end{lemma}\n\\begin{proof}\nProof.\n\\end{proof}\n",
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(ok=True, transcript_path=None, error="", captured_output="", usage=None)
+
+            with patch("lagent_tablets.health.fix_lake_permissions"):
+                with patch("lagent_tablets.cycle._setup_theorem_stating_permissions"):
+                    with patch("lagent_tablets.cycle._save_live_viewer_state"):
+                        with patch("lagent_tablets.prompts.build_theorem_stating_prompt", return_value="prompt"):
+                            with patch("lagent_tablets.prompts.build_theorem_stating_reviewer_prompt", return_value="reviewer prompt"):
+                                with patch("lagent_tablets.cycle.run_worker_burst", side_effect=fake_worker_burst):
+                                    with patch("lagent_tablets.cycle.run_reviewer_burst", return_value=SimpleNamespace(ok=True, transcript_path=None, error="", captured_output="", usage=None)):
+                                        with patch(
+                                            "lagent_tablets.cycle._accept_validated_artifact",
+                                            side_effect=[
+                                                ({"summary": "created bar", "status": "NOT_STUCK", "new_nodes": ["bar"], "difficulty_hints": {}}, None),
+                                                ({"decision": "CONTINUE", "reason": "inspect the dirty worktree", "next_prompt": "Repair from the current files.", "next_active_node": "", "reset_to_checkpoint": ""}, None),
+                                            ],
+                                        ):
+                                            with patch("lagent_tablets.cycle.run_check_tablet", return_value={"errors": []}):
+                                                with patch(
+                                                    "lagent_tablets.cycle.run_check_tablet_scoped",
+                                                    return_value={"errors": ["bar: synthetic failure"], "build_output": ""},
+                                                ):
+                                                    with patch("lagent_tablets.chat_history.commit_chat_attempt", return_value=None):
+                                                        outcome = run_theorem_stating_cycle(config, state, tablet, Policy())
+
+            self.assertEqual(outcome.outcome, "INVALID")
+            self.assertEqual(state.cycle, 8)
+            self.assertEqual(sorted(tablet.nodes.keys()), ["Preamble", "bar"])
+            self.assertTrue((tablet_dir / "bar.lean").exists())
+            self.assertTrue((tablet_dir / "bar.tex").exists())
+            self.assertFalse((repo / "worker_handoff.json").exists())
+            self.assertEqual(state.validation_summary["in_flight_cycle"], 9)
+            self.assertEqual(state.validation_summary["attempt"], 1)
+            self.assertEqual(state.last_review.get("decision"), "CONTINUE")
+
+    def test_theorem_stating_invalid_retries_reuse_cycle_number_and_increment_attempt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True, capture_output=True, text=True)
+            state_dir = repo / ".agent-supervisor"
+            state_dir.mkdir()
+            tablet_dir = repo / "Tablet"
+            tablet_dir.mkdir()
+            (tablet_dir / "Preamble.lean").write_text("import Mathlib.Data.Nat.Basic\n", encoding="utf-8")
+            (tablet_dir / "README.md").write_text("readme\n", encoding="utf-8")
+            (tablet_dir / "INDEX.md").write_text("index\n", encoding="utf-8")
+            (tablet_dir / "header.tex").write_text("% header\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True, text=True)
+
+            state = SupervisorState(cycle=8, phase="theorem_stating")
+            tablet = TabletState(nodes={"Preamble": TabletNode(name="Preamble", kind="preamble", status="closed")})
+            config = SimpleNamespace(
+                repo_path=repo,
+                state_dir=state_dir,
+                worker=SimpleNamespace(provider="codex", model="gpt-5.4"),
+                reviewer=SimpleNamespace(provider="codex", model="gpt-5.4"),
+                verification=SimpleNamespace(soundness_agents=[], correspondence_agents=[]),
+                tmux=SimpleNamespace(session_name="test", burst_user="worker"),
+                startup_timeout_seconds=60.0,
+                workflow=SimpleNamespace(
+                    allowed_import_prefixes=["Mathlib"],
+                    forbidden_keyword_allowlist=[],
+                    approved_axioms_path=None,
+                    paper_tex_path=None,
+                ),
+                goal_file=repo / "GOAL.txt",
+            )
+            config.goal_file.write_text("", encoding="utf-8")
+            seen_prefixes = []
+
+            def fake_worker_burst(*args, **kwargs):
+                seen_prefixes.append(kwargs["artifact_prefix"])
+                (tablet_dir / "bar.lean").write_text(
+                    "import Tablet.Preamble\n\n-- [TABLET NODE: bar]\n\nlemma bar : True := by\n  sorry\n",
+                    encoding="utf-8",
+                )
+                (tablet_dir / "bar.tex").write_text(
+                    "\\begin{lemma}[Bar]\nTrue.\n\\end{lemma}\n\\begin{proof}\nProof.\n\\end{proof}\n",
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(ok=True, transcript_path=None, error="", captured_output="", usage=None)
+
+            common_patches = [
+                patch("lagent_tablets.health.fix_lake_permissions"),
+                patch("lagent_tablets.cycle._setup_theorem_stating_permissions"),
+                patch("lagent_tablets.cycle._save_live_viewer_state"),
+                patch("lagent_tablets.prompts.build_theorem_stating_prompt", return_value="prompt"),
+                patch("lagent_tablets.prompts.build_theorem_stating_reviewer_prompt", return_value="reviewer prompt"),
+                patch("lagent_tablets.cycle.run_worker_burst", side_effect=fake_worker_burst),
+                patch("lagent_tablets.cycle.run_reviewer_burst", return_value=SimpleNamespace(ok=True, transcript_path=None, error="", captured_output="", usage=None)),
+                patch(
+                    "lagent_tablets.cycle._accept_validated_artifact",
+                    side_effect=[
+                        ({"summary": "created bar", "status": "NOT_STUCK", "new_nodes": ["bar"], "difficulty_hints": {}}, None),
+                        ({"decision": "CONTINUE", "reason": "keep going", "next_prompt": "Repair from current worktree.", "next_active_node": "", "reset_to_checkpoint": ""}, None),
+                        ({"summary": "created bar", "status": "NOT_STUCK", "new_nodes": ["bar"], "difficulty_hints": {}}, None),
+                        ({"decision": "CONTINUE", "reason": "keep going", "next_prompt": "Repair from current worktree.", "next_active_node": "", "reset_to_checkpoint": ""}, None),
+                    ],
+                ),
+                patch("lagent_tablets.cycle.run_check_tablet", return_value={"errors": []}),
+                patch(
+                    "lagent_tablets.cycle.run_check_tablet_scoped",
+                    return_value={"errors": ["bar: synthetic failure"], "build_output": ""},
+                ),
+                patch("lagent_tablets.chat_history.commit_chat_attempt", return_value=None),
+            ]
+
+            with common_patches[0], common_patches[1], common_patches[2], common_patches[3], common_patches[4], common_patches[5], common_patches[6], common_patches[7], common_patches[8], common_patches[9], common_patches[10]:
+                first = run_theorem_stating_cycle(config, state, tablet, Policy())
+                second = run_theorem_stating_cycle(config, state, tablet, Policy())
+
+            self.assertEqual(first.outcome, "INVALID")
+            self.assertEqual(second.outcome, "INVALID")
+            self.assertEqual(state.cycle, 8)
+            self.assertEqual(state.validation_summary["in_flight_cycle"], 9)
+            self.assertEqual(state.validation_summary["attempt"], 2)
+            self.assertEqual(
+                seen_prefixes,
+                ["worker_handoff_attempt_0001", "worker_handoff_attempt_0002"],
+            )
 
     def test_proof_formalization_hard_mode_runs_scoped_deterministic_check(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2136,7 +2312,7 @@ class TestTheoremTargetScope(unittest.TestCase):
                                             "lagent_tablets.cycle.run_check_tablet_scoped",
                                             return_value={
                                                 "errors": [
-                                                    "foo: .tex format errors: ['Missing statement environment (theorem/lemma/definition/proposition)']"
+                                                    "foo: .tex format errors: ['Missing statement environment (theorem/lemma/definition/corollary)']"
                                                 ],
                                                 "build_output": "",
                                             },
@@ -2149,6 +2325,83 @@ class TestTheoremTargetScope(unittest.TestCase):
             self.assertEqual(mock_scoped.call_count, 1)
             self.assertEqual(mock_scoped.call_args.kwargs["allowed_nodes"], ["foo"])
             self.assertEqual(mock_scoped.call_args.kwargs["baseline_errors"], [])
+
+    def test_proof_formalization_verification_rejection_becomes_rejected_outcome(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            state_dir = repo / ".agent-supervisor"
+            state_dir.mkdir()
+            tablet_dir = repo / "Tablet"
+            tablet_dir.mkdir()
+            (tablet_dir / "Preamble.lean").write_text("import Mathlib.Data.Nat.Basic\n", encoding="utf-8")
+            (tablet_dir / "foo.lean").write_text(
+                "import Tablet.Preamble\n\n-- [TABLET NODE: foo]\n\nlemma foo : True := by\n  sorry\n",
+                encoding="utf-8",
+            )
+            (tablet_dir / "foo.tex").write_text(
+                "\\begin{lemma}[Foo]\nTrue.\n\\end{lemma}\n\\begin{proof}\nProof.\n\\end{proof}\n",
+                encoding="utf-8",
+            )
+
+            state = SupervisorState(cycle=3, phase="proof_formalization", active_node="foo")
+            tablet = TabletState(
+                active_node="foo",
+                nodes={
+                    "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+                    "foo": TabletNode(name="foo", kind="helper_lemma", status="open", difficulty="hard"),
+                },
+            )
+            config = SimpleNamespace(
+                repo_path=repo,
+                state_dir=state_dir,
+                worker=SimpleNamespace(provider="codex", model="gpt-5.4"),
+                easy_worker=None,
+                hard_worker=None,
+                reviewer=SimpleNamespace(provider="codex", model="gpt-5.4"),
+                tmux=SimpleNamespace(session_name="test", burst_user="worker"),
+                startup_timeout_seconds=60.0,
+                workflow=SimpleNamespace(
+                    allowed_import_prefixes=["Mathlib"],
+                    forbidden_keyword_allowlist=[],
+                    approved_axioms_path=None,
+                ),
+            )
+
+            def fake_worker_burst(*args, **kwargs):
+                (tablet_dir / "foo.lean").write_text(
+                    "import Tablet.Preamble\n\n-- [TABLET NODE: foo]\n\nlemma foo : True := by\n  trivial\n",
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(ok=True, transcript_path=None, error="", captured_output="", usage=None)
+
+            with patch("lagent_tablets.health.fix_lake_permissions"), \
+                 patch("lagent_tablets.cycle._ensure_lake_build"), \
+                 patch("lagent_tablets.cycle.setup_permissions"), \
+                 patch("lagent_tablets.cycle._save_live_viewer_state"), \
+                 patch("lagent_tablets.cycle.build_worker_prompt", return_value="prompt"), \
+                 patch("lagent_tablets.cycle.run_worker_burst", side_effect=fake_worker_burst), \
+                 patch("lagent_tablets.cycle.build_reviewer_prompt", return_value="reviewer prompt"), \
+                 patch("lagent_tablets.cycle.run_reviewer_burst", return_value=SimpleNamespace(ok=True, transcript_path=None, error="", captured_output="", usage=None)), \
+                 patch("lagent_tablets.cycle._accept_validated_artifact", side_effect=[
+                     ({"summary": "updated foo", "status": "DONE", "new_nodes": [], "difficulty_hints": {}}, None),
+                     ({"decision": "CONTINUE", "reason": "fix correspondence", "next_prompt": "Repair the mismatch.", "next_active_node": "foo"}, None),
+                 ]), \
+                 patch("lagent_tablets.cycle.validate_worker_cycle_v2", return_value=CycleOutcome(outcome="PROGRESS", detail="ok", nodes_closed=["foo"], nodes_created=[])), \
+                 patch("lagent_tablets.cycle._run_nl_verification", return_value=[{
+                     "check": "correspondence",
+                     "overall": "REJECT",
+                     "summary": "Correspondence rejected",
+                     "correspondence": {"decision": "FAIL", "issues": [{"node": "foo", "description": "Mismatch"}]},
+                     "paper_faithfulness": {"decision": "PASS", "issues": []},
+                 }]), \
+                 patch("lagent_tablets.git_ops.commit_checkpoint"), \
+                 patch("lagent_tablets.git_ops.commit_cycle"):
+                outcome = run_cycle(config, state, tablet, Policy())
+
+            self.assertEqual(outcome.outcome, "REJECTED")
+            self.assertIn("correspondence", outcome.detail.lower())
+            self.assertEqual(state.validation_summary["last_outcome"], "REJECTED")
+            self.assertEqual(state.last_review.get("decision"), "CONTINUE")
 
     def test_proof_formalization_newly_closed_helper_still_gets_correspondence(self):
         with tempfile.TemporaryDirectory() as tmp:

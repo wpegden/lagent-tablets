@@ -15,6 +15,9 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from lagent_tablets.chat_history import commit_chat_checkpoint, rewind_chat_history
+from lagent_tablets.viewer_state import refresh_project_viewer_cache
+
 
 GITIGNORE_CONTENT = """\
 # Build artifacts
@@ -23,6 +26,9 @@ GITIGNORE_CONTENT = """\
 # Logs (ephemeral, large)
 .agent-supervisor/logs/
 .agent-supervisor/history/
+.agent-supervisor/chats/
+.agent-supervisor/scratch/
+.agent-supervisor/viewer/
 
 # Signal files
 .agent-supervisor/pause
@@ -92,6 +98,131 @@ def _stage_ref(cycle: int, stage: str) -> str:
     raise ValueError(f"Unsupported rewind stage: {stage!r}")
 
 
+def _root_commit(repo: Path) -> Optional[str]:
+    result = _git(repo, "rev-list", "--max-parents=0", "HEAD", check=False)
+    if result.returncode != 0:
+        return None
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return lines[0] if lines else None
+
+
+def _read_cycle_meta(repo: Path, ref: str) -> Dict[str, Any]:
+    meta_result = _git(repo, "show", f"{ref}:.agent-supervisor/cycle_meta.json", check=False)
+    if meta_result.returncode != 0:
+        return {}
+    try:
+        return json.loads(meta_result.stdout)
+    except json.JSONDecodeError:
+        return {}
+
+
+def list_valid_reset_checkpoints(repo: Path) -> List[Dict[str, Any]]:
+    """Return supervisor-legal reset targets for reviewer-directed resets.
+
+    A valid checkpoint is an exact committed state whose recorded outcome is not
+    INVALID. We also expose the repository root commit as `initial`.
+    """
+    checkpoints: List[Dict[str, Any]] = []
+    root = _root_commit(repo)
+    if root:
+        checkpoints.append(
+            {
+                "ref": "initial",
+                "label": "initial setup commit",
+                "outcome": "PROGRESS",
+                "phase": "",
+                "checkpoint": "initial",
+                "commit": root,
+            }
+        )
+
+    result = _git(repo, "tag", "-l", "cycle-*", "--sort=-version:refname", check=False)
+    if result.returncode != 0:
+        return checkpoints
+
+    for tag in [line.strip() for line in result.stdout.splitlines() if line.strip()]:
+        meta = _read_cycle_meta(repo, tag)
+        outcome = str(meta.get("outcome", "") or "").strip().upper()
+        if outcome == "INVALID":
+            continue
+        checkpoint_stage = str(meta.get("checkpoint", "") or "").strip().lower()
+        if _is_final_cycle_tag(tag):
+            stage_label = "reviewer/final"
+        elif checkpoint_stage in CHECKPOINT_STAGES:
+            stage_label = checkpoint_stage
+        else:
+            stage_label = "checkpoint"
+        cycle_value = meta.get("cycle", "")
+        phase = str(meta.get("phase", "") or "").strip()
+        label_bits = [f"cycle {cycle_value}", stage_label]
+        if phase:
+            label_bits.append(phase)
+        if outcome:
+            label_bits.append(outcome)
+        checkpoints.append(
+            {
+                "ref": tag,
+                "label": " | ".join(label_bits),
+                "outcome": outcome,
+                "phase": phase,
+                "checkpoint": checkpoint_stage or ("reviewer" if _is_final_cycle_tag(tag) else ""),
+                "cycle": cycle_value,
+                "commit": _git(repo, "rev-parse", tag, check=False).stdout.strip(),
+            }
+        )
+    return checkpoints
+
+
+def _delete_future_cycle_tags(repo: Path, target_key: tuple[int, int]) -> None:
+    tags_result = _git(repo, "tag", "-l", "cycle-*", check=False)
+    if tags_result.returncode != 0:
+        return
+    for existing in [t.strip() for t in tags_result.stdout.splitlines() if t.strip()]:
+        if _cycle_tag_sort_key(existing) > target_key:
+            _git(repo, "tag", "-d", existing, check=False)
+
+
+def reset_to_checkpoint_ref(
+    repo: Path,
+    ref: str,
+    *,
+    burst_user: str = "lagentworker",
+) -> bool:
+    """Reset the main project repo to an exact committed valid checkpoint and clean it.
+
+    Reviewer-guided resets are exact rewinds, not branches. After reset, both the
+    main repo and the nested chats repo should be clean at the requested checkpoint.
+    """
+    normalized = str(ref or "").strip()
+    if not normalized:
+        return False
+
+    if normalized == "initial":
+        actual_ref = _root_commit(repo)
+        target_key = (0, -1)
+    else:
+        check = _git(repo, "rev-parse", normalized, check=False)
+        if check.returncode != 0:
+            print(f"Checkpoint {normalized} does not exist")
+            return False
+        actual_ref = normalized
+        target_key = _cycle_tag_sort_key(normalized)
+
+    if not actual_ref:
+        print("Could not resolve initial setup commit")
+        return False
+
+    subprocess.run(["pkill", "-9", "-f", "agentapi"], capture_output=True)
+
+    _git(repo, "reset", "--hard", actual_ref)
+    _git(repo, "clean", "-fdx", "-e", ".agent-supervisor/chats/", timeout=120)
+    _delete_future_cycle_tags(repo, target_key)
+    rewind_chat_history(repo, tag=normalized)
+    print(f"Reset project worktree to {normalized} and cleaned it")
+    print(f"  Agent sessions cleared for {burst_user}")
+    return True
+
+
 def _commit_tagged_state(
     repo: Path,
     *,
@@ -131,6 +262,8 @@ def _commit_tagged_state(
     _git(repo, "commit", "-m", f"{summary}{body}")
     _git(repo, "tag", "-d", tag, check=False)
     _git(repo, "tag", tag)
+    commit_chat_checkpoint(repo, tag=tag)
+    refresh_project_viewer_cache(repo, repo / ".agent-supervisor")
     result = _git(repo, "rev-parse", "HEAD")
     return result.stdout.strip()
 
@@ -346,7 +479,8 @@ def rewind_to_cycle(
 
     # Exact restore from the committed checkpoint.
     _git(repo, "reset", "--hard", tag)
-    _git(repo, "clean", "-fdx", timeout=120)
+    rewind_chat_history(repo, tag=tag)
+    _git(repo, "clean", "-fdx", "-e", ".agent-supervisor/chats/", timeout=120)
 
     # Clear agent chat histories to prevent context poisoning
     project_name = repo.name

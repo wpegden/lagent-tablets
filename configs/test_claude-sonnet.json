@@ -49,7 +49,7 @@
     }
   },
   "chat": {
-    "root_dir": "/tmp/lagent-gnp-chats",
+    "root_dir": ".agent-supervisor/chats",
     "repo_name": "connectivity-gnp-full",
     "project_name": "Connectivity Threshold G(n,p) - Full Run"
   },

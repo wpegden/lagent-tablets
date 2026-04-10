@@ -34,7 +34,7 @@
     "allowed_import_prefixes": ["Mathlib"]
   },
   "chat": {
-    "root_dir": "/tmp/lagent-gnp-chats",
+    "root_dir": ".agent-supervisor/chats",
     "repo_name": "test-multi-corr"
   },
   "git": {}

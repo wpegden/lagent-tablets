@@ -16,6 +16,7 @@ from lagent_tablets.config import (
     load_config,
     policy_to_dict,
 )
+from lagent_tablets.project_paths import project_chats_dir, project_policy_path
 
 
 class TestLoadConfig(unittest.TestCase):
@@ -144,6 +145,30 @@ class TestLoadConfig(unittest.TestCase):
         path = self._write_config(repo)
         config = load_config(path)
         self.assertEqual(config.policy_path, path.with_suffix(".policy.json").resolve())
+
+    def test_project_local_config_defaults_policy_and_chat_paths(self):
+        repo = self._make_repo()
+        path = repo / "lagent.config.json"
+        path.write_text(json.dumps({
+            "repo_path": str(repo),
+            "worker": {"provider": "claude", "model": "sonnet"},
+            "reviewer": {"provider": "claude", "model": "sonnet"},
+            "tmux": {
+                "session_name": "test",
+                "dashboard_window_name": "dash",
+                "kill_windows_after_capture": True,
+                "burst_user": "testworker",
+            },
+        }), encoding="utf-8")
+        config = load_config(path)
+        self.assertEqual(config.policy_path, project_policy_path(repo).resolve())
+        self.assertEqual(config.chat.root_dir, project_chats_dir(repo / ".agent-supervisor").resolve())
+
+    def test_relative_chat_root_is_resolved_under_repo(self):
+        repo = self._make_repo()
+        path = self._write_config(repo, chat={"root_dir": ".agent-supervisor/chats"})
+        config = load_config(path)
+        self.assertEqual(config.chat.root_dir, (repo / ".agent-supervisor" / "chats").resolve())
 
 
 class TestPolicyManager(unittest.TestCase):

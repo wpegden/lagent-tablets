@@ -7,6 +7,8 @@ The health monitor tracks success rates and detects systematic failures.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -204,21 +206,135 @@ class HealthMonitor:
         }
 
 
-# ---------------------------------------------------------------------------
-# .lake permission management
-# ---------------------------------------------------------------------------
+def _lake_build_roots(repo_path: Path, *, include_package_builds: bool = False) -> List[Path]:
+    roots: List[Path] = []
+    main_build = repo_path / ".lake" / "build"
+    if main_build.exists():
+        roots.append(main_build)
+    if include_package_builds:
+        packages_root = repo_path / ".lake" / "packages"
+        if packages_root.exists():
+            for package_dir in sorted(packages_root.iterdir()):
+                build_root = package_dir / ".lake" / "build"
+                if build_root.exists():
+                    roots.append(build_root)
+    return roots
 
-def fix_lake_permissions(repo_path: Path, group: str = "leanagent") -> None:
-    """Ensure .lake build artifacts have proper group permissions for multi-user access.
 
-    Only fixes the build directory, NOT the packages directory. Changing permissions
-    on .lake/packages/* causes git to detect "local changes" and Lake refuses to build.
+def _normalize_build_tree(root: Path, *, gid: int) -> None:
+    try:
+        os.chown(str(root), -1, gid)
+    except (PermissionError, OSError):
+        pass
+    try:
+        os.chmod(str(root), 0o2775)
+    except (PermissionError, OSError):
+        pass
+    for current_root, dirs, files in os.walk(str(root)):
+        current_path = Path(current_root)
+        try:
+            os.chown(str(current_path), -1, gid)
+        except (PermissionError, OSError):
+            pass
+        try:
+            os.chmod(str(current_path), 0o2775)
+        except (PermissionError, OSError):
+            pass
+        for name in files:
+            file_path = current_path / name
+            try:
+                os.chown(str(file_path), -1, gid)
+            except (PermissionError, OSError):
+                pass
+            try:
+                os.chmod(str(file_path), 0o664)
+            except (PermissionError, OSError):
+                pass
+
+
+def _normalize_build_roots_as_burst_user(
+    roots: List[Path],
+    *,
+    burst_user: str,
+    group: str,
+) -> None:
+    if not roots:
+        return
+    payload = json.dumps([str(root) for root in roots])
+    script = r"""
+import grp
+import json
+import os
+import sys
+from pathlib import Path
+
+roots = [Path(p) for p in json.loads(sys.argv[1])]
+gid = grp.getgrnam(sys.argv[2]).gr_gid
+
+for root in roots:
+    if not root.exists():
+        continue
+    try:
+        os.chown(str(root), -1, gid)
+    except (PermissionError, OSError):
+        pass
+    try:
+        os.chmod(str(root), 0o2775)
+    except (PermissionError, OSError):
+        pass
+    for current_root, dirs, files in os.walk(str(root)):
+        current_path = Path(current_root)
+        try:
+            os.chown(str(current_path), -1, gid)
+        except (PermissionError, OSError):
+            pass
+        try:
+            os.chmod(str(current_path), 0o2775)
+        except (PermissionError, OSError):
+            pass
+        for name in files:
+            file_path = current_path / name
+            try:
+                os.chown(str(file_path), -1, gid)
+            except (PermissionError, OSError):
+                pass
+            try:
+                os.chmod(str(file_path), 0o664)
+            except (PermissionError, OSError):
+                pass
+"""
+    try:
+        subprocess.run(
+            ["sudo", "-n", "-u", burst_user, "python3", "-c", script, payload, group],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def fix_lake_permissions(
+    repo_path: Path,
+    group: str = "leanagent",
+    *,
+    burst_user: Optional[str] = None,
+    include_package_builds: bool = False,
+) -> None:
+    """Ensure Lean build artifacts are group-readable/writable for shared access.
+
+    We normalize:
+    - repo/.lake/build/**
+    - optionally repo/.lake/packages/*/.lake/build/**
+
+    We intentionally do NOT touch package source checkouts outside those build
+    directories, because those are real git working trees.
     """
     import grp
-    import os
 
-    build_dir = repo_path / ".lake" / "build"
-    if not build_dir.exists():
+    roots = _lake_build_roots(repo_path, include_package_builds=include_package_builds)
+    if not roots:
         return
 
     try:
@@ -226,26 +342,7 @@ def fix_lake_permissions(repo_path: Path, group: str = "leanagent") -> None:
     except KeyError:
         return
 
-    # Fix .lake and .lake/build directories
-    for d in [repo_path / ".lake", build_dir]:
-        try:
-            os.chown(str(d), -1, gid)
-            os.chmod(str(d), 0o2775)
-        except (PermissionError, OSError):
-            pass
-
-    # Walk only the build tree
-    for root, dirs, files in os.walk(str(build_dir)):
-        root_path = Path(root)
-        try:
-            os.chown(str(root_path), -1, gid)
-            os.chmod(str(root_path), 0o2775)
-        except (PermissionError, OSError):
-            pass
-        for fname in files:
-            fpath = root_path / fname
-            try:
-                os.chown(str(fpath), -1, gid)
-                os.chmod(str(fpath), 0o664)
-            except (PermissionError, OSError):
-                pass
+    for root in roots:
+        _normalize_build_tree(root, gid=gid)
+    if burst_user:
+        _normalize_build_roots_as_burst_user(roots, burst_user=burst_user, group=group)

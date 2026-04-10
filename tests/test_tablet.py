@@ -193,6 +193,11 @@ class TestTexValidation(unittest.TestCase):
         errors = validate_tex_format(tex)
         self.assertEqual(errors, [])
 
+    def test_valid_regular_corollary_node(self):
+        tex = "\\begin{corollary}[Foo]\nStatement\n\\end{corollary}\n\n\\begin{proof}\nProof text\n\\end{proof}\n"
+        errors = validate_tex_format(tex)
+        self.assertEqual(errors, [])
+
     def test_missing_statement(self):
         tex = "\\begin{proof}\nProof text\n\\end{proof}\n"
         errors = validate_tex_format(tex)
@@ -207,6 +212,11 @@ class TestTexValidation(unittest.TestCase):
         tex = "\\begin{proposition}[BW]\nStatement\n\\end{proposition}\n"
         errors = validate_tex_format(tex, is_preamble=True)
         self.assertEqual(errors, [])
+
+    def test_regular_nodes_reject_proposition(self):
+        tex = "\\begin{proposition}[Foo]\nStatement\n\\end{proposition}\n"
+        errors = validate_tex_format(tex)
+        self.assertTrue(any("theorem/lemma/definition/corollary" in e for e in errors))
 
     def test_valid_preamble_with_definition(self):
         tex = "\\begin{definition}[thing]\nThing.\n\\end{definition}\n"

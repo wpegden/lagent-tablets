@@ -48,4 +48,4 @@ PY
 
 echo ""
 echo "Done. Restart normally from the committed state:"
-echo "  tmux new-session -d -s supervisor \"python3 -u -m lagent_tablets.cli --config CONFIG 2>&1 | tee /tmp/run.log\""
+echo "  ./scripts/resume.sh /path/to/repo"

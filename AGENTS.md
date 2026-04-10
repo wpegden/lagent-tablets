@@ -153,7 +153,7 @@ The unified poll loop in agentapi_backend:
 ## 5. Configuration
 
 ### Config JSON structure
-See `configs/extremal_vectors_run.json` for a complete example. Key fields:
+Each project now keeps its live config in `lagent.config.json` at the repo root. `configs/extremal_vectors_run.json` remains the source template/example. Key fields:
 - `worker`, `easy_worker`, `hard_worker` — ProviderConfig per difficulty
 - `reviewer` — ProviderConfig for the reviewer agent
 - `verification.correspondence_agents` — list of agents for correspondence checks
@@ -161,7 +161,7 @@ See `configs/extremal_vectors_run.json` for a complete example. Key fields:
 - Each agent: `provider`, `model`, `effort`, `fallback_models`, `label`
 
 ### Policy JSON (hot-reloadable)
-Runtime tuning at `{config}.policy.json`. Editable while supervisor runs:
+Runtime tuning at `lagent.policy.json` in the project root. Editable while supervisor runs:
 - `timing.burst_timeout_seconds` — burst budget hint passed through to backends; it is not a hard completion kill for Codex/script headless
 - `difficulty.easy_max_retries` — attempts before auto-elevation
 - `prompt_notes.worker` — ad-hoc instructions injected into prompts
@@ -222,7 +222,7 @@ Cycle N:
 ./scripts/pause.sh [repo]            # Graceful stop after cycle
 ./scripts/stop.sh [repo]             # Kill everything
 ./scripts/rewind.sh 3 verification   # Rewind to cycle 3, verification stage
-./scripts/resume.sh config.json --stop-at-phase-boundary
+./scripts/resume.sh /path/to/repo --stop-at-phase-boundary
 ./scripts/setup_repo.sh /path paper.tex  # New formalization
 ```
 
@@ -230,7 +230,7 @@ Cycle N:
 
 ## 8. Web Viewer
 
-Dashboard at port 3300 (nginx serves static files from `/home/leanagent/lagent-tablets-web/`).
+Dashboard at port 3300. Project-specific viewer JSON now lives under `.agent-supervisor/viewer/` inside each repo; the static web route symlinks into that project-local data.
 
 ### Visual encoding
 - **Node border**: solid=C pass, dashed=C unknown, dotted=C fail

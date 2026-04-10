@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from lagent_tablets.adapters import BurstResult, ProviderConfig
+from lagent_tablets.chat_history import ensure_chat_file_link
 
 WORKER_PATH = "/home/leanagent/.local/bin:/home/leanagent/.elan/bin:/home/leanagent/.nvm/versions/node/v22.22.2/bin:/usr/local/bin:/usr/bin:/bin"
 WORKER_ELAN_HOME = "/home/leanagent/.elan"
@@ -170,7 +171,14 @@ def run(
     log_dir.mkdir(parents=True, exist_ok=True)
     prefix = _artifact_prefix(artifact_prefix, role)
 
-    prompt_file = log_dir / f"{prefix}-prompt.txt"
+    prompt_file = ensure_chat_file_link(
+        work_dir,
+        log_dir=log_dir,
+        artifact_prefix=prefix,
+        role=role,
+        log_filename=f"{prefix}-prompt.txt",
+        canonical_name="prompt.txt",
+    )
     prompt_file.write_text(prompt, encoding="utf-8")
     prompt_file.chmod(0o644)
 
@@ -179,7 +187,14 @@ def run(
     start_file.unlink(missing_ok=True)
     exit_file.unlink(missing_ok=True)
 
-    output_log = log_dir / f"{prefix}-output.log"
+    output_log = ensure_chat_file_link(
+        work_dir,
+        log_dir=log_dir,
+        artifact_prefix=prefix,
+        role=role,
+        log_filename=f"{prefix}-output.log",
+        canonical_name="output.log",
+    )
     output_log.write_text("", encoding="utf-8")
 
     script_path = build_script(

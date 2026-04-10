@@ -1403,7 +1403,12 @@ def validate_reviewer_decision_data(data: Any, *, phase: str) -> Dict[str, Any]:
     reason, reason_errors = _expect_string(data.get("reason", ""), "reason")
     next_prompt, next_prompt_errors = _expect_string(data.get("next_prompt", ""), "next_prompt", allow_empty=True)
     next_active_node, next_node_errors = _expect_string(data.get("next_active_node", ""), "next_active_node", allow_empty=True)
-    errors.extend(decision_errors + reason_errors + next_prompt_errors + next_node_errors)
+    reset_to_checkpoint, reset_errors = _expect_string(
+        data.get("reset_to_checkpoint", ""),
+        "reset_to_checkpoint",
+        allow_empty=True,
+    )
+    errors.extend(decision_errors + reason_errors + next_prompt_errors + next_node_errors + reset_errors)
 
     if phase == "proof_formalization":
         allowed_decisions = PROOF_REVIEWER_DECISIONS
@@ -1422,6 +1427,7 @@ def validate_reviewer_decision_data(data: Any, *, phase: str) -> Dict[str, Any]:
         "reason": reason,
         "next_prompt": next_prompt,
         "next_active_node": next_active_node,
+        "reset_to_checkpoint": reset_to_checkpoint,
     }
 
     paper_focus_ranges = normalize_paper_focus_ranges(data.get("paper_focus_ranges", []))
@@ -1483,6 +1489,11 @@ def validate_reviewer_decision_data(data: Any, *, phase: str) -> Dict[str, Any]:
         normalized["orphan_resolutions"] = orphan_resolutions
         normalized["open_blockers"] = open_blockers
         normalized["open_rejections"] = open_blockers
+
+    if reset_to_checkpoint and phase != "theorem_stating":
+        errors.append("reset_to_checkpoint is only allowed in theorem_stating")
+    if phase == "theorem_stating" and reset_to_checkpoint and decision != "CONTINUE":
+        errors.append("reset_to_checkpoint is only allowed when decision is CONTINUE")
 
     if phase == "theorem_stating" and decision == "ADVANCE_PHASE" and not next_active_node:
         errors.append("next_active_node is required when decision is ADVANCE_PHASE")

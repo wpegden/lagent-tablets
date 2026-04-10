@@ -6,6 +6,8 @@ YOUR GOAL: Build and refine the proof tablet until it gives a complete DAG of Le
 If the tablet is still missing major parts, create the needed nodes and decomposition. If the prompt includes a `CURRENT SOUNDNESS TARGET`, keep the cycle centered on that target and follow the target-mode rules below. If there is no current target, work in deterministic deepest-first DAG order and keep the cycle focused on one coherent unresolved slice rather than broad opportunistic rewrites across unrelated parts of the tablet.
 
 Read the skill file at `{skill_path}` for Loogle usage and Lean tips.
+For ad hoc Lean experiments or temporary notes, use the repo-local scratch directory `{scratch_dir}` rather than `/tmp`.
+It contains an initial trivial file `example.lean` that already builds and shows the expected scratch-file pattern.
 
 SCOPE:
 - ALL main theorems and lemmas with complete proofs in the paper must be included as nodes.
@@ -21,7 +23,7 @@ DECOMPOSITION STRATEGY:
 - Start with the paper's main theorem(s) as top-level nodes
 - Work backwards: what intermediate results does each theorem need?
 - Each node should be a single, self-contained mathematical statement
-- Aim for 5-15 nodes depending on the paper's complexity
+- Aim for 15-50 nodes depending on the paper's complexity
 - Leaf nodes should be provable directly from Mathlib or basic arguments
 - Think about what order you would prove these in -- the node DAG should reflect this
 
@@ -57,7 +59,11 @@ For each node, create two files:
    -- NEVER write `import Mathlib`
    -- NEVER put `def` or `noncomputable def` here
    ```
-   Use Loogle at `http://127.0.0.1:8088/json?q=...` to find which module contains each lemma you need.
+   Use Loogle at `http://127.0.0.1:8088/json?q=...` to find which module contains each lemma you need. Query one concept at a time instead of combining several names into one malformed search. For example:
+   ```bash
+   curl -s "http://127.0.0.1:8088/json?q=Submodule.span" | python3 -m json.tool
+   curl -s "http://127.0.0.1:8088/json?q=Nat.choose" | python3 -m json.tool
+   ```
 
    Paper-facing imported Mathlib definitions or notation may be documented in `Tablet/Preamble.tex` using `definition` or `proposition` environments, but `Preamble.lean` itself must still contain only imports. Every project-specific definition you introduce must be its own node with a `.lean` + `.tex` pair. The `.tex` for a definition node should state in natural language what the definition means.
 
@@ -73,6 +79,7 @@ IMPORTANT RULES:
 - If your currently authorized theorem-stating scope lets you edit a node's `.lean` file and you can completely prove that node immediately from its current children, you may do that now instead of only improving the NL proof. If you take this Lean shortcut, run `python3 {check_script} node <node_name> {repo_path}` and only rely on it if that exact deterministic check passes.
 - In the coarse early theorem-stating stage only (that is, when there is no `CURRENT SOUNDNESS TARGET`), if you conclude that the source paper appears to contain a genuine fundamental gap that cannot honestly be repaired by local DAG restructuring, you may stop with status `CRISIS`. Use this only for a serious paper-level issue, not for ordinary local proof trouble.
 - Every `.lean` must have a matching `.tex` with NL statement AND NL proof
+- Create node files atomically as pairs: when you create `Tablet/{{name}}.lean`, create `Tablet/{{name}}.tex` in the same edit batch, and vice versa. Do not leave provisional lean-only or tex-only nodes behind while you keep working.
 - Imports between nodes define the DAG: if node B uses node A, then B imports A
 - The `-- [TABLET NODE: name]` marker line is MANDATORY in every node .lean file
 - NEVER use `import Mathlib` -- only specific submodule imports
@@ -83,6 +90,7 @@ IMPORTANT RULES:
 - In theorem_stating, paper-faithful DAG enrichment is generally good when it reflects real paper structure and will make later Lean work more tractable. Do not invent gratuitous helpers, but do request restructure when a richer intermediate-step decomposition is genuinely needed.
 - Use `\noderef{{name}}` to cite other nodes in NL proofs
 - Run `python3 {check_script} tablet {repo_path}` to verify the tablet structure and build state (sorry warnings are expected)
+- If you need a scratch Lean file to probe Mathlib or test a declaration shape, start from `{scratch_dir}/example.lean` or create a new file under `{scratch_dir}`, and remove throwaway probes when you are done.
 - The supervisor auto-generates `Tablet.lean` -- do NOT create or edit it
 
 NODE NAMING: use snake_case names that describe the mathematical content.

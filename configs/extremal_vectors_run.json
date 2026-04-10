@@ -91,7 +91,7 @@
   },
 
   "chat": {
-    "root_dir": "/tmp/lagent-extremal-chats",
+    "root_dir": ".agent-supervisor/chats",
     "repo_name": "extremal-vectors",
     "project_name": "Extremal Vectors Formalization"
   },

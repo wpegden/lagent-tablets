@@ -18,6 +18,7 @@ Write your decision as JSON to the raw file `{raw_output_path}`:
   "reason": "brief explanation",
   "next_prompt": "specific guidance for the worker",
   "target_edit_mode": "repair | restructure",
+  "reset_to_checkpoint": "exact ref from AVAILABLE VALID RESET CHECKPOINTS, or empty",
   "next_active_node": "name of the first node to prove (required for ADVANCE_PHASE)",
   "issues": ["list of specific issues to fix, or empty"],
   "kind_assignments": {{
@@ -48,6 +49,7 @@ Write your decision as JSON to the raw file `{raw_output_path}`:
 }}
 
 - CONTINUE: the worker needs another theorem_stating cycle. Be specific about what to fix. In `repair` mode this usually means refining the target node's `.tex` proof only; use `restructure` when you want to authorize broader DAG or statement changes for the same target.
+- `reset_to_checkpoint` is optional and only applies with `decision: "CONTINUE"`. Use it only when you want the supervisor to hard-reset the project worktree to one of the AVAILABLE VALID RESET CHECKPOINTS before the next worker attempt. The supervisor will reject any reset target that is not in that list.
 - `target_edit_mode` is mandatory whenever theorem_stating has a CURRENT SOUNDNESS TARGET. Use `repair` by default. If the current target is still unresolved, that means the next worker may edit only the target `.tex` proof. If the current target has already passed soundness in this cycle, leaving `target_edit_mode` at `repair` means the next cycle will move on automatically to the next unresolved target. Use `restructure` only when you are explicitly authorizing broader paper-faithful edits because this same target should be reopened for richer dependencies, meaningful intermediate nodes, or other prerequisite work before it is really settled.
 - ADVANCE_PHASE: the tablet is ready for proof_formalization. All main results with complete proofs in the paper are represented, NL proofs are complete, lake build passes, and the DAG structure is sound. You MUST set `next_active_node` to the node the worker should prove first — choose the node where work is most likely to change later plans (favoring hard or low-level nodes).
 - NEED_INPUT: a mathematical question requires human judgment.

@@ -614,6 +614,44 @@ class TestTheoremStatingPrompts(unittest.TestCase):
         self.assertIn("work in deterministic deepest-first DAG order", prompt)
         self.assertIn("broad opportunistic rewrites", prompt)
 
+    def test_worker_prompt_uses_updated_broad_node_count_guidance(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open", title="Main"),
+        })
+        state = SupervisorState(cycle=2, phase="theorem_stating")
+
+        prompt = build_theorem_stating_prompt(config, state, tablet, Policy())
+        self.assertIn("Aim for 15-50 nodes", prompt)
+
+    def test_worker_prompt_surfaces_previous_invalid_attempt_detail(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open", title="Main"),
+        })
+        state = SupervisorState(
+            cycle=2,
+            phase="theorem_stating",
+            validation_summary={
+                "last_outcome": "INVALID",
+                "last_invalid_detail": "foo: synthetic failure",
+                "attempt": 1,
+                "consecutive_invalids": 1,
+                "last_reset_to_checkpoint": "",
+            },
+        )
+
+        prompt = build_theorem_stating_prompt(config, state, tablet, Policy())
+        self.assertIn("--- PREVIOUS ATTEMPT ---", prompt)
+        self.assertIn("foo: synthetic failure", prompt)
+        self.assertIn("worktree has been preserved", prompt)
+
     def test_worker_prompt_with_target_requires_scope_to_stay_in_target_chain(self):
         repo = Path(tempfile.mkdtemp())
         _setup_repo(repo)
@@ -994,6 +1032,53 @@ class TestTheoremStatingPrompts(unittest.TestCase):
         self.assertIn("This target has passed NL proof soundness in the current cycle.", prompt)
         self.assertIn("the next cycle will move automatically to the next unresolved target", prompt)
         self.assertIn("reopened", prompt)
+
+    def test_theorem_reviewer_prompt_lists_valid_reset_checkpoints_on_invalid(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open", title="Main"),
+        })
+
+        prompt = build_theorem_stating_reviewer_prompt(
+            config,
+            SupervisorState(cycle=2, phase="theorem_stating"),
+            tablet,
+            Policy(),
+            validation_summary={
+                "outcome": "INVALID",
+                "detail": "foo: synthetic failure",
+                "consecutive_invalids": 5,
+            },
+            available_reset_checkpoints=[
+                {"ref": "initial", "label": "initial setup commit"},
+                {"ref": "cycle-4", "label": "cycle 4 | reviewer/final | theorem_stating | PROGRESS"},
+            ],
+        )
+        self.assertIn("AVAILABLE VALID RESET CHECKPOINTS", prompt)
+        self.assertIn("`initial`", prompt)
+        self.assertIn("`cycle-4`", prompt)
+        self.assertIn("good time to consider whether continuing from the current worktree is unproductive", prompt)
+
+    def test_correspondence_prompt_includes_preamble_interface_items(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open"),
+        })
+
+        prompt = build_correspondence_prompt(
+            config,
+            tablet,
+            node_names=["Preamble", "main_thm"],
+        )
+        self.assertIn("PREAMBLE INTERFACE ITEMS TO CHECK", prompt)
+        self.assertIn("Preamble[1]", prompt)
+        self.assertIn("use the exact preamble item id", prompt)
 
 
 class TestVerificationPrompt(unittest.TestCase):

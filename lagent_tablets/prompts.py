@@ -21,8 +21,10 @@ from lagent_tablets.state import (
     normalize_open_blockers,
     normalize_orphan_resolutions,
 )
+from lagent_tablets.project_paths import project_scratch_dir
 from lagent_tablets.tablet import (
     PREAMBLE_NAME,
+    extract_tex_statement_items,
     extract_tablet_imports,
     node_lean_path,
     node_tex_path,
@@ -554,6 +556,51 @@ def _theorem_target_worker_guidance(state: SupervisorState) -> str:
     )
 
 
+def _format_reset_checkpoint_lines(
+    checkpoints: Optional[List[Dict[str, Any]]],
+) -> List[str]:
+    lines: List[str] = []
+    for entry in checkpoints or []:
+        if not isinstance(entry, dict):
+            continue
+        ref = str(entry.get("ref", "")).strip()
+        label = str(entry.get("label", "")).strip() or ref
+        if not ref:
+            continue
+        lines.append(f"- `{ref}`: {label}")
+    return lines
+
+
+def _theorem_retry_invalid_text(state: SupervisorState) -> str:
+    summary = state.validation_summary if isinstance(state.validation_summary, dict) else {}
+    if str(summary.get("last_outcome", "")).strip().upper() != "INVALID":
+        return ""
+    attempt = int(summary.get("attempt", 0) or 0)
+    detail = str(summary.get("last_invalid_detail", "") or "").strip()
+    consecutive = int(summary.get("consecutive_invalids", 0) or 0)
+    reset_ref = str(summary.get("last_reset_to_checkpoint", "") or "").strip()
+
+    lines = ["--- PREVIOUS ATTEMPT ---"]
+    if attempt > 0:
+        lines.append(
+            f"The previous attempt on this in-flight cycle was INVALID. You are now on attempt {attempt + 1}."
+        )
+    else:
+        lines.append("The previous attempt on this in-flight cycle was INVALID.")
+    if detail:
+        lines.append(f"Blocker: {detail}")
+    if reset_ref:
+        lines.append(
+            f"The reviewer reset the worktree to valid checkpoint `{reset_ref}` and cleaned it before this attempt."
+        )
+    else:
+        lines.append("The invalid attempt's worktree has been preserved for you to continue from.")
+    if consecutive > 1:
+        lines.append(f"Consecutive INVALID attempts on this in-flight cycle: {consecutive}.")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _theorem_stating_open_blockers(state: SupervisorState) -> List[Dict[str, str]]:
     open_blockers = state.open_blockers
     if not open_blockers and state.last_review:
@@ -920,6 +967,9 @@ def build_theorem_stating_prompt(
     target_text = _theorem_soundness_target_text(state)
     if target_text:
         sections.append(target_text)
+    retry_invalid_text = _theorem_retry_invalid_text(state)
+    if retry_invalid_text:
+        sections.append(retry_invalid_text)
 
     # 4. Current tablet state (may be empty on first cycle)
     if tablet.nodes:
@@ -947,6 +997,7 @@ def build_theorem_stating_prompt(
     instructions = _load_template(template_name).format(
         skill_path=skill_path,
         repo_path=repo_path,
+        scratch_dir=project_scratch_dir(config.state_dir),
         target=target,
         authorized_region_note=_authorized_region_note(authorized_region),
         target_repair_scope_check_command=_theorem_target_repair_scope_check_command(
@@ -984,6 +1035,8 @@ def build_theorem_stating_reviewer_prompt(
     worker_output: str = "",
     nl_verification: Optional[List[Dict[str, Any]]] = None,
     orphan_candidates: Optional[List[str]] = None,
+    validation_summary: Optional[Dict[str, Any]] = None,
+    available_reset_checkpoints: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """Build the reviewer prompt for the theorem_stating phase."""
     sections = []
@@ -1041,6 +1094,36 @@ def build_theorem_stating_reviewer_prompt(
     # Worker output
     if worker_output:
         sections.append(f"--- WORKER OUTPUT (trimmed) ---\n{_trim(worker_output, 15000)}\n")
+
+    if validation_summary:
+        cycle_outcome = str(validation_summary.get("outcome", "") or "").strip()
+        cycle_detail = str(validation_summary.get("detail", "") or "").strip()
+        consecutive_invalids = int(validation_summary.get("consecutive_invalids", 0) or 0)
+        sections.append(f"--- CYCLE OUTCOME: {cycle_outcome or '?'} ---")
+        if cycle_detail:
+            sections.append(f"Detail: {cycle_detail}")
+        if consecutive_invalids > 0:
+            sections.append(
+                f"NOTE: The worker has hit {consecutive_invalids} consecutive INVALID attempts on this in-flight cycle."
+            )
+            if consecutive_invalids % 5 == 0:
+                sections.append(
+                    "This is a good time to consider whether continuing from the current worktree is unproductive."
+                )
+                if available_reset_checkpoints:
+                    sections.append(
+                        "If so, you may keep `decision: \"CONTINUE\"` and set `reset_to_checkpoint` to one of the valid checkpoints listed below."
+                    )
+        sections.append("")
+
+    reset_lines = _format_reset_checkpoint_lines(available_reset_checkpoints)
+    if reset_lines:
+        sections.append("--- AVAILABLE VALID RESET CHECKPOINTS ---")
+        sections.append(
+            "If you think the worker has gone down an unproductive path, you may request a hard reset to one of these committed valid checkpoints."
+        )
+        sections.extend(reset_lines)
+        sections.append("")
 
     # NL verification results
     if nl_verification:
@@ -1383,6 +1466,24 @@ def build_correspondence_prompt(
             imports_str = ", ".join(imports) if imports else "none"
             sections.append(f"- **{name}** (kind: {node.kind}, difficulty: {node.difficulty}) — imports: {imports_str}")
         sections.append("")
+
+        if PREAMBLE_NAME in node_names:
+            preamble_tex = _read_file(config.repo_path / "Tablet" / "Preamble.tex")
+            preamble_items = extract_tex_statement_items(preamble_tex, is_preamble=True)
+            sections.append("=== PREAMBLE INTERFACE ITEMS TO CHECK ===\n")
+            sections.append(
+                "Treat each preamble item as a first-class correspondence target. Read both `Tablet/Preamble.lean` and `Tablet/Preamble.tex`.\n"
+                "When reporting a preamble problem, prefer the exact item id shown below in the issue's `node` field.\n"
+            )
+            if preamble_items:
+                for item in preamble_items:
+                    title = f" [{item['title']}]" if item.get("title") else ""
+                    sections.append(f"- **{item['id']}** ({item['env']}){title}")
+                    if item.get("body"):
+                        sections.append(_trim(item["body"], 800))
+                sections.append("")
+            else:
+                sections.append("- No structured preamble statement items were found in `Tablet/Preamble.tex`.\n")
 
         changed_contexts: List[tuple[str, Dict[str, str]]] = []
         for name in sorted(node_names):

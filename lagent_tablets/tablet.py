@@ -33,9 +33,15 @@ LEAN_DECL_RE = re.compile(
 NODEREF_RE = re.compile(r"\\noderef\{([^}]+)\}")
 
 # .tex environments
-TEX_STATEMENT_ENVS = {"theorem", "lemma", "definition", "proposition"}
+TEX_STATEMENT_ENVS = {"theorem", "lemma", "definition", "corollary", "proposition"}
+TEX_MAIN_NODE_ENVS = {"theorem", "lemma", "definition", "corollary"}
+TEX_PREAMBLE_ENVS = {"definition", "proposition"}
 TEX_STMT_BEGIN_RE = re.compile(r"\\begin\{(" + "|".join(TEX_STATEMENT_ENVS) + r")\}")
 TEX_STMT_END_RE = re.compile(r"\\end\{(" + "|".join(TEX_STATEMENT_ENVS) + r")\}")
+TEX_STMT_BLOCK_RE = re.compile(
+    r"\\begin\{(" + "|".join(TEX_STATEMENT_ENVS) + r")\}(?:\[(.*?)\])?(.*?)\\end\{\1\}",
+    re.DOTALL,
+)
 TEX_PROOF_BEGIN_RE = re.compile(r"\\begin\{proof\}")
 TEX_PROOF_END_RE = re.compile(r"\\end\{proof\}")
 
@@ -400,7 +406,7 @@ def validate_tex_format(tex_content: str, *, is_preamble: bool = False) -> List[
         # Preamble: zero or more proposition/definition environments, no proof
         if TEX_PROOF_BEGIN_RE.search(tex_content):
             errors.append("Preamble .tex must not contain \\begin{proof}")
-        for env in TEX_STATEMENT_ENVS - {"proposition", "definition"}:
+        for env in TEX_STATEMENT_ENVS - TEX_PREAMBLE_ENVS:
             if re.search(r"\\begin\{" + env + r"\}", tex_content):
                 errors.append(
                     "Preamble .tex should only use proposition/definition environments, "
@@ -413,9 +419,16 @@ def validate_tex_format(tex_content: str, *, is_preamble: bool = False) -> List[
     proof_begins = TEX_PROOF_BEGIN_RE.findall(tex_content)
 
     if len(stmt_begins) == 0:
-        errors.append("Missing statement environment (theorem/lemma/definition/proposition)")
+        errors.append("Missing statement environment (theorem/lemma/definition/corollary)")
     elif len(stmt_begins) > 1:
         errors.append(f"Multiple statement environments found ({len(stmt_begins)}), expected exactly 1")
+    else:
+        stmt_env = stmt_begins[0]
+        if stmt_env not in TEX_MAIN_NODE_ENVS:
+            errors.append(
+                "Ordinary tablet nodes must use theorem/lemma/definition/corollary environments, "
+                f"found {stmt_env}"
+            )
 
     # Proof is optional for closed nodes -- caller decides whether to require it
     # We just validate format if present
@@ -423,6 +436,32 @@ def validate_tex_format(tex_content: str, *, is_preamble: bool = False) -> List[
         errors.append(f"Multiple proof environments found ({len(proof_begins)}), expected at most 1")
 
     return errors
+
+
+def extract_tex_statement_items(
+    tex_content: str,
+    *,
+    is_preamble: bool = False,
+) -> List[Dict[str, str]]:
+    """Extract top-level statement environments as lightweight structured items."""
+    allowed = TEX_PREAMBLE_ENVS if is_preamble else TEX_MAIN_NODE_ENVS
+    items: List[Dict[str, str]] = []
+    for index, match in enumerate(TEX_STMT_BLOCK_RE.finditer(tex_content), start=1):
+        env = str(match.group(1) or "").strip()
+        if env not in allowed:
+            continue
+        title = str(match.group(2) or "").strip()
+        body = str(match.group(3) or "").strip()
+        item_id = f"Preamble[{index}]" if is_preamble else f"Item[{index}]"
+        items.append(
+            {
+                "id": item_id,
+                "env": env,
+                "title": title,
+                "body": body,
+            }
+        )
+    return items
 
 
 def extract_noderefs(tex_content: str) -> List[str]:
@@ -775,6 +814,7 @@ def _safe_write(path: Path, content: str) -> None:
                 try:
                     os.write(fd, content.encode("utf-8"))
                     os.close(fd)
+                    os.chmod(tmp, 0o664)
                     os.replace(tmp, str(path))
                 except Exception:
                     os.close(fd)

@@ -1,30 +1,57 @@
 #!/bin/bash
 # Resume the supervisor from its current state.
-# Usage: ./scripts/resume.sh <config> [extra_args...]
-#
-# Example: ./scripts/resume.sh configs/extremal_vectors_run.json --stop-at-phase-boundary
-#          ./scripts/resume.sh configs/extremal_vectors_run.json --resume-from verification
+# Usage: ./scripts/resume.sh <repo_path_or_config> [extra_args...]
 
 set -euo pipefail
 
-CONFIG="${1:?Usage: resume.sh <config> [extra_args...]}"
+TARGET="${1:?Usage: resume.sh <repo_path_or_config> [extra_args...]}"
 shift
-EXTRA_ARGS="$*"
+EXTRA_ARGS=("$@")
 
-# Check no supervisor already running
-if tmux has-session -t supervisor 2>/dev/null; then
-    echo "ERROR: supervisor tmux session already exists. Stop it first with ./scripts/stop.sh"
+readarray -t META < <(python3 - "$TARGET" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+target = Path(sys.argv[1]).resolve()
+if target.is_file():
+    config_path = target
+else:
+    config_path = target / "lagent.config.json"
+if not config_path.exists():
+    raise SystemExit(f"Missing config: {config_path}")
+raw = json.loads(config_path.read_text(encoding="utf-8"))
+repo = Path(raw.get("repo_path", config_path.parent)).resolve()
+session = str(((raw.get("tmux") or {}).get("session_name")) or re.sub(r"[^A-Za-z0-9_]+", "_", repo.name).strip("_") or "lagent_tablets")
+print(repo)
+print(config_path)
+print(session)
+PY
+)
+
+REPO="${META[0]}"
+CONFIG="${META[1]}"
+SESSION="${META[2]}"
+LOG_DIR="$REPO/.agent-supervisor/logs"
+mkdir -p "$LOG_DIR"
+LOG="$LOG_DIR/supervisor_$(date +%Y%m%d_%H%M%S).log"
+
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+    echo "ERROR: tmux session $SESSION already exists. Stop it first with ./scripts/stop.sh $REPO"
     exit 1
 fi
 
-echo "Resuming with config: $CONFIG"
-echo "  extra args: $EXTRA_ARGS"
+echo "Resuming project:"
+echo "  repo:    $REPO"
+echo "  config:  $CONFIG"
+echo "  session: $SESSION"
+if [ "${#EXTRA_ARGS[@]}" -gt 0 ]; then
+    echo "  extra args: ${EXTRA_ARGS[*]}"
+fi
 
-tmux new-session -d -s supervisor "python3 -u -m lagent_tablets.cli --config $CONFIG $EXTRA_ARGS 2>&1 | tee /tmp/lagent_run_$(date +%Y%m%d_%H%M%S).log"
+tmux new-session -d -s "$SESSION" "cd /home/leanagent/src/lagent-tablets && python3 -u -m lagent_tablets.cli --config '$CONFIG' ${EXTRA_ARGS[*]} 2>&1 | tee '$LOG'"
 
 sleep 3
-LOG=$(ls -t /tmp/lagent_run_*.log 2>/dev/null | head -1)
-if [ -n "$LOG" ]; then
-    echo "Log: $LOG"
-    tail -5 "$LOG"
-fi
+echo "Log: $LOG"
+tail -5 "$LOG" 2>/dev/null || true

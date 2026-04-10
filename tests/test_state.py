@@ -52,6 +52,13 @@ class TestAtomicJson(unittest.TestCase):
         actual_mode = path.stat().st_mode & 0o777
         self.assertEqual(actual_mode, 0o640)
 
+    def test_save_defaults_to_shared_mode(self):
+        tmpdir = Path(tempfile.mkdtemp())
+        path = tmpdir / "test.json"
+        save_json(path, {"ok": True})
+        actual_mode = path.stat().st_mode & 0o777
+        self.assertEqual(actual_mode, 0o664)
+
     def test_append_jsonl(self):
         tmpdir = Path(tempfile.mkdtemp())
         path = tmpdir / "log.jsonl"

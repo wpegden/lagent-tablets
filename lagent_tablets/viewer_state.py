@@ -15,13 +15,21 @@ import os
 import hashlib
 import json
 import re
-import shutil
 import subprocess
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Protocol, Set
 
 from lagent_tablets.nl_cache import correspondence_fingerprint, prime_correspondence_fingerprints, soundness_fingerprint
+from lagent_tablets.chat_history import read_historical_chats, read_live_chats
+from lagent_tablets.project_paths import (
+    project_viewer_chats_at_dir,
+    project_viewer_chats_path,
+    project_viewer_cycles_path,
+    project_viewer_dir,
+    project_viewer_state_at_dir,
+    project_viewer_state_path,
+)
 from lagent_tablets.state import (
     SupervisorState,
     TabletNode,
@@ -87,15 +95,6 @@ class GitSnapshot:
 
 def viewer_state_path(state_dir: Path) -> Path:
     return state_dir / "viewer_state.json"
-
-
-def _static_out_dir() -> Path:
-    return Path(os.environ.get("LAGENT_VIEWER_STATIC_OUT", "/home/leanagent/lagent-tablets-web"))
-
-
-def viewer_project_slug(repo_path: Path) -> str:
-    slug = re.sub(r"_tablets?$", "", repo_path.name)
-    return slug or repo_path.name
 
 
 def _write_json_world_readable(path: Path, payload: Any) -> None:
@@ -576,7 +575,7 @@ def write_live_viewer_state(
         fast=fast,
     )
     save_json(path, payload)
-    _mirror_static_project_payloads(repo_path, payload)
+    _write_project_viewer_cache(repo_path, path.parent, payload)
     return payload
 
 
@@ -607,7 +606,7 @@ def write_cycle_viewer_state(
             if name in payload["nodes"]:
                 payload["nodes"][name]["verification"] = status
     save_json(path, payload)
-    _mirror_static_project_payloads(repo_path, payload)
+    _write_project_viewer_cache(repo_path, path.parent, payload)
     return payload
 
 
@@ -673,55 +672,69 @@ def _project_cycles(repo_path: Path) -> List[Dict[str, Any]]:
     return cycles
 
 
-def _ensure_project_static_shell(static_out: Path, project_slug: str) -> None:
-    root_index = static_out / "index.html"
-    if not root_index.exists():
-        return
-    project_root = static_out / project_slug
-    project_root.mkdir(parents=True, exist_ok=True)
-    target = project_root / "index.html"
-    shutil.copyfile(root_index, target)
-    os.chmod(target, 0o644)
-
-
-def _mirror_static_project_payloads(repo_path: Path, live_payload: Dict[str, Any]) -> None:
-    static_out = _static_out_dir()
-    project_slug = viewer_project_slug(repo_path)
-    api_roots = [
-        static_out / "api",
-        static_out / project_slug / "api",
-    ]
-    _ensure_project_static_shell(static_out, project_slug)
-
+def _write_project_viewer_cache(
+    repo_path: Path,
+    state_dir: Path,
+    live_payload: Dict[str, Any],
+) -> None:
+    viewer_dir = project_viewer_dir(state_dir)
+    viewer_dir.mkdir(parents=True, exist_ok=True)
+    _write_json_world_readable(project_viewer_state_path(state_dir), live_payload)
     cycles = _project_cycles(repo_path)
-    for api_root in api_roots:
-        _write_json_world_readable(api_root / "viewer-state.json", live_payload)
-        _write_json_world_readable(api_root / "cycles.json", cycles)
-        state_at_dir = api_root / "state-at"
-        state_at_dir.mkdir(parents=True, exist_ok=True)
-        valid = set()
-        for entry in cycles:
-            cycle = entry.get("cycle")
-            if not isinstance(cycle, int):
-                continue
-            valid.add(str(cycle))
-            payload = load_tagged_viewer_state(repo_path, f"cycle-{cycle}")
-            if payload is None:
-                try:
-                    payload = build_legacy_backfill_viewer_state(repo_path, cycle)
-                except Exception:
-                    payload = None
-            if payload is not None:
-                _write_json_world_readable(state_at_dir / f"{cycle}.json", payload)
-        for existing in state_at_dir.iterdir():
-            if not existing.is_file() or existing.suffix != ".json":
-                continue
-            if existing.stem in valid:
-                continue
+    _write_json_world_readable(project_viewer_cycles_path(state_dir), cycles)
+    live_cycle = live_payload.get("meta", {}).get("in_flight_cycle") or live_payload.get("state", {}).get("cycle") or 0
+    try:
+        live_cycle = int(live_cycle)
+    except Exception:
+        live_cycle = 0
+    _write_json_world_readable(project_viewer_chats_path(state_dir), read_live_chats(repo_path, live_cycle))
+    state_at_dir = project_viewer_state_at_dir(state_dir)
+    state_at_dir.mkdir(parents=True, exist_ok=True)
+    chats_at_dir = project_viewer_chats_at_dir(state_dir)
+    chats_at_dir.mkdir(parents=True, exist_ok=True)
+    valid = set()
+    for entry in cycles:
+        cycle = entry.get("cycle")
+        if not isinstance(cycle, int):
+            continue
+        valid.add(str(cycle))
+        payload = load_tagged_viewer_state(repo_path, f"cycle-{cycle}")
+        if payload is None:
             try:
-                existing.unlink()
-            except OSError:
-                pass
+                payload = build_legacy_backfill_viewer_state(repo_path, cycle)
+            except Exception:
+                payload = None
+        if payload is not None:
+            _write_json_world_readable(state_at_dir / f"{cycle}.json", payload)
+        _write_json_world_readable(chats_at_dir / f"{cycle}.json", read_historical_chats(repo_path, cycle))
+    for existing in state_at_dir.iterdir():
+        if not existing.is_file() or existing.suffix != ".json":
+            continue
+        if existing.stem in valid:
+            continue
+        try:
+            existing.unlink()
+        except OSError:
+            pass
+    for existing in chats_at_dir.iterdir():
+        if not existing.is_file() or existing.suffix != ".json":
+            continue
+        if existing.stem in valid:
+            continue
+        try:
+            existing.unlink()
+        except OSError:
+            pass
+
+
+def refresh_project_viewer_cache(repo_path: Path, state_dir: Path) -> None:
+    """Refresh project-local viewer API files from the current repo state."""
+    payload = load_json(viewer_state_path(state_dir), default=None)
+    if not isinstance(payload, dict):
+        payload = load_current_viewer_state(state_dir)
+    if not isinstance(payload, dict):
+        return
+    _write_project_viewer_cache(repo_path, state_dir, payload)
 
 
 def build_legacy_backfill_viewer_state(repo_path: Path, cycle: int) -> Dict[str, Any]:
@@ -776,5 +789,8 @@ def write_legacy_backfill_viewer_state(
 
 
 def load_current_viewer_state(state_dir: Path) -> Optional[Dict[str, Any]]:
+    data = load_json(project_viewer_state_path(state_dir), default=None)
+    if isinstance(data, dict):
+        return data
     data = load_json(viewer_state_path(state_dir), default=None)
     return data if isinstance(data, dict) else None

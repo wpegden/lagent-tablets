@@ -16,6 +16,10 @@ WHAT YOU MUST NOT EDIT:
 - Any generated support file
 - Any node set, dependency edge, or theorem/definition statement
 
+SCRATCH WORK:
+- If you need a temporary Lean experiment or note file, use `{scratch_dir}` rather than `/tmp`
+- `example.lean` in that directory is a trivial buildable starting point
+
 WHEN TO REQUEST RESTRUCTURE:
 - If you think this proof should be preceded by richer dependencies or meaningful intermediate nodes
 - If you think any statement, import list, or dependency edge needs to change
