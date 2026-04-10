@@ -17,6 +17,7 @@ from lagent_tablets.cycle import (
     _backfill_legacy_correspondence_hashes,
     _changed_tablet_nodes_since_snapshot,
     _correspondence_gate_open,
+    CycleOutcome,
     _normalize_theorem_stating_replay_state,
     _enforce_theorem_stating_orphan_candidates,
     _enforce_theorem_stating_open_rejections,
@@ -26,16 +27,20 @@ from lagent_tablets.cycle import (
     _reconcile_theorem_stating_open_rejections,
     _run_nl_verification,
     _run_per_node_soundness,
+    _run_single_node_soundness,
     _select_theorem_soundness_target,
     _snapshot_tablet_dir,
     _snapshot_tablet_node_hashes,
     _suspend_theorem_soundness_target,
     _theorem_stating_preflight_error,
     _theorem_stating_correspondence_frontier,
+    _theorem_stating_node_kind,
     _theorem_target_scope,
     _validate_easy_proof_repair_changes,
     _validate_theorem_target_repair_changes,
     _validate_theorem_target_edit_scope,
+    run_cycle,
+    run_theorem_stating_cycle,
 )
 from lagent_tablets.nl_cache import correspondence_fingerprint, correspondence_text_fingerprint, soundness_fingerprint
 from lagent_tablets.state import SupervisorState, TabletNode, TabletState
@@ -92,6 +97,13 @@ class TestTheoremStatingOpenRejections(unittest.TestCase):
         self.assertEqual(state.theorem_target_edit_mode, "repair")
         self.assertTrue(state.theorem_correspondence_blocked)
         self.assertTrue(any("correspondence blockers" in note for note in notes))
+
+    def test_theorem_stating_node_kind_defaults_to_intermediate(self):
+        self.assertEqual(_theorem_stating_node_kind("main_theorem", {}), "paper_intermediate")
+        self.assertEqual(
+            _theorem_stating_node_kind("main_theorem", {"main_theorem": "paper_main_result"}),
+            "paper_main_result",
+        )
 
     def test_normalize_theorem_stating_replay_state_strips_stale_proof_phase_carryover(self):
         state = SupervisorState(
@@ -1356,6 +1368,69 @@ class TestTheoremTargetScope(unittest.TestCase):
             self.assertIn("_supervisor_meta", saved)
             self.assertIn("soundness_fingerprint", saved["_supervisor_meta"])
 
+    def test_single_node_soundness_injects_previous_agent_issues(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            state_dir = repo / ".agent-supervisor"
+            (state_dir / "staging").mkdir(parents=True)
+            (repo / "Tablet").mkdir()
+            (repo / "Tablet" / "foo.lean").write_text(
+                "theorem foo : True := by\n  sorry\n",
+                encoding="utf-8",
+            )
+            (repo / "Tablet" / "foo.tex").write_text(
+                "\\begin{theorem}[foo]\nTrue.\n\\end{theorem}\n\\begin{proof}\nProof.\n\\end{proof}\n",
+                encoding="utf-8",
+            )
+            (repo / "nl_proof_foo_0.json").write_text(
+                json.dumps({
+                    "node": "foo",
+                    "soundness": {"decision": "UNSOUND", "explanation": "The proof skips the key linear-independence step."},
+                    "overall": "REJECT",
+                    "summary": "Still missing the linear-independence argument.",
+                }),
+                encoding="utf-8",
+            )
+
+            tablet = TabletState(nodes={
+                "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+                "foo": TabletNode(name="foo", kind="paper_intermediate", status="open"),
+            })
+            config = SimpleNamespace(
+                repo_path=repo,
+                state_dir=state_dir,
+                tmux=SimpleNamespace(session_name="test", burst_user="worker"),
+            )
+            agent = SimpleNamespace(provider="codex", model="gpt-5.4", label="A", selected_index=0, extra_args=[], fallback_models=[])
+            seen: dict[str, Any] = {}
+
+            def fake_build_prompt(*args, **kwargs):
+                seen["previous_issues"] = kwargs.get("previous_issues")
+                return "prompt"
+
+            with patch("lagent_tablets.prompts.build_node_soundness_prompt", side_effect=fake_build_prompt):
+                with patch("lagent_tablets.cycle.run_reviewer_burst", return_value=SimpleNamespace(ok=False, error="", captured_output="", usage=None)):
+                    result = _run_single_node_soundness(
+                        config,
+                        tablet,
+                        "foo",
+                        agent,
+                        paper_tex="",
+                        human_input="",
+                        log_dir=repo,
+                        agent_index=0,
+                        node_index=0,
+                    )
+
+            self.assertEqual(
+                seen["previous_issues"],
+                [
+                    "The proof skips the key linear-independence step.",
+                    "Still missing the linear-independence argument.",
+                ],
+            )
+            self.assertEqual(result["overall"], "ERROR")
+
     def test_nl_verification_records_soundness_cache_per_approved_node(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
@@ -1707,6 +1782,74 @@ class TestTheoremTargetScope(unittest.TestCase):
 
             self.assertEqual(seen["labels"], ["Gemini", "Codex"])
 
+    def test_run_nl_verification_can_skip_soundness_for_correspondence_only_nodes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            state_dir = repo / ".agent-supervisor"
+            state_dir.mkdir()
+            (repo / "Tablet").mkdir()
+            (repo / "Tablet" / "helper.lean").write_text(
+                "lemma helper : True := by\n  trivial\n",
+                encoding="utf-8",
+            )
+            (repo / "Tablet" / "helper.tex").write_text(
+                "\\begin{lemma}[helper]\nTrue.\n\\end{lemma}\n\\begin{proof}\nProof.\n\\end{proof}\n",
+                encoding="utf-8",
+            )
+
+            tablet = TabletState(nodes={
+                "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+                "helper": TabletNode(name="helper", kind="helper_lemma", status="closed"),
+            })
+            config = SimpleNamespace(
+                repo_path=repo,
+                state_dir=state_dir,
+                workflow=SimpleNamespace(paper_tex_path=None),
+                verification=SimpleNamespace(
+                    provider="claude",
+                    model="claude-opus-4-6",
+                    extra_args=[],
+                    correspondence_agents=[
+                        SimpleNamespace(provider="claude", model="a", label="A"),
+                        SimpleNamespace(provider="gemini", model="b", label="B"),
+                    ],
+                    soundness_agents=[
+                        SimpleNamespace(provider="claude", model="a", label="A"),
+                        SimpleNamespace(provider="gemini", model="b", label="B"),
+                    ],
+                ),
+                tmux=SimpleNamespace(session_name="test", burst_user="worker"),
+            )
+            corr_result = {
+                "check": "correspondence",
+                "overall": "APPROVE",
+                "node_names": ["helper"],
+                "agent_results": [
+                    {
+                        "correspondence": {"decision": "PASS", "issues": []},
+                        "paper_faithfulness": {"decision": "PASS", "issues": []},
+                    }
+                ],
+            }
+
+            with patch("lagent_tablets.cycle._run_multi_correspondence", return_value=corr_result):
+                with patch("lagent_tablets.cycle._run_per_node_soundness") as mock_soundness:
+                    results = _run_nl_verification(
+                        config,
+                        Policy(),
+                        tablet,
+                        ["helper"],
+                        cycle=9,
+                        log_dir=repo,
+                        nl_cache=None,
+                        human_input="",
+                        soundness_node_names=[],
+                    )
+
+            mock_soundness.assert_not_called()
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0]["check"], "correspondence")
+
     def test_per_node_soundness_two_agent_split_defaults_to_reject(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
@@ -1772,6 +1915,239 @@ class TestTheoremTargetScope(unittest.TestCase):
             self.assertEqual(verdict["overall"], "REJECT")
             self.assertTrue(verdict["panel_split"])
             self.assertEqual(verdict["disagree_bias"], "reject")
+
+    def test_theorem_stating_normal_path_runs_scoped_deterministic_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            state_dir = repo / ".agent-supervisor"
+            state_dir.mkdir()
+            tablet_dir = repo / "Tablet"
+            tablet_dir.mkdir()
+            (tablet_dir / "Preamble.lean").write_text("import Mathlib.Data.Nat.Basic\n", encoding="utf-8")
+            (tablet_dir / "foo.lean").write_text(
+                "import Tablet.Preamble\n\n-- [TABLET NODE: foo]\n\nlemma foo : True := by\n  sorry\n",
+                encoding="utf-8",
+            )
+            (tablet_dir / "foo.tex").write_text(
+                "\\begin{lemma}[Foo]\nTrue.\n\\end{lemma}\n\\begin{proof}\nProof.\n\\end{proof}\n",
+                encoding="utf-8",
+            )
+
+            state = SupervisorState(cycle=8, phase="theorem_stating")
+            tablet = TabletState(nodes={
+                "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+                "foo": TabletNode(name="foo", kind="paper_intermediate", status="open"),
+            })
+            config = SimpleNamespace(
+                repo_path=repo,
+                state_dir=state_dir,
+                worker=SimpleNamespace(provider="codex", model="gpt-5.4"),
+                reviewer=SimpleNamespace(provider="codex", model="gpt-5.4"),
+                verification=SimpleNamespace(
+                    soundness_agents=[],
+                    correspondence_agents=[],
+                ),
+                tmux=SimpleNamespace(session_name="test", burst_user="worker"),
+                startup_timeout_seconds=60.0,
+                workflow=SimpleNamespace(
+                    allowed_import_prefixes=["Mathlib"],
+                    forbidden_keyword_allowlist=[],
+                    approved_axioms_path=None,
+                    paper_tex_path=None,
+                ),
+                goal_file=repo / "GOAL.txt",
+            )
+            config.goal_file.write_text("", encoding="utf-8")
+
+            def fake_worker_burst(*args, **kwargs):
+                (tablet_dir / "foo.tex").write_text(
+                    "\\begin{proof}\nBroken.\n\\end{proof}\n",
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(ok=True, transcript_path=None, error="", captured_output="", usage=None)
+
+            with patch("lagent_tablets.health.fix_lake_permissions"):
+                with patch("lagent_tablets.cycle._setup_theorem_stating_permissions"):
+                    with patch("lagent_tablets.prompts.build_theorem_stating_prompt", return_value="prompt"):
+                        with patch("lagent_tablets.cycle.run_worker_burst", side_effect=fake_worker_burst):
+                            with patch(
+                                "lagent_tablets.cycle._accept_validated_artifact",
+                                return_value=({"summary": "changed foo tex", "status": "DONE", "new_nodes": [], "difficulty_hints": {}}, None),
+                            ):
+                                with patch("lagent_tablets.cycle.run_check_tablet", return_value={"errors": []}):
+                                    with patch(
+                                        "lagent_tablets.cycle.run_check_tablet_scoped",
+                                        return_value={
+                                            "errors": [
+                                                "foo: .tex format errors: ['Missing statement environment (theorem/lemma/definition/proposition)']"
+                                            ],
+                                            "build_output": "",
+                                        },
+                                    ) as mock_scoped:
+                                        outcome = run_theorem_stating_cycle(config, state, tablet, Policy())
+
+            self.assertEqual(outcome.outcome, "INVALID")
+            self.assertIn("foo: .tex format errors", outcome.detail)
+            self.assertEqual(mock_scoped.call_count, 1)
+            self.assertEqual(mock_scoped.call_args.kwargs["allowed_nodes"], ["foo"])
+            self.assertEqual(mock_scoped.call_args.kwargs["baseline_errors"], [])
+
+    def test_proof_formalization_hard_mode_runs_scoped_deterministic_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            state_dir = repo / ".agent-supervisor"
+            state_dir.mkdir()
+            tablet_dir = repo / "Tablet"
+            tablet_dir.mkdir()
+            (tablet_dir / "Preamble.lean").write_text("import Mathlib.Data.Nat.Basic\n", encoding="utf-8")
+            (tablet_dir / "foo.lean").write_text(
+                "import Tablet.Preamble\n\n-- [TABLET NODE: foo]\n\nlemma foo : True := by\n  sorry\n",
+                encoding="utf-8",
+            )
+            (tablet_dir / "foo.tex").write_text(
+                "\\begin{lemma}[Foo]\nTrue.\n\\end{lemma}\n\\begin{proof}\nProof.\n\\end{proof}\n",
+                encoding="utf-8",
+            )
+
+            state = SupervisorState(cycle=3, phase="proof_formalization", active_node="foo")
+            tablet = TabletState(
+                active_node="foo",
+                nodes={
+                    "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+                    "foo": TabletNode(name="foo", kind="helper_lemma", status="open", difficulty="hard"),
+                },
+            )
+            config = SimpleNamespace(
+                repo_path=repo,
+                state_dir=state_dir,
+                worker=SimpleNamespace(provider="codex", model="gpt-5.4"),
+                easy_worker=None,
+                hard_worker=None,
+                reviewer=SimpleNamespace(provider="codex", model="gpt-5.4"),
+                tmux=SimpleNamespace(session_name="test", burst_user="worker"),
+                startup_timeout_seconds=60.0,
+                workflow=SimpleNamespace(
+                    allowed_import_prefixes=["Mathlib"],
+                    forbidden_keyword_allowlist=[],
+                    approved_axioms_path=None,
+                ),
+            )
+
+            def fake_worker_burst(*args, **kwargs):
+                (tablet_dir / "foo.tex").write_text(
+                    "\\begin{proof}\nBroken.\n\\end{proof}\n",
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(ok=True, transcript_path=None, error="", captured_output="", usage=None)
+
+            with patch("lagent_tablets.health.fix_lake_permissions"):
+                with patch("lagent_tablets.cycle._ensure_lake_build"):
+                    with patch("lagent_tablets.cycle.setup_permissions"):
+                        with patch("lagent_tablets.cycle.build_worker_prompt", return_value="prompt"):
+                            with patch("lagent_tablets.cycle.run_worker_burst", side_effect=fake_worker_burst):
+                                with patch(
+                                    "lagent_tablets.cycle._accept_validated_artifact",
+                                    return_value=({"summary": "changed foo tex", "status": "DONE", "new_nodes": [], "difficulty_hints": {}}, None),
+                                ):
+                                    with patch("lagent_tablets.cycle.run_check_tablet", return_value={"errors": []}):
+                                        with patch(
+                                            "lagent_tablets.cycle.run_check_tablet_scoped",
+                                            return_value={
+                                                "errors": [
+                                                    "foo: .tex format errors: ['Missing statement environment (theorem/lemma/definition/proposition)']"
+                                                ],
+                                                "build_output": "",
+                                            },
+                                        ) as mock_scoped:
+                                            with patch("lagent_tablets.git_ops.commit_cycle"):
+                                                outcome = run_cycle(config, state, tablet, Policy())
+
+            self.assertEqual(outcome.outcome, "INVALID")
+            self.assertIn("foo: .tex format errors", outcome.detail)
+            self.assertEqual(mock_scoped.call_count, 1)
+            self.assertEqual(mock_scoped.call_args.kwargs["allowed_nodes"], ["foo"])
+            self.assertEqual(mock_scoped.call_args.kwargs["baseline_errors"], [])
+
+    def test_proof_formalization_newly_closed_helper_still_gets_correspondence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            state_dir = repo / ".agent-supervisor"
+            state_dir.mkdir()
+            tablet_dir = repo / "Tablet"
+            tablet_dir.mkdir()
+            (tablet_dir / "Preamble.lean").write_text("import Mathlib.Data.Nat.Basic\n", encoding="utf-8")
+            (tablet_dir / "foo.lean").write_text(
+                "import Tablet.Preamble\n\n-- [TABLET NODE: foo]\n\nlemma foo : True := by\n  sorry\n",
+                encoding="utf-8",
+            )
+            (tablet_dir / "foo.tex").write_text(
+                "\\begin{lemma}[Foo]\nTrue.\n\\end{lemma}\n\\begin{proof}\nProof.\n\\end{proof}\n",
+                encoding="utf-8",
+            )
+
+            state = SupervisorState(cycle=3, phase="proof_formalization", active_node="foo")
+            tablet = TabletState(
+                active_node="foo",
+                nodes={
+                    "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+                    "foo": TabletNode(name="foo", kind="helper_lemma", status="open", difficulty="hard"),
+                },
+            )
+            config = SimpleNamespace(
+                repo_path=repo,
+                state_dir=state_dir,
+                worker=SimpleNamespace(provider="codex", model="gpt-5.4"),
+                easy_worker=None,
+                hard_worker=None,
+                reviewer=SimpleNamespace(provider="codex", model="gpt-5.4"),
+                tmux=SimpleNamespace(session_name="test", burst_user="worker"),
+                startup_timeout_seconds=60.0,
+                workflow=SimpleNamespace(
+                    allowed_import_prefixes=["Mathlib"],
+                    forbidden_keyword_allowlist=[],
+                    approved_axioms_path=None,
+                ),
+            )
+
+            def fake_worker_burst(*args, **kwargs):
+                (tablet_dir / "helper.lean").write_text(
+                    "import Tablet.Preamble\n\n-- [TABLET NODE: helper]\n\nlemma helper : True := by\n  trivial\n",
+                    encoding="utf-8",
+                )
+                (tablet_dir / "helper.tex").write_text(
+                    "\\begin{lemma}[Helper]\nTrue.\n\\end{lemma}\n\\begin{proof}\nProof.\n\\end{proof}\n",
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(ok=True, transcript_path=None, error="", captured_output="", usage=None)
+
+            worker_handoff = {"summary": "created helper", "status": "DONE", "new_nodes": [], "difficulty_hints": {}}
+
+            with patch("lagent_tablets.health.fix_lake_permissions"):
+                with patch("lagent_tablets.cycle._ensure_lake_build"):
+                    with patch("lagent_tablets.cycle.setup_permissions"):
+                        with patch("lagent_tablets.cycle.build_worker_prompt", return_value="prompt"):
+                            with patch("lagent_tablets.cycle.run_worker_burst", side_effect=fake_worker_burst):
+                                with patch("lagent_tablets.cycle._accept_validated_artifact", return_value=(worker_handoff, None)):
+                                    with patch("lagent_tablets.cycle.run_check_tablet", return_value={"errors": []}):
+                                        with patch("lagent_tablets.cycle.run_check_tablet_scoped", return_value={"errors": [], "build_output": ""}):
+                                            with patch(
+                                                "lagent_tablets.cycle.validate_worker_cycle_v2",
+                                                return_value=CycleOutcome(
+                                                    outcome="PROGRESS",
+                                                    detail="closed: ['helper']; created: ['helper']",
+                                                    nodes_closed=["helper"],
+                                                    nodes_created=["helper"],
+                                                ),
+                                            ):
+                                                with patch("lagent_tablets.cycle._run_nl_verification", return_value=[]) as mock_verify:
+                                                    with patch("lagent_tablets.cycle.build_reviewer_prompt", return_value="reviewer"):
+                                                        with patch("lagent_tablets.cycle.run_reviewer_burst", return_value=SimpleNamespace(ok=False, error="", captured_output="", usage=None)):
+                                                            with patch("lagent_tablets.git_ops.commit_cycle"):
+                                                                run_cycle(config, state, tablet, Policy())
+
+            self.assertEqual(mock_verify.call_count, 1)
+            self.assertEqual(mock_verify.call_args.args[3], ["helper"])
+            self.assertEqual(mock_verify.call_args.kwargs["soundness_node_names"], [])
 
 
 if __name__ == "__main__":

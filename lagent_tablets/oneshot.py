@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from lagent_tablets.config import load_config, ConfigError, Policy, PolicyManager
+from lagent_tablets.config import load_config, ConfigError, Policy, PolicyManager, FORBIDDEN_KEYWORDS_DEFAULT
 from lagent_tablets.state import (
     SupervisorState,
     TabletState,
@@ -48,7 +48,7 @@ from lagent_tablets.burst import (
     extract_json_decision,
     _clean_terminal_json,
 )
-from lagent_tablets.verification import write_scripts, FORBIDDEN_KEYWORDS_DEFAULT
+from lagent_tablets.check import write_scripts
 from lagent_tablets.tablet import regenerate_support_files
 
 

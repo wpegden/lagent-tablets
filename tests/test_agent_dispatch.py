@@ -95,12 +95,25 @@ class TestReviewerBurstDoneFile(unittest.TestCase):
             args = mock_run.call_args
             # codex_headless.run() should NOT receive done_file
             self.assertNotIn("done_file", args.kwargs)
+            self.assertFalse(args.kwargs["fresh"])
+
+    def test_codex_fresh_reviewer_burst_passes_fresh(self):
+        config = ProviderConfig(provider="codex", model="test")
+        tmpdir = Path(tempfile.mkdtemp())
+
+        with patch("lagent_tablets.agents.codex_headless.run") as mock_run:
+            mock_run.return_value = _fake_result()
+            from lagent_tablets.burst import run_reviewer_burst
+            with patch("lagent_tablets.burst.run_with_retry", side_effect=lambda fn, **kw: fn()):
+                run_reviewer_burst(config, "test", session_name="t", work_dir=tmpdir, fresh=True)
+            args = mock_run.call_args
+            self.assertTrue(args.kwargs["fresh"])
 
 
 class TestCodexNoHardTimeout(unittest.TestCase):
     """Verify codex_headless doesn't wrap with `timeout` command."""
 
-    def test_no_timeout_in_script(self):
+    def test_stateful_codex_script_omits_ephemeral(self):
         from lagent_tablets.agents.codex_headless import build_script
         config = ProviderConfig(provider="codex", model="gpt-5.4")
         tmpdir = Path(tempfile.mkdtemp())
@@ -114,6 +127,8 @@ class TestCodexNoHardTimeout(unittest.TestCase):
         content = script.read_text()
         self.assertNotIn("timeout --signal", content,
                          "codex script should NOT have hard timeout wrapper")
+        self.assertNotIn("--ephemeral", content,
+                         "stateful codex worker/reviewer scripts should persist sessions")
         self.assertIn('"${cmd[@]}" < "$PROMPT_FILE"', content,
                       "codex script should pass the prompt on stdin")
         self.assertIn('setsid "${cmd[@]}"', content,
@@ -122,6 +137,37 @@ class TestCodexNoHardTimeout(unittest.TestCase):
                       "codex cleanup should kill the whole process group")
         self.assertNotIn("PROMPT_CONTENT=$(cat \"$PROMPT_FILE\")", content,
                          "codex script should not materialize the prompt into argv")
+
+    def test_fresh_codex_script_uses_ephemeral(self):
+        from lagent_tablets.agents.codex_headless import build_script
+        config = ProviderConfig(provider="codex", model="gpt-5.4")
+        tmpdir = Path(tempfile.mkdtemp())
+        script = build_script(
+            config,
+            prompt_file=tmpdir / "prompt.txt",
+            start_file=tmpdir / "start",
+            exit_file=tmpdir / "exit",
+            work_dir=tmpdir,
+            fresh=True,
+        )
+        content = script.read_text()
+        self.assertIn("--ephemeral", content)
+
+    def test_resume_codex_script_uses_resume_subcommand(self):
+        from lagent_tablets.agents.codex_headless import build_script
+        config = ProviderConfig(provider="codex", model="gpt-5.4")
+        tmpdir = Path(tempfile.mkdtemp())
+        script = build_script(
+            config,
+            prompt_file=tmpdir / "prompt.txt",
+            start_file=tmpdir / "start",
+            exit_file=tmpdir / "exit",
+            work_dir=tmpdir,
+            resume_thread_id="thread-123",
+        )
+        content = script.read_text()
+        self.assertIn("resume", content)
+        self.assertIn("thread-123", content)
 
     def test_script_headless_codex_uses_stdin(self):
         from lagent_tablets.agents.script_headless import build_script
@@ -144,7 +190,7 @@ class TestCodexNoHardTimeout(unittest.TestCase):
         self.assertNotIn("PROMPT_CONTENT=$(cat \"$PROMPT_FILE\")", content,
                          "fallback codex script should not materialize the prompt into argv")
 
-    def test_script_headless_noncodex_uses_watchdog_and_process_group_cleanup(self):
+    def test_script_headless_noncodex_has_no_hard_timeout_and_keeps_process_group_cleanup(self):
         from lagent_tablets.agents.script_headless import build_script
         config = ProviderConfig(provider="claude", model="claude-opus-4-6")
         tmpdir = Path(tempfile.mkdtemp())
@@ -154,15 +200,30 @@ class TestCodexNoHardTimeout(unittest.TestCase):
             start_file=tmpdir / "start",
             exit_file=tmpdir / "exit",
             work_dir=tmpdir,
-            agent_timeout_seconds=123,
         )
         content = script.read_text()
         self.assertNotIn("timeout --signal", content,
-                         "script headless should manage timeout via watchdog, not timeout(1)")
-        self.assertIn("AGENT_TIMEOUT_SECONDS=123", content)
-        self.assertIn('WATCHDOG_PID=$!', content)
+                         "script headless should not use timeout(1)")
+        self.assertNotIn("AGENT_TIMEOUT_SECONDS", content)
+        self.assertNotIn("WATCHDOG_PID", content)
         self.assertIn('kill -- -"$AGENT_PID"', content)
         self.assertIn('setsid "${real_cmd[@]}"', content)
+
+    def test_codex_thread_id_helpers(self):
+        from lagent_tablets.agents.codex_headless import (
+            _extract_thread_id,
+            _load_persisted_thread_id,
+            _store_persisted_thread_id,
+        )
+
+        tmpdir = Path(tempfile.mkdtemp())
+        self.assertEqual(
+            _extract_thread_id('{"type":"thread.started","thread_id":"abc-123"}\n{"type":"turn.completed"}\n'),
+            "abc-123",
+        )
+        self.assertEqual(_load_persisted_thread_id(tmpdir, "worker"), "")
+        _store_persisted_thread_id(tmpdir, "worker", "abc-123")
+        self.assertEqual(_load_persisted_thread_id(tmpdir, "worker"), "abc-123")
 
 
 class TestCorrespondenceAgentDoneFiles(unittest.TestCase):

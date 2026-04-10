@@ -28,6 +28,7 @@ from lagent_tablets.config import (
     Config,
     ConfigError,
     ConfigManager,
+    FORBIDDEN_KEYWORDS_DEFAULT,
     PolicyManager,
     load_config,
     PHASES,
@@ -56,7 +57,7 @@ from lagent_tablets.tablet import (
 )
 from lagent_tablets.viewer_state import viewer_state_path, write_live_viewer_state
 from lagent_tablets.git_ops import init_repo, rewind_to_cycle
-from lagent_tablets.verification import write_scripts, FORBIDDEN_KEYWORDS_DEFAULT
+from lagent_tablets.check import write_scripts
 
 
 def ensure_directories(config: Config) -> None:

@@ -20,6 +20,8 @@ import hashlib
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -589,14 +591,27 @@ def validate_worker_handoff_data(data: Any, *, phase: str, repo: Optional[Path] 
             "difficulty_hints",
             allowed_values=("easy", "hard"),
         )
+        kind_hints, kind_errors = _normalize_string_dict(
+            data.get("kind_hints", {}),
+            "kind_hints",
+            allowed_values=("paper_main_result", "paper_intermediate"),
+        )
         errors.extend(diff_errors)
+        errors.extend(kind_errors)
         extra_hint_nodes = sorted(set(difficulty_hints) - set(new_nodes))
         if extra_hint_nodes:
             errors.append(
                 "difficulty_hints keys must be listed in new_nodes "
                 f"(only genuinely new nodes may be hinted): {extra_hint_nodes}"
             )
+        extra_kind_nodes = sorted(set(kind_hints) - set(new_nodes))
+        if extra_kind_nodes:
+            errors.append(
+                "kind_hints keys must be listed in new_nodes "
+                f"(only genuinely new nodes may be classified): {extra_kind_nodes}"
+            )
         normalized["difficulty_hints"] = difficulty_hints
+        normalized["kind_hints"] = kind_hints
     if repo is not None:
         for name in new_nodes:
             lean_path = repo / "Tablet" / f"{name}.lean"
@@ -717,7 +732,13 @@ def validate_reviewer_decision_data(data: Any, *, phase: str) -> Dict[str, Any]:
         normalized["elevate_to_hard"] = elevate_to_hard
     else:
         issues, issues_errors = _expect_string_list(data.get("issues", []), "issues")
+        kind_assignments, kind_errors = _normalize_string_dict(
+            data.get("kind_assignments", {}),
+            "kind_assignments",
+            allowed_values=("paper_main_result", "paper_intermediate"),
+        )
         errors.extend(issues_errors)
+        errors.extend(kind_errors)
         target_edit_mode, target_edit_mode_errors = _expect_string(
             data.get("target_edit_mode", "repair"),
             "target_edit_mode",
@@ -733,6 +754,7 @@ def validate_reviewer_decision_data(data: Any, *, phase: str) -> Dict[str, Any]:
         if raw_open_blockers != [] and not open_blockers:
             errors.append("open_blockers must be a list of valid blocker objects")
         normalized["issues"] = issues
+        normalized["kind_assignments"] = kind_assignments
         normalized["target_edit_mode"] = target_edit_mode or "repair"
         normalized["orphan_resolutions"] = orphan_resolutions
         normalized["open_blockers"] = open_blockers
@@ -908,16 +930,32 @@ def check_node(
         errors: list of error strings
         warnings: list of warning strings
     """
+    from lagent_tablets.tablet import (
+        extract_declaration_name,
+        extract_marker_name,
+        validate_tex_format,
+    )
+
     lean_path = repo / "Tablet" / f"{name}.lean"
     tex_path = repo / "Tablet" / f"{name}.tex"
     errors: List[str] = []
     warnings: List[str] = []
+    import_violations: List[str] = []
+    forbidden_hits: List[Dict[str, Any]] = []
+    sorry_warnings: List[str] = []
+    marker_valid = True
+    declaration_name_matches = True
+    tex_format_valid = True
 
     # File existence
     if not lean_path.exists():
         return {"ok": False, "errors": [f"{lean_path} not found"], "warnings": []}
+    tex_content = ""
     if not tex_path.exists():
         errors.append(f"{tex_path} not found (every node needs a .tex file)")
+        tex_format_valid = False
+    else:
+        tex_content = tex_path.read_text(encoding="utf-8")
 
     content = lean_path.read_text(encoding="utf-8")
 
@@ -937,18 +975,35 @@ def check_node(
             errors.append("Only the proof body (after :=) may be modified, not the theorem statement.")
 
     # Imports
-    violations = check_imports(content, allowed_prefixes)
-    imports_valid = len(violations) == 0
-    if violations:
-        errors.append(f"Unauthorized imports: {violations}")
+    import_violations = check_imports(content, allowed_prefixes)
+    imports_valid = len(import_violations) == 0
+    if import_violations:
+        errors.append(f"Unauthorized imports: {import_violations}")
+
+    # Marker / declaration / tex structure
+    marker = extract_marker_name(content)
+    if marker != name:
+        marker_valid = False
+        errors.append(f"Marker says {marker!r}, expected {name!r}")
+
+    decl_name = extract_declaration_name(content)
+    if decl_name != name:
+        declaration_name_matches = False
+        errors.append(f"Declaration name is {decl_name!r}, expected {name!r}")
+
+    if tex_path.exists():
+        tex_errors = validate_tex_format(tex_content)
+        if tex_errors:
+            tex_format_valid = False
+            errors.append(f".tex format errors: {tex_errors}")
 
     # Forbidden keywords
-    hits = scan_forbidden(content, forbidden_keywords)
-    non_sorry = [h for h in hits if h["keyword"] != "sorry"]
+    forbidden_hits = scan_forbidden(content, forbidden_keywords)
+    non_sorry = [h for h in forbidden_hits if h["keyword"] != "sorry"]
     keyword_clean = len(non_sorry) == 0
     if non_sorry:
         errors.append(f"Forbidden keywords: {[h['keyword'] for h in non_sorry]}")
-    sorry_in_source = any(h["keyword"] == "sorry" for h in hits)
+    sorry_in_source = any(h["keyword"] == "sorry" for h in forbidden_hits)
 
     # Sorry in definitions (always forbidden, even when sorry is allowed in theorems)
     from lagent_tablets.tablet import scan_sorry_in_definitions
@@ -978,7 +1033,16 @@ def check_node(
     axioms_valid = True
     axiom_violations: List[str] = []
     audited_axioms: List[str] = []
-    if compiles and sorry_free and keyword_clean and imports_valid and declaration_intact:
+    if (
+        compiles
+        and sorry_free
+        and keyword_clean
+        and imports_valid
+        and declaration_intact
+        and marker_valid
+        and declaration_name_matches
+        and tex_format_valid
+    ):
         axiom_audit = audit_node_axioms(
             repo,
             name,
@@ -991,7 +1055,17 @@ def check_node(
             axiom_violations = list(axiom_audit.get("disallowed", []))
             errors.append(f"Axiom audit failed: {axiom_audit['error']}")
 
-    ok = compiles and sorry_free and keyword_clean and imports_valid and declaration_intact and axioms_valid
+    ok = (
+        compiles
+        and sorry_free
+        and keyword_clean
+        and imports_valid
+        and declaration_intact
+        and marker_valid
+        and declaration_name_matches
+        and tex_format_valid
+        and axioms_valid
+    )
 
     return {
         "ok": ok,
@@ -1000,9 +1074,15 @@ def check_node(
         "keyword_clean": keyword_clean,
         "imports_valid": imports_valid,
         "declaration_intact": declaration_intact,
+        "marker_valid": marker_valid,
+        "declaration_name_matches": declaration_name_matches,
+        "tex_format_valid": tex_format_valid,
         "axioms_valid": axioms_valid,
         "audited_axioms": audited_axioms,
         "axiom_violations": axiom_violations,
+        "import_violations": import_violations,
+        "forbidden_hits": forbidden_hits,
+        "sorry_warnings": sorry_warnings,
         "errors": errors,
         "warnings": warnings,
         "build_output": build.get("output", ""),
@@ -1034,6 +1114,127 @@ def _expected_hash_from_tablet(repo: Path, node_name: str) -> str:
     if not isinstance(node_data, dict):
         return ""
     return str(node_data.get("lean_statement_hash", ""))
+
+
+def generate_check_node_sh(
+    repo_path: Path,
+    state_dir: Path,
+    *,
+    allowed_prefixes: List[str],
+    forbidden_keywords: List[str],
+) -> str:
+    """Generate the check_node.sh wrapper.
+
+    The actual logic lives in this module; this wrapper is only for convenience.
+    """
+    return f"""#!/bin/bash
+# Wrapper for the shared deterministic checker.
+exec python3 {shlex.quote(str(state_dir / "scripts" / "check.py"))} node "$@" {shlex.quote(str(repo_path))}
+"""
+
+
+def generate_check_tablet_sh(
+    repo_path: Path,
+    state_dir: Path,
+    *,
+    allowed_prefixes: List[str],
+    forbidden_keywords: List[str],
+) -> str:
+    """Generate the check_tablet.sh wrapper."""
+    return f"""#!/bin/bash
+# Wrapper for the shared deterministic checker.
+exec python3 {shlex.quote(str(state_dir / "scripts" / "check.py"))} tablet {shlex.quote(str(repo_path))}
+"""
+
+
+def write_scripts(
+    repo_path: Path,
+    state_dir: Path,
+    *,
+    allowed_prefixes: List[str],
+    forbidden_keywords: List[str],
+) -> None:
+    """Install deterministic checker scripts into state_dir/scripts/.
+
+    The key script is check.py -- the single source of truth used by both the
+    supervisor and workers. The shell wrappers are conveniences only.
+    """
+    scripts_dir = state_dir / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    gid: Optional[int] = None
+    try:
+        import grp
+
+        gid = grp.getgrnam("leanagent").gr_gid
+        os.chown(str(scripts_dir), -1, gid)
+        os.chmod(str(scripts_dir), 0o2755)
+    except (ImportError, KeyError, PermissionError):
+        gid = None
+
+    check_src = Path(__file__)
+    check_dst = scripts_dir / "check.py"
+    source_root = str(Path(__file__).resolve().parent.parent)
+    check_text = check_src.read_text(encoding="utf-8")
+    bootstrap = (
+        "import sys as _sys\n"
+        f"_src_root = {source_root!r}\n"
+        "if _src_root not in _sys.path:\n"
+        "    _sys.path.insert(0, _src_root)\n\n"
+    )
+    shebang = "#!/usr/bin/env python3\n"
+    if check_text.startswith(shebang):
+        body = check_text[len(shebang):]
+        prefix = shebang
+    else:
+        body = check_text
+        prefix = ""
+    future_line = "from __future__ import annotations\n"
+    if future_line in body:
+        body = body.replace(future_line, future_line + "\n" + bootstrap, 1)
+    else:
+        body = bootstrap + body
+    check_dst.write_text(prefix + body, encoding="utf-8")
+    shutil.copystat(check_src, check_dst)
+    check_dst.chmod(0o755)
+    if gid is not None:
+        try:
+            os.chown(str(check_dst), -1, gid)
+        except PermissionError:
+            pass
+
+    check_node = scripts_dir / "check_node.sh"
+    check_node.write_text(
+        generate_check_node_sh(
+            repo_path,
+            state_dir,
+            allowed_prefixes=allowed_prefixes,
+            forbidden_keywords=forbidden_keywords,
+        ),
+        encoding="utf-8",
+    )
+    check_node.chmod(0o755)
+    if gid is not None:
+        try:
+            os.chown(str(check_node), -1, gid)
+        except PermissionError:
+            pass
+
+    check_tablet = scripts_dir / "check_tablet.sh"
+    check_tablet.write_text(
+        generate_check_tablet_sh(
+            repo_path,
+            state_dir,
+            allowed_prefixes=allowed_prefixes,
+            forbidden_keywords=forbidden_keywords,
+        ),
+        encoding="utf-8",
+    )
+    check_tablet.chmod(0o755)
+    if gid is not None:
+        try:
+            os.chown(str(check_tablet), -1, gid)
+        except PermissionError:
+            pass
 
 
 def _print_json_validation_result(result: Dict[str, Any], *, path: Path) -> int:

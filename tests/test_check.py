@@ -108,6 +108,37 @@ class TestAxiomAudit(unittest.TestCase):
 
         self.assertTrue(result["ok"])
 
+    def test_check_node_rejects_marker_mismatch(self):
+        repo = self._make_repo("-- [TABLET NODE: bar]\ntheorem foo : True := by\n  trivial\n")
+
+        with patch("lagent_tablets.check.run_lake_env_lean", return_value={"ok": True, "returncode": 0, "output": ""}):
+            result = check_node(
+                repo,
+                "foo",
+                allowed_prefixes=["Mathlib"],
+                forbidden_keywords=["sorry", "axiom"],
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["marker_valid"])
+        self.assertTrue(any("Marker says" in err for err in result["errors"]))
+
+    def test_check_node_rejects_bad_tex_format(self):
+        repo = self._make_repo("-- [TABLET NODE: foo]\ntheorem foo : True := by\n  trivial\n")
+        (repo / "Tablet" / "foo.tex").write_text("\\begin{proof}\nBroken.\n\\end{proof}\n", encoding="utf-8")
+
+        with patch("lagent_tablets.check.run_lake_env_lean", return_value={"ok": True, "returncode": 0, "output": ""}):
+            result = check_node(
+                repo,
+                "foo",
+                allowed_prefixes=["Mathlib"],
+                forbidden_keywords=["sorry", "axiom"],
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["tex_format_valid"])
+        self.assertTrue(any(".tex format errors" in err for err in result["errors"]))
+
 
 class TestWriteScripts(unittest.TestCase):
 
@@ -155,6 +186,7 @@ class TestArtifactValidation(unittest.TestCase):
             "target_edit_mode": "repair",
             "next_active_node": "",
             "issues": ["Missing quantifier"],
+            "kind_assignments": {"main_result": "paper_main_result"},
             "paper_focus_ranges": [{"start_line": 10, "end_line": 12, "reason": "statement"}],
             "orphan_resolutions": [],
             "open_blockers": [{"node": "foo", "phase": "correspondence", "reason": "Missing quantifier"}],
@@ -162,6 +194,7 @@ class TestArtifactValidation(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["data"]["decision"], "CONTINUE")
         self.assertEqual(result["data"]["open_blockers"][0]["phase"], "correspondence")
+        self.assertEqual(result["data"]["kind_assignments"]["main_result"], "paper_main_result")
 
     def test_validates_theorem_reviewer_decision_with_soundness_blocker(self):
         result = validate_reviewer_decision_data({
@@ -205,8 +238,20 @@ class TestArtifactValidation(unittest.TestCase):
             "status": "NOT_STUCK",
             "new_nodes": ["helper"],
             "difficulty_hints": {"helper": "easy"},
+            "kind_hints": {"helper": "paper_intermediate"},
         }, phase="theorem_stating", repo=repo)
         self.assertTrue(result["ok"])
+
+    def test_worker_handoff_rejects_kind_hints_outside_new_nodes(self):
+        result = validate_worker_handoff_data({
+            "summary": "Added helper",
+            "status": "NOT_STUCK",
+            "new_nodes": ["helper"],
+            "difficulty_hints": {"helper": "easy"},
+            "kind_hints": {"main_thm": "paper_main_result"},
+        }, phase="theorem_stating")
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("kind_hints keys must be listed in new_nodes" in err for err in result["errors"]))
 
     def test_scoped_tablet_check_ignores_unrelated_baseline_debt(self):
         repo = Path(tempfile.mkdtemp())

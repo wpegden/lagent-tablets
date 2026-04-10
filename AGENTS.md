@@ -79,7 +79,7 @@ New or changed theorem-stating targets default back to `repair`.
 - All result files are **tracked in git** — complete history preserved
 
 ### Context Continuity
-Verifiers are stateless (fresh each cycle) but receive their own previous results in the prompt. This prevents workers from gaming verifiers with superficial fixes. Each agent sees: "Last cycle you flagged these issues — check if they're genuinely fixed."
+Verifiers are stateless (fresh each cycle) but receive their own previous results in the prompt. This now applies to both correspondence and per-node soundness. Each agent sees only its own prior findings for the same check, so workers cannot game verification with superficial fixes.
 
 ---
 
@@ -89,9 +89,9 @@ Verifiers are stateless (fresh each cycle) but receive their own previous result
 
 | Backend | Provider | Session | Completion Signal | Timeout |
 |---------|----------|---------|-------------------|---------|
-| `codex_headless.py` | Codex | One-shot in tmux | `.exit` marker file | None (runs until done) |
+| `codex_headless.py` | Codex | Persisted thread for stateful worker/reviewer bursts; fresh for verification | `.exit` marker file | No completion timeout (startup timeout only) |
 | `agentapi_backend.py` | Claude, Gemini | PTY via agentapi HTTP | `done_file` (separate `.done` marker) | Liveness-based (inactivity only) |
-| `script_headless.py` | Fallback | `-p` mode | Process exit | None |
+| `script_headless.py` | Fallback | `-p` mode | Process exit | No completion timeout (startup timeout only) |
 
 ### Critical Rules (LEARNED THE HARD WAY)
 
@@ -104,7 +104,7 @@ Verifiers are stateless (fresh each cycle) but receive their own previous result
    - **Regression test**: `TestCorrespondenceAgentDoneFiles`, `TestWorkerBurstDoneFile`
 
 2. **No hard wall-clock timeouts**
-   - Codex: no `timeout` command wrapper
+   - Codex/script headless: no completion watchdog or `timeout` wrapper; only startup failure detection
    - Agentapi: liveness-based — resets while status="running", only fires on sustained inactivity
    - Extended thinking (Claude max effort) can run 15+ minutes — NEVER kill an active agent
    - **Regression test**: `TestCodexNoHardTimeout`
@@ -162,7 +162,7 @@ See `configs/extremal_vectors_run.json` for a complete example. Key fields:
 
 ### Policy JSON (hot-reloadable)
 Runtime tuning at `{config}.policy.json`. Editable while supervisor runs:
-- `timing.burst_timeout_seconds` — max agent runtime
+- `timing.burst_timeout_seconds` — burst budget hint passed through to backends; it is not a hard completion kill for Codex/script headless
 - `difficulty.easy_max_retries` — attempts before auto-elevation
 - `prompt_notes.worker` — ad-hoc instructions injected into prompts
 - `verification.correspondence_agent_selectors` — ordered hot-settable subset of configured correspondence agents
@@ -180,7 +180,7 @@ Cycle N:
     - If theorem_stating is holding on a current soundness target in `repair` mode, only `Tablet/{target}.tex` is writable
     - If correspondence/paper-faithfulness blockers are open, there is no active soundness target for that cycle; the worker is addressing the correspondence frontier instead
      - Broader paper-faithful DAG changes require reviewer-authorized `restructure` mode
-  2. Register new nodes in tablet, apply difficulty hints
+  2. Register new nodes in tablet, apply difficulty hints and explicit theorem-stating kind hints (`paper_main_result` vs `paper_intermediate`)
   3. Correspondence + Faithfulness check (3 agents, gate)
      - If REJECT → skip soundness, go to reviewer
      - If APPROVE → proceed to soundness

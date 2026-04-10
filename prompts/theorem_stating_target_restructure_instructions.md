@@ -46,7 +46,8 @@ Write the raw handoff JSON to `{raw_output_path}`:
   "summary": "brief description of the restructure or proof improvement",
   "status": "NOT_STUCK | STUCK | DONE | NEED_INPUT",
   "new_nodes": ["list any genuinely new prerequisite nodes you added"],
-  "difficulty_hints": {{"new_node_name": "easy | hard"}}
+  "difficulty_hints": {{"new_node_name": "easy | hard"}},
+  "kind_hints": {{"new_node_name": "paper_intermediate | paper_main_result"}}
 }}
 
 Then run:

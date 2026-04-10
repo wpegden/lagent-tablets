@@ -177,7 +177,7 @@ def run_worker_burst(
                       work_dir=work_dir, burst_user=burst_user,
                       startup_timeout=startup_timeout_seconds,
                       burst_timeout=timeout_seconds, log_dir=log_dir,
-                      artifact_prefix=prefix)
+                      artifact_prefix=prefix, fresh=False)
 
         if config.provider in ("claude", "gemini"):
             from lagent_tablets.agents.agentapi_backend import run
@@ -229,7 +229,7 @@ def run_reviewer_burst(
                       work_dir=work_dir, burst_user=burst_user,
                       startup_timeout=startup_timeout_seconds,
                       burst_timeout=timeout_seconds, log_dir=log_dir,
-                      artifact_prefix=prefix)
+                      artifact_prefix=prefix, fresh=fresh)
 
         if config.provider in ("claude", "gemini"):
             from lagent_tablets.agents.agentapi_backend import run

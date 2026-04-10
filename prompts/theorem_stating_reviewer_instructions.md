@@ -20,6 +20,9 @@ Write your decision as JSON to the raw file `{raw_output_path}`:
   "target_edit_mode": "repair | restructure",
   "next_active_node": "name of the first node to prove (required for ADVANCE_PHASE)",
   "issues": ["list of specific issues to fix, or empty"],
+  "kind_assignments": {{
+    "node_name": "paper_main_result | paper_intermediate"
+  }},
   "paper_focus_ranges": [
     {{
       "start_line": 420,
@@ -49,6 +52,7 @@ Write your decision as JSON to the raw file `{raw_output_path}`:
 - ADVANCE_PHASE: the tablet is ready for proof_formalization. All main results with complete proofs in the paper are represented, NL proofs are complete, lake build passes, and the DAG structure is sound. You MUST set `next_active_node` to the node the worker should prove first — choose the node where work is most likely to change later plans (favoring hard or low-level nodes).
 - NEED_INPUT: a mathematical question requires human judgment.
 - `paper_focus_ranges` is mandatory. Include the source-paper line ranges the next worker should have inlined for focused context. Use `[]` when no specific excerpt is needed.
+- Use `kind_assignments` when you want to explicitly classify or reclassify theorem-stating nodes as `paper_main_result` or `paper_intermediate`. Use `paper_main_result` only for genuine top-level paper results; otherwise prefer `paper_intermediate`.
 - Prefer short, high-signal ranges: theorem statements, notation blocks, or the exact proof paragraphs the worker should track next. Do not dump broad sections when a targeted excerpt will do.
 - `orphan_resolutions` is mandatory. Include one entry for every CURRENT ORPHAN CANDIDATE shown in the prompt. Use `[]` only when there are no orphan candidates.
 - Use `remove` when the node should be deleted from the tablet.

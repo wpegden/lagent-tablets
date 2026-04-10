@@ -92,12 +92,21 @@ For each node, classify it as "easy" or "hard":
 
 Include your classification in the handoff file as `difficulty_hints`.
 
+STRUCTURAL ROLE CLASSIFICATION:
+For each genuinely new theorem-stating node, classify it as either:
+- `paper_main_result`: only for an actual top-level paper theorem/result that should never be treated as an orphanable intermediate
+- `paper_intermediate`: everything else
+
+Do NOT guess from the filename. Use `paper_main_result` sparingly and only when the node is truly a main paper result.
+Include this in the handoff file as `kind_hints`.
+
 WHEN YOU HAVE FINISHED THE CYCLE'S TABLET EDITS: Write the raw handoff JSON to `{raw_output_path}` listing every node you created this cycle:
 {{
   "summary": "Created N tablet nodes covering the paper's main results and key lemmas",
   "status": "NOT_STUCK | STUCK | DONE | NEED_INPUT",
   "new_nodes": ["node1", "node2", "...every node you created..."],
-  "difficulty_hints": {{"node1": "easy", "node2": "hard", "..."}}
+  "difficulty_hints": {{"node1": "easy", "node2": "hard", "..."}},
+  "kind_hints": {{"node1": "paper_intermediate", "node2": "paper_main_result", "..."}}
 }}
 Then run:
   python3 {check_script} worker-handoff {raw_output_path} --phase theorem_stating --repo {repo_path}

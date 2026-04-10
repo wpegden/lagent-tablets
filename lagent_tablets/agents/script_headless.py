@@ -40,7 +40,6 @@ def build_script(
     work_dir: Path,
     burst_user: Optional[str] = None,
     log_prefix: str = "worker",
-    agent_timeout_seconds: int = 3600,
 ) -> Path:
     """Generate a bash script that wraps the codex exec command."""
     codex_stdin = False
@@ -88,15 +87,10 @@ def build_script(
         f"EXIT_FILE={shlex.quote(str(exit_file))}",
         f"PROMPT_FILE={shlex.quote(str(prompt_file))}",
         f"WORK_DIR={shlex.quote(str(work_dir))}",
-        f"AGENT_TIMEOUT_SECONDS={int(agent_timeout_seconds)}",
         "",
         "cleanup() {",
         "  ec=$?",
         "  trap - EXIT HUP INT TERM",
-        "  if [[ -n \"${WATCHDOG_PID:-}\" ]]; then",
-        "    kill \"$WATCHDOG_PID\" 2>/dev/null || true",
-        "    wait \"$WATCHDOG_PID\" 2>/dev/null || true",
-        "  fi",
         "  if [[ -n \"${AGENT_PID:-}\" ]]; then",
         "    kill -- -\"$AGENT_PID\" 2>/dev/null || true",
         "    for _ in 1 2 3 4 5; do",
@@ -144,15 +138,6 @@ def build_script(
         ])
 
     lines.extend([
-        'if (( AGENT_TIMEOUT_SECONDS > 0 )); then',
-        '  (',
-        '    sleep "$AGENT_TIMEOUT_SECONDS"',
-        '    kill -- -"$AGENT_PID" 2>/dev/null || true',
-        '    sleep 30',
-        '    kill -KILL -- -"$AGENT_PID" 2>/dev/null || true',
-        '  ) &',
-        '  WATCHDOG_PID=$!',
-        'fi',
         'wait "$AGENT_PID"',
         "ec=$?",
         'exit "$ec"',
@@ -205,7 +190,6 @@ def run(
         work_dir=work_dir,
         burst_user=burst_user,
         log_prefix=prefix,
-        agent_timeout_seconds=int(burst_timeout),
     )
 
     # Launch via tmux for process isolation
@@ -245,9 +229,8 @@ def run(
                               error="Agent pane died before startup")
         time.sleep(0.5)
 
-    # Wait for exit marker
-    deadline_exit = time.monotonic() + burst_timeout
-    while time.monotonic() < deadline_exit:
+    # Wait for exit marker. Completion is unbounded; only startup is timed.
+    while True:
         if exit_file.exists():
             break
         if tmux_pane_is_dead(pane_id):

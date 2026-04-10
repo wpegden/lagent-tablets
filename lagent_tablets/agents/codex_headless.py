@@ -31,6 +31,47 @@ def _artifact_prefix(prefix: Optional[str], role: str) -> str:
     return base[:80]
 
 
+def _session_state_path(work_dir: Path, role: str) -> Path:
+    session_dir = work_dir / ".agent-supervisor" / "sessions"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    return session_dir / f"codex-{role}.json"
+
+
+def _load_persisted_thread_id(work_dir: Path, role: str) -> str:
+    path = _session_state_path(work_dir, role)
+    if not path.exists():
+        return ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("thread_id", "") or "").strip()
+
+
+def _store_persisted_thread_id(work_dir: Path, role: str, thread_id: str) -> None:
+    thread_id = str(thread_id or "").strip()
+    if not thread_id:
+        return
+    path = _session_state_path(work_dir, role)
+    path.write_text(json.dumps({"thread_id": thread_id}, indent=2) + "\n", encoding="utf-8")
+
+
+def _extract_thread_id(output: str) -> str:
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if rec.get("type") == "thread.started":
+            return str(rec.get("thread_id", "") or "").strip()
+    return ""
+
+
 def build_script(
     config: ProviderConfig,
     *,
@@ -40,18 +81,27 @@ def build_script(
     work_dir: Path,
     burst_user: Optional[str] = None,
     log_prefix: str = "worker",
-    agent_timeout_seconds: int = 3600,
+    fresh: bool = False,
+    resume_thread_id: str = "",
 ) -> Path:
     """Generate a bash script that wraps the codex exec command."""
-    cmd_parts = ["codex", "exec", "--json",
-                 "--skip-git-repo-check",
-                 "--dangerously-bypass-approvals-and-sandbox",
-                 "--ephemeral"]
+    cmd_parts = ["codex", "exec"]
+    if resume_thread_id and not fresh:
+        cmd_parts.extend(["resume"])
+    cmd_parts.extend([
+        "--json",
+        "--skip-git-repo-check",
+        "--dangerously-bypass-approvals-and-sandbox",
+    ])
+    if fresh:
+        cmd_parts.append("--ephemeral")
     if config.model:
         cmd_parts.extend(["-m", config.model])
     if config.effort:
         cmd_parts.extend(["-c", f"reasoning_effort={shlex.quote(config.effort)}"])
     cmd_parts.extend(config.extra_args or [])
+    if resume_thread_id and not fresh:
+        cmd_parts.append(resume_thread_id)
     cmd_parts.append("-")
 
     env_lines = [
@@ -127,6 +177,7 @@ def run(
     burst_timeout: float = 7200.0,
     log_dir: Optional[Path] = None,
     artifact_prefix: Optional[str] = None,
+    fresh: bool = False,
 ) -> BurstResult:
     """Run a Codex burst via the script-based pattern."""
     start = time.monotonic()
@@ -148,6 +199,10 @@ def run(
     output_log = log_dir / f"{prefix}-output.log"
     output_log.write_text("", encoding="utf-8")
 
+    resume_thread_id = ""
+    if not fresh and role in {"worker", "reviewer"}:
+        resume_thread_id = _load_persisted_thread_id(work_dir, role)
+
     script_path = build_script(
         config,
         prompt_file=prompt_file,
@@ -156,7 +211,8 @@ def run(
         work_dir=work_dir,
         burst_user=burst_user,
         log_prefix=prefix,
-        agent_timeout_seconds=int(burst_timeout),
+        fresh=fresh,
+        resume_thread_id=resume_thread_id,
     )
 
     # Launch via tmux for process isolation
@@ -196,9 +252,8 @@ def run(
                               error="Agent pane died before startup")
         time.sleep(0.5)
 
-    # Wait for exit marker
-    deadline_exit = time.monotonic() + burst_timeout
-    while time.monotonic() < deadline_exit:
+    # Wait for exit marker. Completion is unbounded; only startup is timed.
+    while True:
         if exit_file.exists():
             break
         if tmux_pane_is_dead(pane_id):
@@ -237,6 +292,10 @@ def run(
                 usage["model"] = config.model or "codex"
         except (json.JSONDecodeError, ValueError):
             pass
+
+    thread_id = _extract_thread_id(output)
+    if thread_id and not fresh and role in {"worker", "reviewer"}:
+        _store_persisted_thread_id(work_dir, role, thread_id)
 
     return BurstResult(
         ok=exit_code == 0,

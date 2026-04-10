@@ -17,7 +17,7 @@ import copy
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
 import hashlib
 
@@ -27,7 +27,7 @@ from lagent_tablets.burst import (
     run_reviewer_burst,
     run_worker_burst,
 )
-from lagent_tablets.config import Config, Policy
+from lagent_tablets.config import Config, Policy, FORBIDDEN_KEYWORDS_DEFAULT
 from lagent_tablets.prompts import (
     build_reviewer_prompt,
     build_correspondence_prompt,
@@ -78,7 +78,9 @@ from lagent_tablets.check import (
     check_node as run_check_node,
     check_tablet as run_check_tablet,
     check_tablet_scoped as run_check_tablet_scoped,
+    is_lake_package_error,
     validate_json_artifact,
+    write_scripts,
 )
 from lagent_tablets.nl_cache import (
     correspondence_fingerprint,
@@ -129,10 +131,6 @@ def _accumulate_usage(state: SupervisorState, role: str, usage: Optional[Dict[st
     mbucket["input_tokens"] += usage.get("input_tokens", 0)
     mbucket["output_tokens"] += usage.get("output_tokens", 0)
     mbucket["calls"] += 1
-from lagent_tablets.verification import (
-    FORBIDDEN_KEYWORDS_DEFAULT,
-    write_scripts,
-)
 
 
 # ---------------------------------------------------------------------------
@@ -955,8 +953,7 @@ def validate_worker_cycle(
         )
         if not result.compiles:
             # Check if the failure is just Lake package noise
-            from lagent_tablets.verification import _is_lake_package_error
-            if _is_lake_package_error(result.build_output):
+            if is_lake_package_error(result.build_output):
                 pass  # Ignore Lake package errors -- the code itself is fine
             else:
                 return CycleOutcome(
@@ -1025,8 +1022,7 @@ def validate_worker_cycle(
             timeout_seconds=config.burst_timeout_seconds,
         )
         if not result.compiles:
-            from lagent_tablets.verification import _is_lake_package_error
-            if not _is_lake_package_error(result.build_output):
+            if not is_lake_package_error(result.build_output):
                 _cleanup_new_files(repo, lean_name)
                 return CycleOutcome(
                     outcome="INVALID",
@@ -1067,6 +1063,46 @@ def validate_worker_cycle(
         nodes_closed=nodes_closed,
         nodes_created=new_node_names,
     )
+
+
+def _validate_hard_proof_changes(
+    repo_path: Path,
+    active_node: str,
+    snapshot_before: Dict[str, str],
+) -> tuple[Optional[str], Dict[str, List[str]]]:
+    """Reject destructive or out-of-scope file edits in proof-formalization hard mode."""
+    snapshot_after = _snapshot_tablet_dir(repo_path)
+    changes = _detect_changes(snapshot_before, snapshot_after)
+    supervisor_generated = {"INDEX.md", "README.md", "header.tex", "Tablet.lean"}
+    allowed_modified = {f"{active_node}.lean", f"{active_node}.tex", "Preamble.lean"} | supervisor_generated
+
+    if changes["deleted"]:
+        return f"Files were deleted (not allowed): {changes['deleted']}", changes
+
+    unexpected_modified = [f for f in changes["modified"] if f not in allowed_modified]
+    if unexpected_modified:
+        return (
+            f"Unexpected files modified: {unexpected_modified}. "
+            f"Only {active_node}, Preamble.lean, and supervisor-generated support files may be modified.",
+            changes,
+        )
+
+    return None, changes
+
+
+def _theorem_stating_node_kind(
+    name: str,
+    kind_hints: Dict[str, str],
+) -> str:
+    """Return the structural role for a theorem-stating node.
+
+    New theorem-stating nodes default to paper_intermediate unless the worker
+    explicitly classifies them as a paper_main_result.
+    """
+    kind = str(kind_hints.get(name, "paper_intermediate") or "paper_intermediate").strip()
+    if kind in {"paper_main_result", "paper_intermediate"}:
+        return kind
+    return "paper_intermediate"
 
 
 def validate_worker_cycle_v2(
@@ -1124,20 +1160,26 @@ def validate_worker_cycle_v2(
         if not is_valid_node_name(name):
             return CycleOutcome(outcome="INVALID", detail=f"Invalid node name: {name!r}")
 
-        lean_path = node_lean_path(repo, name)
         tex_path = node_tex_path(repo, name)
         if not tex_path.exists():
             return CycleOutcome(outcome="INVALID", detail=f"New node {name} has .lean but no .tex file")
 
+        result = run_check_node(
+            repo,
+            name,
+            allowed_prefixes=config.workflow.allowed_import_prefixes,
+            forbidden_keywords=forbidden,
+            approved_axioms_path=config.workflow.approved_axioms_path,
+        )
+        if result["errors"]:
+            return CycleOutcome(
+                outcome="INVALID",
+                detail=f"New node {name}: {result['errors'][0]}",
+                build_output=result.get("build_output", ""),
+            )
+
+        lean_path = node_lean_path(repo, name)
         content = lean_path.read_text(encoding="utf-8")
-        marker = extract_marker_name(content)
-        if marker != name:
-            return CycleOutcome(outcome="INVALID", detail=f"New node {name}: marker says {marker!r}")
-
-        import_violations = validate_imports(content, config.workflow.allowed_import_prefixes)
-        if import_violations:
-            return CycleOutcome(outcome="INVALID", detail=f"New node {name} has unauthorized imports: {import_violations}")
-
         if not has_sorry(content):
             nodes_closed.append(name)
         nodes_created.append(name)
@@ -1491,11 +1533,13 @@ def _run_single_node_soundness(
     # Ports: 3310 + (node_index * 10) + (agent_index * 2) — spread to avoid collisions
     port = 3310 + (node_index % 5) * 10 + agent_index * 2
 
+    previous_issues = _load_previous_soundness_issues(repo, node_name=node_name, agent_index=selected_index)
     artifact_paths = _clear_artifact_files(config, output_file)
 
     prompt = build_node_soundness_prompt(
         config, tablet, node_name=node_name, paper_tex=paper_tex,
         human_input=human_input, output_file=output_file,
+        previous_issues=previous_issues,
     )
 
     agent_provider = ProviderConfig(
@@ -1541,6 +1585,45 @@ def _run_single_node_soundness(
     if burst_result.usage:
         result["_usage"] = burst_result.usage
     return result
+
+
+def _load_previous_soundness_issues(
+    repo: Path,
+    *,
+    node_name: str,
+    agent_index: int,
+) -> List[str]:
+    """Load prior per-agent soundness objections for prompt continuity."""
+    from lagent_tablets.check import validate_node_soundness_result_data
+
+    path = repo / f"nl_proof_{node_name}_{agent_index}.json"
+    if not path.exists():
+        return []
+    try:
+        raw = load_json(path)
+    except Exception:
+        return []
+    validation = validate_node_soundness_result_data(raw, node_name=node_name)
+    if not validation["ok"] or not isinstance(validation.get("data"), dict):
+        return []
+
+    data = validation["data"]
+    if data.get("overall") == "APPROVE":
+        return []
+
+    soundness = data.get("soundness", {})
+    decision = str(soundness.get("decision", "")).strip()
+    explanation = str(soundness.get("explanation", "")).strip()
+    summary = str(data.get("summary", "")).strip()
+
+    issues: List[str] = []
+    if decision and decision != "UNSOUND":
+        issues.append(f"{decision}: {explanation or summary}".strip())
+    elif explanation:
+        issues.append(explanation)
+    if summary and summary not in issues:
+        issues.append(summary)
+    return issues
 
 
 def _soundness_priority_order(
@@ -2256,6 +2339,34 @@ def _write_scoped_tablet_check_payload(
     return out
 
 
+def _run_scoped_tablet_check(
+    config: Config,
+    *,
+    baseline_errors: Sequence[str],
+    allowed_nodes: Sequence[str],
+) -> Optional[CycleOutcome]:
+    """Fail only on newly introduced deterministic errors relevant to allowed nodes."""
+    forbidden = [
+        kw for kw in FORBIDDEN_KEYWORDS_DEFAULT
+        if kw not in config.workflow.forbidden_keyword_allowlist
+    ]
+    scoped_result = run_check_tablet_scoped(
+        config.repo_path,
+        allowed_prefixes=config.workflow.allowed_import_prefixes,
+        forbidden_keywords=forbidden,
+        baseline_errors=baseline_errors,
+        allowed_nodes=allowed_nodes,
+        approved_axioms_path=config.workflow.approved_axioms_path,
+    )
+    if scoped_result["errors"]:
+        return CycleOutcome(
+            outcome="INVALID",
+            detail=scoped_result["errors"][0],
+            build_output=scoped_result.get("build_output", ""),
+        )
+    return None
+
+
 def _validate_theorem_target_repair_changes(
     repo_path: Path,
     target: str,
@@ -2574,6 +2685,7 @@ def _run_nl_verification(
     nl_cache: Optional[Any] = None,
     human_input: str = "",
     soundness_target_node: Optional[str] = None,
+    soundness_node_names: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Run correspondence and NL proof verification on the given nodes.
 
@@ -2585,7 +2697,10 @@ def _run_nl_verification(
     results: List[Dict[str, Any]] = []
     state = state or SupervisorState(cycle=cycle or 0)
 
-    if not node_names:
+    corr_nodes_base = list(correspondence_node_names) if correspondence_node_names is not None else list(node_names)
+    proof_nodes_base = list(soundness_node_names) if soundness_node_names is not None else list(node_names)
+
+    if not corr_nodes_base and not proof_nodes_base:
         return results
 
     # Load previous results for verifier context
@@ -2602,7 +2717,6 @@ def _run_nl_verification(
     )
 
     # 1. Correspondence check (possibly multi-agent)
-    corr_nodes_base = list(correspondence_node_names) if correspondence_node_names is not None else list(node_names)
     corr_nodes = corr_nodes_base
     cached_corr_nodes: List[str] = []
     if nl_cache:
@@ -2674,7 +2788,7 @@ def _run_nl_verification(
                     "overall": "ERROR",
                     "summary": artifact_error or "missing correspondence artifact",
                 })
-    else:
+    elif corr_nodes_base:
         print(f"  Correspondence: all {len(corr_nodes_base)} nodes cached (APPROVE)")
         if not cached_corr_nodes:
             results.append({"check": "correspondence", "overall": "APPROVE", "summary": "cached", "node_names": list(corr_nodes_base)})
@@ -2694,9 +2808,9 @@ def _run_nl_verification(
         print(f"  Skipping NL proof soundness (correspondence {corr_overall} — must pass first)")
         return results
 
-    proof_nodes = node_names
+    proof_nodes = proof_nodes_base
     if nl_cache:
-        proof_nodes = nl_cache.filter_uncached(repo, node_names, "soundness")
+        proof_nodes = nl_cache.filter_uncached(repo, proof_nodes_base, "soundness")
     if proof_nodes and soundness_target_node is not None:
         if soundness_target_node in proof_nodes:
             proof_nodes = [soundness_target_node]
@@ -2728,7 +2842,7 @@ def _run_nl_verification(
                             nl_cache.record_soundness_approval(repo, [node])
         else:
             # Single-agent, all-at-once soundness (fallback)
-            print(f"  NL proof check: {len(proof_nodes)} nodes ({len(node_names) - len(proof_nodes)} cached)")
+            print(f"  NL proof check: {len(proof_nodes)} nodes ({len(proof_nodes_base) - len(proof_nodes)} cached)")
             proof_artifacts = _clear_artifact_files(config, "nl_proof_result.json")
             proof_prompt = build_nl_proof_prompt(
                 config, tablet, node_names=proof_nodes, paper_tex=paper_tex,
@@ -2767,8 +2881,8 @@ def _run_nl_verification(
                     "overall": "ERROR",
                     "summary": artifact_error or "missing NL proof artifact",
                 })
-    else:
-        print(f"  NL proof soundness: all {len(node_names)} nodes cached (APPROVE)")
+    elif proof_nodes_base:
+        print(f"  NL proof soundness: all {len(proof_nodes_base)} nodes cached (APPROVE)")
         results.append({"check": "nl_proof", "overall": "APPROVE", "summary": "cached", "node_names": []})
 
     _save_live_viewer_state(config, tablet, state, source="verification")
@@ -2833,6 +2947,7 @@ def run_theorem_stating_cycle(
     )
     target_scope_before_worker = _theorem_target_scope(repo, state.theorem_soundness_target)
     scoped_tablet_check_payload_path: Optional[Path] = None
+    theorem_tablet_baseline_errors: List[str] = []
     node_hashes_before_worker = _snapshot_tablet_node_hashes(repo) if not resume_from else {}
     tablet_snapshot_before_worker = _snapshot_tablet_dir(repo) if not resume_from else {}
 
@@ -2850,6 +2965,18 @@ def run_theorem_stating_cycle(
             target=state.theorem_soundness_target,
             repair_mode=target_repair_mode,
         )
+
+        forbidden = [
+            kw for kw in FORBIDDEN_KEYWORDS_DEFAULT
+            if kw not in config.workflow.forbidden_keyword_allowlist
+        ]
+        baseline = run_check_tablet(
+            repo,
+            allowed_prefixes=config.workflow.allowed_import_prefixes,
+            forbidden_keywords=forbidden,
+            approved_axioms_path=config.workflow.approved_axioms_path,
+        )
+        theorem_tablet_baseline_errors = list(baseline.get("errors", []))
 
         if target_restructure_mode and state.theorem_soundness_target:
             scoped_tablet_check_payload_path = _write_scoped_tablet_check_payload(
@@ -2946,41 +3073,49 @@ def run_theorem_stating_cycle(
                 detail=scope_error,
             )
 
+        touched_nodes = sorted(
+            {
+                name
+                for name in changed_nodes
+                if name == PREAMBLE_NAME or name in all_node_names
+            }
+        )
         if target_restructure_mode and state.theorem_soundness_target:
             allowed_nodes = sorted(
                 target_scope_before_worker | _theorem_target_scope(repo, state.theorem_soundness_target)
             )
-            forbidden = [
-                kw for kw in FORBIDDEN_KEYWORDS_DEFAULT
-                if kw not in config.workflow.forbidden_keyword_allowlist
-            ]
-            scoped_result = run_check_tablet_scoped(
-                repo,
-                allowed_prefixes=config.workflow.allowed_import_prefixes,
-                forbidden_keywords=forbidden,
-                baseline_errors=(
-                    load_json(scoped_tablet_check_payload_path, {}).get("baseline_errors", [])
-                    if scoped_tablet_check_payload_path else []
-                ),
-                allowed_nodes=allowed_nodes,
-                approved_axioms_path=config.workflow.approved_axioms_path,
+            baseline_errors = (
+                load_json(scoped_tablet_check_payload_path, {}).get("baseline_errors", [])
+                if scoped_tablet_check_payload_path else []
             )
-            if scoped_result["errors"]:
-                print(f"  INVALID: scoped deterministic check failed: {scoped_result['errors'][0]}")
+        else:
+            allowed_nodes = [name for name in touched_nodes if name != PREAMBLE_NAME]
+            baseline_errors = theorem_tablet_baseline_errors
+
+        if touched_nodes or target_restructure_mode:
+            scoped_outcome = _run_scoped_tablet_check(
+                config,
+                baseline_errors=baseline_errors,
+                allowed_nodes=allowed_nodes,
+            )
+            if scoped_outcome is not None:
+                print(f"  INVALID: scoped deterministic check failed: {scoped_outcome.detail}")
                 save_state(state_path(config), state)
-                return CycleOutcome(
-                    outcome="INVALID",
-                    detail=scoped_result["errors"][0],
-                    build_output=scoped_result.get("build_output", ""),
-                )
+                return scoped_outcome
 
         # Read difficulty hints from worker handoff (if present)
         difficulty_hints: Dict[str, str] = {}
+        kind_hints: Dict[str, str] = {}
         hints = worker_handoff.get("difficulty_hints", {}) if isinstance(worker_handoff, dict) else {}
         if isinstance(hints, dict):
             for k, v in hints.items():
                 if v in ("easy", "hard"):
                     difficulty_hints[k] = v
+        raw_kind_hints = worker_handoff.get("kind_hints", {}) if isinstance(worker_handoff, dict) else {}
+        if isinstance(raw_kind_hints, dict):
+            for k, v in raw_kind_hints.items():
+                if v in ("paper_main_result", "paper_intermediate"):
+                    kind_hints[k] = v
 
         # Register any new nodes in the tablet
         for name in new_nodes:
@@ -2989,7 +3124,7 @@ def run_theorem_stating_cycle(
             if lean_path.exists():
                 content = lean_path.read_text(encoding="utf-8")
                 marker = extract_marker_name(content)
-                kind = "paper_main_result" if "main" in name or "theorem" in name else "paper_intermediate"
+                kind = _theorem_stating_node_kind(name, kind_hints)
                 register_new_node(tablet, repo, name=name, kind=kind, cycle=cycle)
                 if name in difficulty_hints:
                     tablet.nodes[name].difficulty = difficulty_hints[name]
@@ -3189,6 +3324,10 @@ def run_theorem_stating_cycle(
         )
         _enforce_theorem_stating_open_rejections(decision, open_rejections)
         state.open_blockers = open_rejections
+
+        for name, kind in decision.get("kind_assignments", {}).items():
+            if name in tablet.nodes and kind in {"paper_main_result", "paper_intermediate"}:
+                tablet.nodes[name].kind = kind
 
         if correspondence_blocked:
             state.theorem_correspondence_blocked = True
@@ -3444,12 +3583,20 @@ def run_cycle(
 
     # Record state BEFORE the burst for easy-mode validation
     active_lean = node_lean_path(repo, active_node)
+    active_tex = node_tex_path(repo, active_node)
     hash_before = hashlib.sha256(active_lean.read_bytes()).hexdigest() if active_lean.exists() else ""
+    proof_tablet_baseline_errors: List[str] = list(
+        run_check_tablet(
+            repo,
+            allowed_prefixes=config.workflow.allowed_import_prefixes,
+            forbidden_keywords=forbidden,
+            approved_axioms_path=config.workflow.approved_axioms_path,
+        ).get("errors", [])
+    )
     imports_before: List[str] = []
-    tablet_snapshot_before: Dict[str, str] = {}
+    tablet_snapshot_before: Dict[str, str] = _snapshot_tablet_dir(repo)
     if easy_mode and active_lean.exists():
         imports_before = extract_imports(active_lean.read_text(encoding="utf-8"))
-        tablet_snapshot_before = _snapshot_tablet_dir(repo)
 
     # Build worker prompt
     worker_prompt = build_worker_prompt(
@@ -3508,11 +3655,26 @@ def run_cycle(
     # Check the active node's hash AFTER the burst
     hash_after = hashlib.sha256(active_lean.read_bytes()).hexdigest() if active_lean.exists() else ""
     active_changed = hash_before != hash_after
+    tablet_snapshot_after = _snapshot_tablet_dir(repo)
+    changes = _detect_changes(tablet_snapshot_before, tablet_snapshot_after)
+    active_tex_changed = f"{active_node}.tex" in changes["modified"]
+    preamble_changed = "Preamble.lean" in changes["modified"]
+
+    if not easy_mode:
+        scope_error, changes = _validate_hard_proof_changes(
+            repo,
+            active_node,
+            tablet_snapshot_before,
+        )
+        if scope_error:
+            outcome = CycleOutcome(outcome="INVALID", detail=scope_error)
+            save_state(state_path(config), state)
+            save_tablet(tablet_path(config), tablet)
+            _save_live_viewer_state(config, tablet, state, source="worker")
+            return outcome
 
     # Detect new files created by the worker
-    current_files = {p.name for p in (repo / "Tablet").iterdir() if p.is_file()} if (repo / "Tablet").is_dir() else set()
-    known_files = {f"{name}.lean" for name in tablet.nodes} | {f"{name}.tex" for name in tablet.nodes} | {"INDEX.md", "README.md", "header.tex"}
-    new_files = current_files - known_files
+    new_files = set(changes["created"])
 
     # Easy-mode enforcement (layer 2: supervisor-side, in addition to filesystem)
     if easy_mode:
@@ -3568,6 +3730,20 @@ def run_cycle(
     )
     print(f"  Validation: {outcome.outcome} -- {outcome.detail}")
 
+    proof_allowed_nodes = []
+    if active_changed or active_tex_changed:
+        proof_allowed_nodes.append(active_node)
+    proof_allowed_nodes.extend(outcome.nodes_created)
+    if outcome.outcome != "INVALID" and (proof_allowed_nodes or preamble_changed):
+        scoped_outcome = _run_scoped_tablet_check(
+            config,
+            baseline_errors=proof_tablet_baseline_errors,
+            allowed_nodes=proof_allowed_nodes,
+        )
+        if scoped_outcome is not None:
+            print(f"  Validation: {scoped_outcome.outcome} -- {scoped_outcome.detail}")
+            outcome = scoped_outcome
+
     # Track consecutive invalids for escalation
     prev_invalids = _count_consecutive_invalids(state)
     if outcome.outcome == "INVALID":
@@ -3593,15 +3769,20 @@ def run_cycle(
     nl_verification_results: List[Dict[str, Any]] = []
     needs_nl_review = False
 
-    # Run NL verification on: new nodes, and any modified nodes that are still open
+    # Run correspondence/paper-faithfulness on all new nodes plus any changed active node.
+    # Run soundness only on nodes that remain open after this cycle.
     nodes_to_verify = []
+    soundness_nodes_to_verify: List[str] = []
     if outcome.outcome == "PROGRESS":
         if outcome.nodes_created:
-            nodes_to_verify.extend([n for n in outcome.nodes_created if n not in outcome.nodes_closed])
-        # Also verify the active node if it changed (even if not closed)
-        if active_changed and active_node not in outcome.nodes_closed:
+            nodes_to_verify.extend(outcome.nodes_created)
+            soundness_nodes_to_verify.extend([n for n in outcome.nodes_created if n not in outcome.nodes_closed])
+        if active_changed or active_tex_changed:
             if active_node not in nodes_to_verify:
                 nodes_to_verify.append(active_node)
+        if active_changed and active_node not in outcome.nodes_closed:
+            if active_node not in soundness_nodes_to_verify:
+                soundness_nodes_to_verify.append(active_node)
 
     if nodes_to_verify:
         print(f"  Running NL verification for nodes: {nodes_to_verify}")
@@ -3611,6 +3792,7 @@ def run_cycle(
         nl_verification_results = _run_nl_verification(
             config, policy, tablet, nodes_to_verify, state=state, cycle=cycle, log_dir=log_dir, nl_cache=nl_cache,
             human_input=state.human_input,
+            soundness_node_names=soundness_nodes_to_verify,
         )
 
     # Accumulate verification usage
