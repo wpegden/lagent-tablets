@@ -10,6 +10,7 @@ to prevent context poisoning (kill servers, clear chat histories).
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -35,12 +36,101 @@ GITIGNORE_CONTENT = """\
 """
 
 
+FINAL_CYCLE_TAG_RE = re.compile(r"^cycle-(\d+)$")
+CHECKPOINT_TAG_RE = re.compile(r"^cycle-(\d+)-(worker|verification)$")
+CHECKPOINT_STAGES = ("worker", "verification")
+
+
 def _git(repo: Path, *args: str, check: bool = True, timeout: int = 30) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["git", *args],
         capture_output=True, text=True, timeout=timeout,
         cwd=str(repo), check=check,
     )
+
+
+def _is_git_repo(repo: Path) -> bool:
+    try:
+        result = _git(repo, "rev-parse", "--is-inside-work-tree", check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and result.stdout.strip() == "true"
+
+
+def cycle_tag(cycle: int) -> str:
+    return f"cycle-{cycle}"
+
+
+def checkpoint_tag(cycle: int, checkpoint: str) -> str:
+    return f"cycle-{cycle}-{checkpoint}"
+
+
+def _is_final_cycle_tag(tag: str) -> bool:
+    return FINAL_CYCLE_TAG_RE.fullmatch(tag.strip()) is not None
+
+
+def _cycle_tag_sort_key(tag: str) -> tuple[int, int]:
+    tag = tag.strip()
+    final_match = FINAL_CYCLE_TAG_RE.fullmatch(tag)
+    if final_match:
+        return (int(final_match.group(1)), 2)
+    checkpoint_match = CHECKPOINT_TAG_RE.fullmatch(tag)
+    if checkpoint_match:
+        stage_order = {"worker": 0, "verification": 1}
+        return (int(checkpoint_match.group(1)), stage_order[checkpoint_match.group(2)])
+    return (-1, -1)
+
+
+def _stage_ref(cycle: int, stage: str) -> str:
+    normalized = str(stage or "reviewer").strip().lower()
+    if normalized == "reviewer":
+        return cycle_tag(cycle)
+    if normalized in CHECKPOINT_STAGES:
+        return checkpoint_tag(cycle, normalized)
+    raise ValueError(f"Unsupported rewind stage: {stage!r}")
+
+
+def _commit_tagged_state(
+    repo: Path,
+    *,
+    cycle: int,
+    tag: str,
+    phase: str = "",
+    outcome: str = "",
+    active_node: str = "",
+    detail: str = "",
+    meta: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Commit the current state and tag it with an exact checkpoint ref."""
+    if not _is_git_repo(repo):
+        return None
+    meta_path = repo / ".agent-supervisor" / "cycle_meta.json"
+    meta_data = {
+        "cycle": cycle,
+        "phase": phase,
+        "outcome": outcome,
+        "active_node": active_node,
+        "detail": detail,
+        **(meta or {}),
+    }
+    meta_path.write_text(json.dumps(meta_data, indent=2), encoding="utf-8")
+
+    _git(repo, "add", "-A")
+    result = _git(repo, "diff", "--cached", "--quiet", check=False)
+    if result.returncode == 0:
+        return None
+
+    summary = f"{tag}: {outcome}"
+    if active_node:
+        summary += f" on {active_node}"
+    if phase:
+        summary += f" ({phase})"
+    body = f"\n\n{detail}" if detail else ""
+    _git(repo, "commit", "-m", f"{summary}{body}")
+    _git(repo, "tag", "-d", tag, check=False)
+    _git(repo, "tag", tag)
+    result = _git(repo, "rev-parse", "HEAD")
+    return result.stdout.strip()
 
 
 def init_repo(repo: Path, *, author_name: str = "lagent-supervisor",
@@ -74,48 +164,43 @@ def commit_cycle(
 
     Returns the commit hash, or None if nothing to commit.
     """
-    # Write cycle metadata file (committed alongside state)
-    meta_path = repo / ".agent-supervisor" / "cycle_meta.json"
-    meta_data = {
-        "cycle": cycle,
-        "phase": phase,
-        "outcome": outcome,
-        "active_node": active_node,
-        "detail": detail,
-        **(meta or {}),
-    }
-    meta_path.write_text(json.dumps(meta_data, indent=2), encoding="utf-8")
+    return _commit_tagged_state(
+        repo,
+        cycle=cycle,
+        tag=cycle_tag(cycle),
+        phase=phase,
+        outcome=outcome,
+        active_node=active_node,
+        detail=detail,
+        meta=meta,
+    )
 
-    # Stage everything
-    _git(repo, "add", "-A")
 
-    # Check if there's anything to commit
-    result = _git(repo, "diff", "--cached", "--quiet", check=False)
-    if result.returncode == 0:
-        return None  # Nothing changed
-
-    # Build commit message
-    summary = f"cycle-{cycle}: {outcome}"
-    if active_node:
-        summary += f" on {active_node}"
-    if phase:
-        summary += f" ({phase})"
-
-    body = ""
-    if detail:
-        body = f"\n\n{detail}"
-
-    _git(repo, "commit", "-m", f"{summary}{body}")
-
-    # Tag
-    tag = f"cycle-{cycle}"
-    # Remove existing tag if present (e.g., from a rewound branch)
-    _git(repo, "tag", "-d", tag, check=False)
-    _git(repo, "tag", tag)
-
-    # Return commit hash
-    result = _git(repo, "rev-parse", "HEAD")
-    return result.stdout.strip()
+def commit_checkpoint(
+    repo: Path,
+    cycle: int,
+    checkpoint: str,
+    *,
+    phase: str = "",
+    outcome: str = "",
+    active_node: str = "",
+    detail: str = "",
+    meta: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Commit an exact subcycle checkpoint such as worker or verification."""
+    normalized = str(checkpoint or "").strip().lower()
+    if normalized not in CHECKPOINT_STAGES:
+        raise ValueError(f"Unsupported checkpoint stage: {checkpoint!r}")
+    return _commit_tagged_state(
+        repo,
+        cycle=cycle,
+        tag=checkpoint_tag(cycle, normalized),
+        phase=phase,
+        outcome=outcome,
+        active_node=active_node,
+        detail=detail,
+        meta={**(meta or {}), "checkpoint": normalized},
+    )
 
 
 def push_remote(repo: Path, *, remote: str = "origin", branch: str = "main") -> bool:
@@ -141,12 +226,9 @@ def get_cycle_history(repo: Path) -> List[Dict[str, Any]]:
 
     for tag in tags:
         tag = tag.strip()
-        if not tag:
+        if not tag or not _is_final_cycle_tag(tag):
             continue
-        try:
-            cycle_num = int(tag.replace("cycle-", ""))
-        except ValueError:
-            continue
+        cycle_num = int(FINAL_CYCLE_TAG_RE.fullmatch(tag).group(1))
 
         # Get commit info
         log_result = _git(repo, "log", "-1", "--format=%H%n%aI%n%s%n%b", tag, check=False)
@@ -181,8 +263,8 @@ def get_cycle_history(repo: Path) -> List[Dict[str, Any]]:
 
 def get_cycle_diff(repo: Path, cycle: int) -> str:
     """Get the unified diff for a specific cycle (vs previous cycle)."""
-    tag = f"cycle-{cycle}"
-    prev_tag = f"cycle-{cycle - 1}"
+    tag = cycle_tag(cycle)
+    prev_tag = cycle_tag(cycle - 1)
 
     # Check if previous tag exists
     check = _git(repo, "rev-parse", prev_tag, check=False)
@@ -198,7 +280,7 @@ def get_cycle_diff(repo: Path, cycle: int) -> str:
 
 def get_file_at_cycle(repo: Path, cycle: int, file_path: str) -> str:
     """Get file content at a specific cycle."""
-    tag = f"cycle-{cycle}"
+    tag = cycle_tag(cycle)
     result = _git(repo, "show", f"{tag}:{file_path}", check=False)
     return result.stdout if result.returncode == 0 else ""
 
@@ -229,19 +311,25 @@ def rewind_to_cycle(
     repo: Path,
     cycle: int,
     *,
+    stage: str = "reviewer",
     burst_user: str = "lagentworker",
 ) -> bool:
-    """Rewind the repo to a specific cycle.
+    """Rewind the repo to an exact committed checkpoint.
 
     This:
-    1. Checks out the cycle's tag
+    1. Resets hard to the exact committed checkpoint tag
+    2. Cleans the worktree completely
     2. Kills all agentapi servers
     3. Clears agent chat histories (prevents context poisoning)
-    4. Removes signal files
+    4. Deletes future cycle/checkpoint tags for destructive rewind semantics
 
     Returns True on success.
     """
-    tag = f"cycle-{cycle}"
+    try:
+        tag = _stage_ref(cycle, stage)
+    except ValueError as exc:
+        print(str(exc))
+        return False
 
     # Verify tag exists
     check = _git(repo, "rev-parse", tag, check=False)
@@ -254,10 +342,9 @@ def rewind_to_cycle(
     import time
     time.sleep(2)
 
-    # Checkout the tag (detached HEAD)
-    # First create a branch from it so we're not detached
-    branch_name = f"rewind-from-cycle-{cycle}"
-    _git(repo, "checkout", "-B", branch_name, tag)
+    # Exact restore from the committed checkpoint.
+    _git(repo, "reset", "--hard", tag)
+    _git(repo, "clean", "-fdx", timeout=120)
 
     # Clear agent chat histories to prevent context poisoning
     project_name = repo.name
@@ -284,14 +371,15 @@ def rewind_to_cycle(
             capture_output=True, timeout=10,
         )
 
-    # Remove signal files
-    for f in ["pause", "human_approve.json", "human_feedback.json"]:
-        (repo / ".agent-supervisor" / f).unlink(missing_ok=True)
-    for f in ["worker_handoff.json", "reviewer_decision.json",
-              "correspondence_result.json", "nl_proof_result.json"]:
-        (repo / f).unlink(missing_ok=True)
+    # Delete future cycle/checkpoint tags so replay semantics stay exact.
+    tags_result = _git(repo, "tag", "-l", "cycle-*", check=False)
+    if tags_result.returncode == 0:
+        target_key = _cycle_tag_sort_key(tag)
+        for existing in [t.strip() for t in tags_result.stdout.splitlines() if t.strip()]:
+            if _cycle_tag_sort_key(existing) > target_key:
+                _git(repo, "tag", "-d", existing, check=False)
 
-    print(f"Rewound to cycle {cycle} on branch {branch_name}")
+    print(f"Rewound to {tag}")
     print(f"  Agent sessions cleared for {burst_user}")
     return True
 
@@ -301,8 +389,8 @@ def current_cycle_from_git(repo: Path) -> int:
     result = _git(repo, "tag", "-l", "cycle-*", "--sort=-version:refname", check=False)
     if result.returncode != 0 or not result.stdout.strip():
         return 0
-    first_tag = result.stdout.strip().split("\n")[0].strip()
-    try:
-        return int(first_tag.replace("cycle-", ""))
-    except ValueError:
-        return 0
+    for tag in [t.strip() for t in result.stdout.splitlines() if t.strip()]:
+        match = FINAL_CYCLE_TAG_RE.fullmatch(tag)
+        if match:
+            return int(match.group(1))
+    return 0

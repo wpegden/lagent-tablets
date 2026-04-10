@@ -26,6 +26,8 @@ You must NOT:
 If you believe this node genuinely needs new helpers or structural changes that you cannot accomplish within these constraints, write the raw handoff file with status `STUCK` and explain why. The supervisor will elevate the node to "hard" mode where refactoring is allowed.
 
 MANDATORY BEFORE SUBMITTING: Run the self-check and fix any errors:
+  {proof_scope_check_command}
+  {proof_worker_delta_check_command}
   python3 {check_script} node {node_name} {repo_path}
 You MUST iterate until the checker reports all deterministic node checks pass before writing the handoff.
 

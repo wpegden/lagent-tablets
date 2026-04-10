@@ -395,12 +395,15 @@ def validate_tex_format(tex_content: str, *, is_preamble: bool = False) -> List[
     errors = []
 
     if is_preamble:
-        # Preamble: zero or more proposition environments, no proof
+        # Preamble: zero or more proposition/definition environments, no proof
         if TEX_PROOF_BEGIN_RE.search(tex_content):
             errors.append("Preamble .tex must not contain \\begin{proof}")
-        for env in TEX_STATEMENT_ENVS - {"proposition"}:
+        for env in TEX_STATEMENT_ENVS - {"proposition", "definition"}:
             if re.search(r"\\begin\{" + env + r"\}", tex_content):
-                errors.append(f"Preamble .tex should only use proposition environment, found {env}")
+                errors.append(
+                    "Preamble .tex should only use proposition/definition environments, "
+                    f"found {env}"
+                )
         return errors
 
     # Regular node: exactly one statement env, exactly one proof env (if open)

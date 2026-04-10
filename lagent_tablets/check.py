@@ -28,6 +28,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
+from lagent_tablets.nl_cache import correspondence_fingerprint
+
 
 # ---------------------------------------------------------------------------
 # Comment/string masking (for accurate keyword scanning)
@@ -84,11 +86,16 @@ DEFAULT_APPROVED_AXIOMS: Tuple[str, ...] = (
     "Classical.choice",
     "Quot.sound",
 )
-WORKER_STATUSES: Tuple[str, ...] = ("NOT_STUCK", "STUCK", "DONE", "NEED_INPUT")
+WORKER_STATUSES: Tuple[str, ...] = ("NOT_STUCK", "STUCK", "DONE", "NEED_INPUT", "CRISIS")
 PROOF_REVIEWER_DECISIONS: Tuple[str, ...] = (
     "CONTINUE",
     "ADVANCE_PHASE",
     "STUCK",
+    "NEED_INPUT",
+    "DONE",
+)
+CLEANUP_REVIEWER_DECISIONS: Tuple[str, ...] = (
+    "CONTINUE",
     "NEED_INPUT",
     "DONE",
 )
@@ -128,6 +135,25 @@ def find_declaration(content: str, node_name: str) -> Optional[str]:
     if decl_lines:
         return " ".join(decl_lines)
     return None
+
+
+def declaration_kind(content: str, node_name: str) -> str:
+    """Return a coarse declaration kind for one node name."""
+    for line in content.splitlines():
+        match = LEAN_DECL_RE.match(line.strip())
+        if match and match.group(2) == node_name:
+            raw = match.group(1).strip()
+            if "def" in raw or raw == "abbrev":
+                return "definition"
+            return "theorem_like"
+    return ""
+
+
+def tex_statement_environment(tex_content: str) -> str:
+    match = re.search(r"\\begin\{([A-Za-z*]+)\}", tex_content)
+    if not match:
+        return ""
+    return match.group(1).strip().lower()
 
 
 def normalize_declaration(decl: str) -> str:
@@ -580,6 +606,8 @@ def validate_worker_handoff_data(data: Any, *, phase: str, repo: Optional[Path] 
     errors.extend(summary_errors + status_errors + new_nodes_errors)
     if status and status not in WORKER_STATUSES:
         errors.append(f"status must be one of {list(WORKER_STATUSES)}")
+    if phase != "theorem_stating" and status == "CRISIS":
+        errors.append("status CRISIS is only allowed in theorem_stating")
     normalized: Dict[str, Any] = {
         "summary": summary,
         "status": status,
@@ -630,9 +658,398 @@ def _tablet_check_known_nodes(repo: Path) -> Set[str]:
     return {n for n in names if n not in {"Preamble", "Axioms", "header"}}
 
 
+def _snapshot_tablet_dir(repo: Path) -> Dict[str, str]:
+    snapshot: Dict[str, str] = {}
+    tablet_dir = repo / "Tablet"
+    if not tablet_dir.exists():
+        return snapshot
+    for path in sorted(tablet_dir.iterdir()):
+        if path.is_file():
+            snapshot[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return snapshot
+
+
+def _detect_snapshot_changes(before: Dict[str, str], after: Dict[str, str]) -> Dict[str, List[str]]:
+    all_names = set(before) | set(after)
+    created: List[str] = []
+    modified: List[str] = []
+    deleted: List[str] = []
+    for name in sorted(all_names):
+        if name not in before:
+            created.append(name)
+        elif name not in after:
+            deleted.append(name)
+        elif before[name] != after[name]:
+            modified.append(name)
+    return {"created": created, "modified": modified, "deleted": deleted}
+
+
 def _tablet_error_owner(error: str, known_nodes: Set[str]) -> Optional[str]:
     prefix = error.split(":", 1)[0].strip()
     return prefix if prefix in known_nodes else None
+
+
+def _current_tablet_node_names(repo: Path) -> Set[str]:
+    tablet_dir = repo / "Tablet"
+    if not tablet_dir.exists():
+        return set()
+    lean_files = {p.stem for p in tablet_dir.glob("*.lean") if p.stem != "Preamble"}
+    tex_files = {p.stem for p in tablet_dir.glob("*.tex") if p.stem not in ("header", "Preamble")}
+    return lean_files | tex_files
+
+
+def _tablet_node_file_hash(repo: Path, name: str) -> str:
+    from lagent_tablets.tablet import node_lean_path, node_tex_path
+
+    h = hashlib.sha256()
+    lean_path = node_lean_path(repo, name)
+    tex_path = node_tex_path(repo, name)
+    h.update(lean_path.read_bytes() if lean_path.exists() else b"")
+    h.update(b"\0")
+    h.update(tex_path.read_bytes() if tex_path.exists() else b"")
+    return h.hexdigest()
+
+
+def changed_tablet_nodes_since_snapshot(repo: Path, before_hashes: Dict[str, str]) -> List[str]:
+    current_names = _current_tablet_node_names(repo)
+    all_names = set(before_hashes) | current_names
+    changed: List[str] = []
+    for name in sorted(all_names):
+        current_hash = _tablet_node_file_hash(repo, name) if name in current_names else ""
+        if before_hashes.get(name, "") != current_hash:
+            changed.append(name)
+    return changed
+
+
+def snapshot_tablet_node_hashes(repo: Path) -> Dict[str, str]:
+    return {
+        name: _tablet_node_file_hash(repo, name)
+        for name in sorted(_current_tablet_node_names(repo))
+    }
+
+
+def check_proof_easy_scope(
+    repo: Path,
+    *,
+    active_node: str,
+    snapshot_before: Dict[str, str],
+    imports_before: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    """Check easy-mode proof scope constraints against a pre-burst snapshot."""
+    from lagent_tablets.tablet import extract_imports, node_lean_path
+
+    after = _snapshot_tablet_dir(repo)
+    changes = _detect_snapshot_changes(snapshot_before, after)
+    active_lean = f"{active_node}.lean"
+    errors: List[str] = []
+    warnings: List[str] = []
+
+    if changes["deleted"]:
+        errors.append(f"Easy mode does not allow deleting files: {changes['deleted']}")
+
+    created_content_files = [
+        fname for fname in changes["created"]
+        if fname.endswith(".lean") or fname.endswith(".tex")
+    ]
+    if created_content_files:
+        errors.append(
+            f"Easy mode only allows editing `{active_lean}`. Created: {sorted(created_content_files)}"
+        )
+
+    unexpected_modified = [fname for fname in changes["modified"] if fname != active_lean]
+    if unexpected_modified:
+        errors.append(
+            f"Easy mode only allows editing `{active_lean}`. Modified: {sorted(unexpected_modified)}"
+        )
+
+    if imports_before is not None:
+        lean_path = node_lean_path(repo, active_node)
+        if lean_path.exists():
+            imports_after = extract_imports(lean_path.read_text(encoding="utf-8"))
+            if list(imports_after) != list(imports_before):
+                errors.append(
+                    "Easy-mode node cannot change imports. Only the active `.lean` proof body may change."
+                )
+
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "warnings": warnings,
+        "changes": changes,
+        "created_content_files": created_content_files,
+    }
+
+
+def check_proof_hard_scope(
+    repo: Path,
+    *,
+    active_node: str,
+    snapshot_before: Dict[str, str],
+) -> Dict[str, Any]:
+    """Check proof-formalization hard-mode scope constraints."""
+    after = _snapshot_tablet_dir(repo)
+    changes = _detect_snapshot_changes(snapshot_before, after)
+    supervisor_generated = {"INDEX.md", "README.md", "header.tex", "Tablet.lean"}
+    allowed_modified = {f"{active_node}.lean", f"{active_node}.tex", "Preamble.lean"} | supervisor_generated
+    errors: List[str] = []
+
+    if changes["deleted"]:
+        errors.append(f"Files were deleted (not allowed): {changes['deleted']}")
+
+    unexpected_modified = [f for f in changes["modified"] if f not in allowed_modified]
+    if unexpected_modified:
+        errors.append(
+            f"Unexpected files modified: {unexpected_modified}. "
+            f"Only {active_node}, Preamble.lean, and supervisor-generated support files may be modified."
+        )
+
+    return {"ok": not errors, "errors": errors, "warnings": [], "changes": changes}
+
+
+def check_proof_worker_delta(
+    repo: Path,
+    *,
+    active_node: str,
+    snapshot_before: Dict[str, str],
+    existing_nodes: Sequence[str],
+    expected_active_hash: str = "",
+    allowed_prefixes: List[str],
+    forbidden_keywords: List[str],
+    approved_axioms_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Canonical post-burst proof-worker validation for touched/new nodes.
+
+    This is the artifact-creating deterministic gate shared by workers and the
+    supervisor for proof_formalization. It validates the active node and any
+    newly created helper nodes, then summarizes created/closed progress.
+    """
+    from lagent_tablets.tablet import has_sorry, node_lean_path, node_tex_path
+
+    changes = _detect_snapshot_changes(snapshot_before, _snapshot_tablet_dir(repo))
+    active_lean = f"{active_node}.lean"
+    active_changed = active_lean in changes["modified"]
+    new_lean_files = [
+        fname.removesuffix(".lean")
+        for fname in changes["created"]
+        if fname.endswith(".lean")
+    ]
+    existing = set(str(name) for name in existing_nodes)
+
+    if not active_changed and not new_lean_files:
+        return {
+            "ok": True,
+            "outcome": "NO_PROGRESS",
+            "detail": "No files were changed.",
+            "nodes_closed": [],
+            "nodes_created": [],
+            "build_output": "",
+            "errors": [],
+            "warnings": [],
+        }
+
+    nodes_closed: List[str] = []
+    nodes_created: List[str] = []
+
+    if active_changed:
+        result = check_node(
+            repo,
+            active_node,
+            allowed_prefixes=allowed_prefixes,
+            forbidden_keywords=forbidden_keywords,
+            expected_hash=expected_active_hash,
+            approved_axioms_path=approved_axioms_path,
+        )
+        if result["errors"]:
+            return {
+                "ok": False,
+                "outcome": "INVALID",
+                "detail": result["errors"][0],
+                "nodes_closed": [],
+                "nodes_created": [],
+                "build_output": result.get("build_output", ""),
+                "errors": list(result["errors"]),
+                "warnings": list(result.get("warnings", [])),
+            }
+        if result["ok"]:
+            nodes_closed.append(active_node)
+
+    for name in new_lean_files:
+        if name in ("Preamble", "Axioms") or name in existing:
+            continue
+        if not is_valid_node_name(name):
+            return {
+                "ok": False,
+                "outcome": "INVALID",
+                "detail": f"Invalid node name: {name!r}",
+                "nodes_closed": [],
+                "nodes_created": [],
+                "build_output": "",
+                "errors": [f"Invalid node name: {name!r}"],
+                "warnings": [],
+            }
+        tex_path = node_tex_path(repo, name)
+        if not tex_path.exists():
+            return {
+                "ok": False,
+                "outcome": "INVALID",
+                "detail": f"New node {name} has .lean but no .tex file",
+                "nodes_closed": [],
+                "nodes_created": [],
+                "build_output": "",
+                "errors": [f"New node {name} has .lean but no .tex file"],
+                "warnings": [],
+            }
+        result = check_node(
+            repo,
+            name,
+            allowed_prefixes=allowed_prefixes,
+            forbidden_keywords=forbidden_keywords,
+            approved_axioms_path=approved_axioms_path,
+        )
+        if result["errors"]:
+            return {
+                "ok": False,
+                "outcome": "INVALID",
+                "detail": f"New node {name}: {result['errors'][0]}",
+                "nodes_closed": [],
+                "nodes_created": [],
+                "build_output": result.get("build_output", ""),
+                "errors": [f"New node {name}: {err}" for err in result["errors"]],
+                "warnings": list(result.get("warnings", [])),
+            }
+
+        if not has_sorry(node_lean_path(repo, name).read_text(encoding="utf-8")):
+            nodes_closed.append(name)
+        nodes_created.append(name)
+
+    parts: List[str] = []
+    if nodes_closed:
+        parts.append(f"closed: {nodes_closed}")
+    if nodes_created:
+        parts.append(f"created: {nodes_created}")
+    if active_changed and active_node not in nodes_closed:
+        parts.append(f"{active_node} modified (still open)")
+
+    if not parts:
+        return {
+            "ok": True,
+            "outcome": "NO_PROGRESS",
+            "detail": "No meaningful changes detected.",
+            "nodes_closed": [],
+            "nodes_created": [],
+            "build_output": "",
+            "errors": [],
+            "warnings": [],
+        }
+
+    return {
+        "ok": True,
+        "outcome": "PROGRESS",
+        "detail": "; ".join(parts),
+        "nodes_closed": nodes_closed,
+        "nodes_created": nodes_created,
+        "build_output": "",
+        "errors": [],
+        "warnings": [],
+    }
+
+
+def check_theorem_target_repair_scope(
+    repo: Path,
+    *,
+    target: str,
+    snapshot_before: Dict[str, str],
+) -> Dict[str, Any]:
+    """Check target-repair theorem-stating scope constraints."""
+    after = _snapshot_tablet_dir(repo)
+    changes = _detect_snapshot_changes(snapshot_before, after)
+    target_tex = f"{target}.tex"
+    supervisor_generated = {"INDEX.md", "README.md", "header.tex", "Tablet.lean"}
+    errors: List[str] = []
+
+    if changes["deleted"]:
+        errors.append(f"Theorem target repair mode does not allow deleting files: {changes['deleted']}")
+
+    created_content_files = [
+        fname for fname in changes["created"]
+        if fname.endswith(".lean") or fname.endswith(".tex")
+    ]
+    if created_content_files:
+        errors.append(
+            "Theorem target repair mode does not allow creating new node files. "
+            f"Created: {sorted(created_content_files)}"
+        )
+
+    unexpected_modified = [
+        fname for fname in changes["modified"]
+        if fname not in ({target_tex} | supervisor_generated)
+    ]
+    if unexpected_modified:
+        errors.append(
+            f"Theorem target repair mode only allows editing `{target_tex}`. "
+            f"Modified: {sorted(unexpected_modified)}"
+        )
+
+    return {"ok": not errors, "errors": errors, "warnings": [], "changes": changes}
+
+
+def check_theorem_target_edit_scope(
+    repo: Path,
+    *,
+    target: str,
+    before_hashes: Dict[str, str],
+    initial_scope: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    """Check target-restructure theorem-stating impact-region constraints."""
+    from lagent_tablets.tablet import compute_target_impact_region
+
+    if not target:
+        return {"ok": True, "errors": [], "warnings": [], "changed_nodes": [], "allowed_nodes": []}
+
+    final_names = _current_tablet_node_names(repo)
+    if target not in final_names:
+        return {
+            "ok": False,
+            "errors": [f"Current soundness target `{target}` must remain present in the tablet."],
+            "warnings": [],
+            "changed_nodes": [],
+            "allowed_nodes": [],
+        }
+
+    changed_nodes = changed_tablet_nodes_since_snapshot(repo, before_hashes)
+    if not changed_nodes:
+        return {"ok": True, "errors": [], "warnings": [], "changed_nodes": [], "allowed_nodes": []}
+
+    before_scope = set(str(name) for name in (initial_scope or []))
+    after_scope = compute_target_impact_region(repo, target)
+    allowed = before_scope | after_scope
+    out_of_scope = [name for name in changed_nodes if name not in allowed]
+    if not out_of_scope:
+        return {
+            "ok": True,
+            "errors": [],
+            "warnings": [],
+            "changed_nodes": changed_nodes,
+            "allowed_nodes": sorted(allowed),
+        }
+
+    allowed_preview = ", ".join(sorted(allowed)[:12])
+    if len(allowed) > 12:
+        allowed_preview += ", ..."
+    return {
+        "ok": False,
+        "errors": [
+            f"Out-of-scope theorem-stating edits for target `{target}`: "
+            f"{', '.join(out_of_scope)}. "
+            "When a current soundness target is set, changes must stay within that target's "
+            "authorized impact region (target, prerequisites, and downstream consumers, "
+            "before or after the cycle). "
+            f"Allowed scope: {allowed_preview or '(empty)'}.",
+        ],
+        "warnings": [],
+        "changed_nodes": changed_nodes,
+        "allowed_nodes": sorted(allowed),
+    }
 
 
 def check_tablet_scoped(
@@ -678,6 +1095,78 @@ def check_tablet_scoped(
     }
 
 
+def check_cleanup_preserving(
+    repo: Path,
+    *,
+    snapshot_before: Dict[str, str],
+    baseline_declaration_hashes: Dict[str, str],
+    baseline_correspondence_hashes: Dict[str, str],
+    allowed_prefixes: List[str],
+    forbidden_keywords: List[str],
+    approved_axioms_path: Optional[Path] = None,
+    timeout_secs: float = 300,
+) -> Dict[str, Any]:
+    """Validate a style-cleanup cycle is semantics-preserving.
+
+    Cleanup is intentionally strict:
+    - no new or deleted Tablet files
+    - no `.tex` edits
+    - any changed `.lean` node must preserve declaration hash and correspondence fingerprint
+    - the full tablet must still pass canonical deterministic checks
+    """
+    after = _snapshot_tablet_dir(repo)
+    changes = _detect_snapshot_changes(snapshot_before, after)
+    errors: List[str] = []
+    warnings: List[str] = []
+
+    if changes["created"]:
+        errors.append(f"cleanup may not create Tablet files: {changes['created']}")
+    if changes["deleted"]:
+        errors.append(f"cleanup may not delete Tablet files: {changes['deleted']}")
+
+    tex_modified = [name for name in changes["modified"] if name.endswith(".tex")]
+    if tex_modified:
+        errors.append(f"cleanup may not modify .tex files: {tex_modified}")
+
+    changed_nodes = sorted(
+        {
+            Path(name).stem
+            for name in changes["modified"]
+            if name.endswith(".lean") and Path(name).stem not in {"Preamble", "Axioms"}
+        }
+    )
+
+    full = check_tablet(
+        repo,
+        allowed_prefixes=allowed_prefixes,
+        forbidden_keywords=forbidden_keywords,
+        approved_axioms_path=approved_axioms_path,
+        timeout_secs=timeout_secs,
+    )
+    errors.extend(full["errors"])
+    warnings.extend(full["warnings"])
+
+    for node_name in changed_nodes:
+        baseline_decl = str(baseline_declaration_hashes.get(node_name, "") or "")
+        current_decl = declaration_hash((repo / "Tablet" / f"{node_name}.lean").read_text(encoding="utf-8"), node_name)
+        if baseline_decl and current_decl != baseline_decl:
+            errors.append(f"{node_name}: declaration hash changed during cleanup")
+
+        baseline_corr = str(baseline_correspondence_hashes.get(node_name, "") or "")
+        current_corr = correspondence_fingerprint(repo, node_name)
+        if baseline_corr and current_corr != baseline_corr:
+            errors.append(f"{node_name}: correspondence fingerprint changed during cleanup")
+
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "warnings": warnings,
+        "changes": changes,
+        "changed_nodes": changed_nodes,
+        "build_output": full.get("build_output", ""),
+    }
+
+
 def validate_reviewer_decision_data(data: Any, *, phase: str) -> Dict[str, Any]:
     from lagent_tablets.state import (
         normalize_open_blockers,
@@ -697,6 +1186,8 @@ def validate_reviewer_decision_data(data: Any, *, phase: str) -> Dict[str, Any]:
 
     if phase == "proof_formalization":
         allowed_decisions = PROOF_REVIEWER_DECISIONS
+    elif phase == "proof_complete_style_cleanup":
+        allowed_decisions = CLEANUP_REVIEWER_DECISIONS
     elif phase == "theorem_stating":
         allowed_decisions = THEOREM_REVIEWER_DECISIONS
     else:
@@ -730,6 +1221,9 @@ def validate_reviewer_decision_data(data: Any, *, phase: str) -> Dict[str, Any]:
         errors.extend(diff_errors + elevate_errors)
         normalized["difficulty_assignments"] = difficulty_assignments
         normalized["elevate_to_hard"] = elevate_to_hard
+    elif phase == "proof_complete_style_cleanup":
+        normalized["difficulty_assignments"] = {}
+        normalized["elevate_to_hard"] = []
     else:
         issues, issues_errors = _expect_string_list(data.get("issues", []), "issues")
         kind_assignments, kind_errors = _normalize_string_dict(
@@ -852,6 +1346,11 @@ def check_tablet(
         preamble_import_violations = check_imports(preamble_content, allowed_prefixes)
         if preamble_import_violations:
             errors.append(f"Preamble has unauthorized imports: {preamble_import_violations}")
+    preamble_tex = tablet_dir / "Preamble.tex"
+    if preamble_tex.exists():
+        tex_errors = validate_tex_format(preamble_tex.read_text(encoding="utf-8"), is_preamble=True)
+        if tex_errors:
+            errors.append(f"Preamble: .tex format errors: {tex_errors}")
 
     for lean_path in sorted(tablet_dir.glob("*.lean")):
         name = lean_path.stem
@@ -946,6 +1445,7 @@ def check_node(
     marker_valid = True
     declaration_name_matches = True
     tex_format_valid = True
+    declaration_role_warning = ""
 
     # File existence
     if not lean_path.exists():
@@ -996,6 +1496,21 @@ def check_node(
         if tex_errors:
             tex_format_valid = False
             errors.append(f".tex format errors: {tex_errors}")
+        else:
+            decl_kind = declaration_kind(content, name)
+            tex_env = tex_statement_environment(tex_content)
+            if decl_kind == "definition" and tex_env and tex_env != "definition":
+                declaration_role_warning = (
+                    f"Lean declaration is a definition but .tex uses {tex_env}; "
+                    "paper-facing concepts should be modeled as definition nodes."
+                )
+            elif decl_kind == "theorem_like" and tex_env == "definition":
+                declaration_role_warning = (
+                    "The .tex statement uses definition but the Lean declaration is theorem-like; "
+                    "do not use theorem/lemma nodes as disguised definitions."
+                )
+            if declaration_role_warning:
+                warnings.append(declaration_role_warning)
 
     # Forbidden keywords
     forbidden_hits = scan_forbidden(content, forbidden_keywords)
@@ -1252,6 +1767,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "node",
         "tablet",
         "tablet-scoped",
+        "cleanup-preserving",
+        "proof-easy-scope",
+        "proof-hard-scope",
+        "proof-worker-delta",
+        "theorem-target-repair-scope",
+        "theorem-target-edit-scope",
         "worker-handoff",
         "reviewer-decision",
         "correspondence-result",
@@ -1279,14 +1800,56 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     tablet_scoped_parser.add_argument("repo_path", nargs="?", default=".")
     tablet_scoped_parser.add_argument("--scope-json", required=True)
 
+    cleanup_parser = subparsers.add_parser(
+        "cleanup-preserving",
+        help="Check that cleanup edits are semantics-preserving",
+    )
+    cleanup_parser.add_argument("repo_path", nargs="?", default=".")
+    cleanup_parser.add_argument("--scope-json", required=True)
+
+    easy_scope_parser = subparsers.add_parser(
+        "proof-easy-scope",
+        help="Check easy-mode proof worker scope constraints",
+    )
+    easy_scope_parser.add_argument("repo_path", nargs="?", default=".")
+    easy_scope_parser.add_argument("--scope-json", required=True)
+
+    hard_scope_parser = subparsers.add_parser(
+        "proof-hard-scope",
+        help="Check hard-mode proof worker scope constraints",
+    )
+    hard_scope_parser.add_argument("repo_path", nargs="?", default=".")
+    hard_scope_parser.add_argument("--scope-json", required=True)
+
+    proof_delta_parser = subparsers.add_parser(
+        "proof-worker-delta",
+        help="Check active-node/new-node deterministic proof worker validation",
+    )
+    proof_delta_parser.add_argument("repo_path", nargs="?", default=".")
+    proof_delta_parser.add_argument("--scope-json", required=True)
+
+    theorem_repair_parser = subparsers.add_parser(
+        "theorem-target-repair-scope",
+        help="Check theorem-stating target-repair scope constraints",
+    )
+    theorem_repair_parser.add_argument("repo_path", nargs="?", default=".")
+    theorem_repair_parser.add_argument("--scope-json", required=True)
+
+    theorem_edit_parser = subparsers.add_parser(
+        "theorem-target-edit-scope",
+        help="Check theorem-stating target impact-region scope constraints",
+    )
+    theorem_edit_parser.add_argument("repo_path", nargs="?", default=".")
+    theorem_edit_parser.add_argument("--scope-json", required=True)
+
     handoff_parser = subparsers.add_parser("worker-handoff", help="Validate a worker handoff raw JSON file")
     handoff_parser.add_argument("path")
-    handoff_parser.add_argument("--phase", required=True, choices=["proof_formalization", "theorem_stating"])
+    handoff_parser.add_argument("--phase", required=True, choices=["proof_formalization", "proof_complete_style_cleanup", "theorem_stating"])
     handoff_parser.add_argument("--repo", default=".")
 
     reviewer_parser = subparsers.add_parser("reviewer-decision", help="Validate a reviewer decision raw JSON file")
     reviewer_parser.add_argument("path")
-    reviewer_parser.add_argument("--phase", required=True, choices=["proof_formalization", "theorem_stating"])
+    reviewer_parser.add_argument("--phase", required=True, choices=["proof_formalization", "proof_complete_style_cleanup", "theorem_stating"])
 
     corr_parser = subparsers.add_parser("correspondence-result", help="Validate a correspondence raw JSON file")
     corr_parser.add_argument("path")
@@ -1388,6 +1951,144 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"WARNING: {warn}")
         if result["ok"]:
             print("OK: no new relevant deterministic errors in scoped region")
+            return 0
+        return 1
+
+    if args.command == "cleanup-preserving":
+        repo = Path(args.repo_path).resolve()
+        scope_path = Path(args.scope_json).resolve()
+        allowed_prefixes, forbidden_keywords, approved_axioms_path = _default_check_context(repo)
+        try:
+            scope = json.loads(scope_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"FAIL: could not read scope json {scope_path}: {exc}")
+            return 1
+        print(f"=== Checking cleanup preservation: {repo} ===")
+        result = check_cleanup_preserving(
+            repo,
+            snapshot_before=dict(scope.get("snapshot_before", {})),
+            baseline_declaration_hashes=dict(scope.get("baseline_declaration_hashes", {})),
+            baseline_correspondence_hashes=dict(scope.get("baseline_correspondence_hashes", {})),
+            allowed_prefixes=allowed_prefixes,
+            forbidden_keywords=forbidden_keywords,
+            approved_axioms_path=approved_axioms_path,
+        )
+        for err in result["errors"]:
+            print(f"FAIL: {err}")
+        for warn in result["warnings"]:
+            print(f"WARNING: {warn}")
+        if result["ok"]:
+            print("OK: cleanup edits preserved tablet semantics")
+            return 0
+        return 1
+
+    if args.command == "proof-easy-scope":
+        repo = Path(args.repo_path).resolve()
+        scope_path = Path(args.scope_json).resolve()
+        try:
+            scope = json.loads(scope_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"FAIL: could not read scope json {scope_path}: {exc}")
+            return 1
+        result = check_proof_easy_scope(
+            repo,
+            active_node=str(scope.get("active_node", "") or "").strip(),
+            snapshot_before=dict(scope.get("snapshot_before", {})),
+            imports_before=list(scope.get("imports_before", [])),
+        )
+        for err in result["errors"]:
+            print(f"FAIL: {err}")
+        if result["ok"]:
+            print("OK: easy-mode proof scope respected")
+            return 0
+        return 1
+
+    if args.command == "proof-hard-scope":
+        repo = Path(args.repo_path).resolve()
+        scope_path = Path(args.scope_json).resolve()
+        try:
+            scope = json.loads(scope_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"FAIL: could not read scope json {scope_path}: {exc}")
+            return 1
+        result = check_proof_hard_scope(
+            repo,
+            active_node=str(scope.get("active_node", "") or "").strip(),
+            snapshot_before=dict(scope.get("snapshot_before", {})),
+        )
+        for err in result["errors"]:
+            print(f"FAIL: {err}")
+        if result["ok"]:
+            print("OK: hard-mode proof scope respected")
+            return 0
+        return 1
+
+    if args.command == "proof-worker-delta":
+        repo = Path(args.repo_path).resolve()
+        scope_path = Path(args.scope_json).resolve()
+        allowed_prefixes, forbidden_keywords, approved_axioms_path = _default_check_context(repo)
+        try:
+            scope = json.loads(scope_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"FAIL: could not read scope json {scope_path}: {exc}")
+            return 1
+        result = check_proof_worker_delta(
+            repo,
+            active_node=str(scope.get("active_node", "") or "").strip(),
+            snapshot_before=dict(scope.get("snapshot_before", {})),
+            existing_nodes=list(scope.get("existing_nodes", [])),
+            expected_active_hash=str(scope.get("expected_active_hash", "") or ""),
+            allowed_prefixes=allowed_prefixes,
+            forbidden_keywords=forbidden_keywords,
+            approved_axioms_path=approved_axioms_path,
+        )
+        for err in result["errors"]:
+            print(f"FAIL: {err}")
+        for warn in result.get("warnings", []):
+            print(f"WARNING: {warn}")
+        if result["ok"]:
+            print(f"OK: {result['outcome']} -- {result['detail']}")
+            return 0
+        return 1
+
+    if args.command == "theorem-target-repair-scope":
+        repo = Path(args.repo_path).resolve()
+        scope_path = Path(args.scope_json).resolve()
+        try:
+            scope = json.loads(scope_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"FAIL: could not read scope json {scope_path}: {exc}")
+            return 1
+        result = check_theorem_target_repair_scope(
+            repo,
+            target=str(scope.get("target", "") or "").strip(),
+            snapshot_before=dict(scope.get("snapshot_before", {})),
+        )
+        for err in result["errors"]:
+            print(f"FAIL: {err}")
+        if result["ok"]:
+            print("OK: theorem target repair scope respected")
+            return 0
+        return 1
+
+    if args.command == "theorem-target-edit-scope":
+        repo = Path(args.repo_path).resolve()
+        scope_path = Path(args.scope_json).resolve()
+        try:
+            scope = json.loads(scope_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"FAIL: could not read scope json {scope_path}: {exc}")
+            return 1
+        result = check_theorem_target_edit_scope(
+            repo,
+            target=str(scope.get("target", "") or "").strip(),
+            before_hashes=dict(scope.get("before_hashes", {})),
+            initial_scope=list(scope.get("initial_scope", [])),
+        )
+        for err in result["errors"]:
+            print(f"FAIL: {err}")
+        if result["ok"]:
+            print("OK: theorem target edit scope respected")
             return 0
         return 1
 

@@ -628,6 +628,73 @@ def _scoped_tablet_check_command(
     return f"python3 {check_script} tablet {config.repo_path}"
 
 
+def _cleanup_check_command(
+    config: Config,
+    cleanup_check_payload_path: Optional[Path],
+) -> str:
+    check_script = _check_script_path(config)
+    if cleanup_check_payload_path:
+        return (
+            f"python3 {check_script} cleanup-preserving {config.repo_path} "
+            f"--scope-json {cleanup_check_payload_path}"
+        )
+    return f"python3 {check_script} tablet {config.repo_path}"
+
+
+def _proof_scope_check_command(
+    config: Config,
+    difficulty: str,
+    proof_scope_check_payload_path: Optional[Path],
+) -> str:
+    check_script = _check_script_path(config)
+    command = "proof-easy-scope" if difficulty == "easy" else "proof-hard-scope"
+    if proof_scope_check_payload_path:
+        return (
+            f"python3 {check_script} {command} {config.repo_path} "
+            f"--scope-json {proof_scope_check_payload_path}"
+        )
+    return f"python3 {check_script} tablet {config.repo_path}"
+
+
+def _proof_worker_delta_check_command(
+    config: Config,
+    proof_scope_check_payload_path: Optional[Path],
+) -> str:
+    check_script = _check_script_path(config)
+    if proof_scope_check_payload_path:
+        return (
+            f"python3 {check_script} proof-worker-delta {config.repo_path} "
+            f"--scope-json {proof_scope_check_payload_path}"
+        )
+    return f"python3 {check_script} tablet {config.repo_path}"
+
+
+def _theorem_target_repair_scope_check_command(
+    config: Config,
+    repair_scope_check_payload_path: Optional[Path],
+) -> str:
+    check_script = _check_script_path(config)
+    if repair_scope_check_payload_path:
+        return (
+            f"python3 {check_script} theorem-target-repair-scope {config.repo_path} "
+            f"--scope-json {repair_scope_check_payload_path}"
+        )
+    return f"python3 {check_script} tablet {config.repo_path}"
+
+
+def _theorem_target_edit_scope_check_command(
+    config: Config,
+    edit_scope_check_payload_path: Optional[Path],
+) -> str:
+    check_script = _check_script_path(config)
+    if edit_scope_check_payload_path:
+        return (
+            f"python3 {check_script} theorem-target-edit-scope {config.repo_path} "
+            f"--scope-json {edit_scope_check_payload_path}"
+        )
+    return f"python3 {check_script} tablet {config.repo_path}"
+
+
 # ---------------------------------------------------------------------------
 # Worker prompt
 # ---------------------------------------------------------------------------
@@ -640,16 +707,24 @@ def build_worker_prompt(
     *,
     previous_outcome: Optional[Dict[str, Any]] = None,
     difficulty: str = "hard",
+    cleanup_check_payload_path: Optional[Path] = None,
+    proof_scope_check_payload_path: Optional[Path] = None,
 ) -> str:
     """Build the complete worker prompt."""
     node_name = state.active_node or tablet.active_node
     repo_path = config.repo_path
+    cleanup_mode = state.phase == "proof_complete_style_cleanup"
 
     sections = []
 
     # 1. Basic model + role
     sections.append(_load_template("basic_model.md"))
-    if difficulty == "easy":
+    if cleanup_mode:
+        sections.append(
+            "YOUR ROLE: **Worker** (proof_complete_style_cleanup phase). "
+            "The tablet is already complete. Your job is semantics-preserving polish only.\n"
+        )
+    elif difficulty == "easy":
         sections.append(f"YOUR ROLE: **Worker** (proof_formalization phase, EASY node). You are proving `{node_name}` using ONLY its existing children. No new imports, no new files.\n")
     else:
         sections.append("YOUR ROLE: **Worker** (proof_formalization phase). You are eliminating `sorry` from one node at a time. You do not decide which node to work on -- the reviewer assigns your node.\n")
@@ -699,11 +774,24 @@ def build_worker_prompt(
     # Skill file reference
     skill_path = _skill_path(repo_path, "PROOF_FORMALIZATION_WORKER.md")
 
-    template_name = "easy_worker_instructions.md" if difficulty == "easy" else "worker_instructions.md"
+    if cleanup_mode:
+        template_name = "cleanup_worker_instructions.md"
+    else:
+        template_name = "easy_worker_instructions.md" if difficulty == "easy" else "worker_instructions.md"
     instructions = _load_template(template_name).format(
         node_name=node_name,
         skill_path=skill_path,
         repo_path=repo_path,
+        cleanup_check_command=_cleanup_check_command(config, cleanup_check_payload_path),
+        proof_scope_check_command=_proof_scope_check_command(
+            config,
+            difficulty,
+            proof_scope_check_payload_path,
+        ),
+        proof_worker_delta_check_command=_proof_worker_delta_check_command(
+            config,
+            proof_scope_check_payload_path,
+        ),
         **worker_handoff_artifacts,
     )
     sections.append(instructions)
@@ -728,6 +816,8 @@ def build_theorem_stating_prompt(
     previous_outcome: Optional[Dict[str, Any]] = None,
     authorized_region: Optional[List[str]] = None,
     scoped_tablet_check_payload_path: Optional[Path] = None,
+    repair_scope_check_payload_path: Optional[Path] = None,
+    edit_scope_check_payload_path: Optional[Path] = None,
 ) -> str:
     """Build the worker prompt for the theorem_stating phase.
 
@@ -820,6 +910,14 @@ def build_theorem_stating_prompt(
         repo_path=repo_path,
         target=target,
         authorized_region_note=_authorized_region_note(authorized_region),
+        target_repair_scope_check_command=_theorem_target_repair_scope_check_command(
+            config,
+            repair_scope_check_payload_path,
+        ),
+        target_edit_scope_check_command=_theorem_target_edit_scope_check_command(
+            config,
+            edit_scope_check_payload_path,
+        ),
         scoped_tablet_check_command=_scoped_tablet_check_command(
             config, scoped_tablet_check_payload_path,
         ),
@@ -894,6 +992,12 @@ def build_theorem_stating_reviewer_prompt(
     # Worker handoff
     if worker_handoff:
         sections.append(f"--- WORKER HANDOFF ---\n{json.dumps(worker_handoff, indent=2)}\n")
+        if str(worker_handoff.get("status", "")).strip().upper() == "CRISIS":
+            sections.append(
+                "--- CRISIS ESCALATION ---\n"
+                "The worker is reporting a likely fundamental gap in the source paper, not an ordinary local repair issue.\n"
+                "If you agree, choose `NEED_INPUT` and explain the gap crisply for the human reviewer.\n"
+            )
 
     # Worker output
     if worker_output:
@@ -996,9 +1100,16 @@ def build_reviewer_prompt(
 ) -> str:
     """Build the complete reviewer prompt."""
     sections = []
+    cleanup_mode = state.phase == "proof_complete_style_cleanup"
 
     sections.append(_load_template("basic_model.md"))
-    sections.append("YOUR ROLE: **Reviewer** (proof_formalization phase). You evaluate the worker's proof attempts, choose which node to assign next, and provide specific mathematical guidance. You are the final arbiter on NL verification disputes.\n")
+    if cleanup_mode:
+        sections.append(
+            "YOUR ROLE: **Reviewer** (proof_complete_style_cleanup phase). "
+            "The tablet is already complete. Evaluate cleanup attempts only for semantics-preserving polish and either continue cleanup or stop successfully.\n"
+        )
+    else:
+        sections.append("YOUR ROLE: **Reviewer** (proof_formalization phase). You evaluate the worker's proof attempts, choose which node to assign next, and provide specific mathematical guidance. You are the final arbiter on NL verification disputes.\n")
     goal_text = _read_file(config.goal_file)
     if goal_text.strip():
         sections.append(f"GOAL:\n{goal_text}\n")
@@ -1128,9 +1239,10 @@ def build_reviewer_prompt(
     skill_path = _skill_path(config.repo_path, "PROOF_FORMALIZATION_REVIEWER.md")
 
     # Instructions
-    instructions = _load_template("reviewer_instructions.md").format(
+    reviewer_template = "cleanup_reviewer_instructions.md" if cleanup_mode else "reviewer_instructions.md"
+    instructions = _load_template(reviewer_template).format(
         skill_path=skill_path,
-        phase="proof_formalization",
+        phase="proof_complete_style_cleanup" if cleanup_mode else "proof_formalization",
         **_artifact_prompt_values(config, "reviewer_decision.json"),
     )
     sections.append(instructions)

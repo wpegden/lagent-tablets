@@ -40,6 +40,14 @@ WORKER_ELAN_HOME = "/home/leanagent/.elan"
 PORT_MAP = {"worker": 3284, "reviewer": 3285, "verification": 3286}
 
 
+def _server_log_path(work_dir: Path, role: str, port: int) -> Path:
+    return work_dir / ".agent-supervisor" / "logs" / f"agentapi-{role}-{port}.log"
+
+
+def _session_meta_path(work_dir: Path, role: str, port: int) -> Path:
+    return work_dir / ".agent-supervisor" / "logs" / f"agentapi-{role}-{port}.json"
+
+
 def _agent_env(burst_user: Optional[str]) -> str:
     """Build the env vars string for sudo."""
     parts = [f"PATH={shlex.quote(WORKER_PATH)}"]
@@ -73,6 +81,38 @@ def _agent_command(config: ProviderConfig) -> List[str]:
         return cmd
 
     raise ValueError(f"agentapi backend does not support provider: {config.provider}")
+
+
+def _session_identity(config: ProviderConfig) -> Dict[str, Any]:
+    return {
+        "provider": config.provider,
+        "model": config.model or "",
+        "effort": config.effort or "",
+        "extra_args": list(config.extra_args or []),
+    }
+
+
+def _load_session_identity(work_dir: Path, role: str, port: int) -> Optional[Dict[str, Any]]:
+    path = _session_meta_path(work_dir, role, port)
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _store_session_identity(
+    work_dir: Path,
+    role: str,
+    port: int,
+    config: ProviderConfig,
+) -> None:
+    path = _session_meta_path(work_dir, role, port)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(_session_identity(config), indent=2), encoding="utf-8")
+    try:
+        path.chmod(0o644)
+    except OSError:
+        pass
 
 
 def _is_server_running(port: int) -> bool:
@@ -134,7 +174,7 @@ def _launch_server(
     cmd.extend(agent_cmd)
 
     # Launch detached
-    log_path = work_dir / ".agent-supervisor" / "logs" / f"agentapi-{role}-{port}.log"
+    log_path = _server_log_path(work_dir, role, port)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"  Starting agentapi: {' '.join(cmd[:6])}... (log: {log_path})")
@@ -158,6 +198,7 @@ def _launch_server(
         if _is_server_running(port):
             # Give the agent a moment to render its initial screen
             time.sleep(5)
+            _store_session_identity(work_dir, role, port, config)
             return
         # Check if process exited (crashed on startup)
         ret = proc.poll()
@@ -194,6 +235,7 @@ def ensure_server(
     if port is None:
         port = PORT_MAP.get(role, 3284)
 
+    desired_identity = _session_identity(config)
     if _is_server_running(port):
         # Check that the running server matches the expected provider
         try:
@@ -207,7 +249,30 @@ def ensure_server(
                 stop_server(port)
                 time.sleep(1)
             else:
-                return port
+                saved_identity = _load_session_identity(work_dir, role, port)
+                if saved_identity is None:
+                    print(f"  Missing session identity on port {port}; restarting to avoid stale config reuse.")
+                    stop_server(port)
+                    time.sleep(1)
+                elif saved_identity == desired_identity:
+                    return port
+                else:
+                    gemini_model_only = (
+                        config.provider == "gemini"
+                        and saved_identity.get("provider") == desired_identity.get("provider")
+                        and saved_identity.get("effort", "") == desired_identity.get("effort", "")
+                        and list(saved_identity.get("extra_args", [])) == desired_identity.get("extra_args", [])
+                        and saved_identity.get("model", "") != desired_identity.get("model", "")
+                    )
+                    if gemini_model_only and switch_model(port, desired_identity.get("model", "")):
+                        _store_session_identity(work_dir, role, port, config)
+                        return port
+                    print(
+                        f"  Session config mismatch on port {port}; restarting "
+                        f"(have={saved_identity}, want={desired_identity})."
+                    )
+                    stop_server(port)
+                    time.sleep(1)
         except Exception:
             pass
 
@@ -749,7 +814,7 @@ def run(
                 output = transcript_err
         # Also check the agentapi process stderr/log for the error
         if not output:
-            log_path = work_dir / ".agent-supervisor" / "logs" / "agentapi-reviewer.log"
+            log_path = _server_log_path(work_dir, role, port)
             if log_path.exists():
                 try:
                     log_tail = log_path.read_text(encoding="utf-8", errors="replace")[-2000:]

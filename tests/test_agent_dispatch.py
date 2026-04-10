@@ -460,6 +460,93 @@ class TestFullConfigLoad(unittest.TestCase):
         self.assertEqual(codex_sound.effort, "xhigh")
 
 
+class TestAgentapiSessionIdentity(unittest.TestCase):
+    def test_ensure_server_restarts_on_model_mismatch(self):
+        from lagent_tablets.agents import agentapi_backend as backend
+
+        tmpdir = Path(tempfile.mkdtemp())
+        config = ProviderConfig(provider="claude", model="new-model")
+
+        class _Resp:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def read(self):
+                return json.dumps(self._payload).encode("utf-8")
+
+        with patch.object(backend, "_is_server_running", return_value=True), \
+             patch("urllib.request.urlopen", return_value=_Resp({"agent_type": "claude"})), \
+             patch.object(backend, "_load_session_identity", return_value={
+                 "provider": "claude", "model": "old-model", "effort": "", "extra_args": [],
+             }), \
+             patch.object(backend, "switch_model", return_value=False) as mock_switch, \
+             patch.object(backend, "stop_server") as mock_stop, \
+             patch.object(backend, "_launch_server") as mock_launch:
+            port = backend.ensure_server(config, role="worker", work_dir=tmpdir, port=3284)
+            self.assertEqual(port, 3284)
+            mock_switch.assert_not_called()
+            mock_stop.assert_called_once_with(3284)
+            mock_launch.assert_called_once()
+
+    def test_ensure_server_gemini_switches_model_in_place(self):
+        from lagent_tablets.agents import agentapi_backend as backend
+
+        tmpdir = Path(tempfile.mkdtemp())
+        config = ProviderConfig(provider="gemini", model="gemini-2.5-pro")
+
+        class _Resp:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def read(self):
+                return json.dumps(self._payload).encode("utf-8")
+
+        with patch.object(backend, "_is_server_running", return_value=True), \
+             patch("urllib.request.urlopen", return_value=_Resp({"agent_type": "gemini"})), \
+             patch.object(backend, "_load_session_identity", return_value={
+                 "provider": "gemini", "model": "gemini-2.5-flash", "effort": "", "extra_args": [],
+             }), \
+             patch.object(backend, "switch_model", return_value=True) as mock_switch, \
+             patch.object(backend, "_store_session_identity") as mock_store, \
+             patch.object(backend, "stop_server") as mock_stop, \
+             patch.object(backend, "_launch_server") as mock_launch:
+            port = backend.ensure_server(config, role="reviewer", work_dir=tmpdir, port=3285)
+            self.assertEqual(port, 3285)
+            mock_switch.assert_called_once_with(3285, "gemini-2.5-pro")
+            mock_store.assert_called_once()
+            mock_stop.assert_not_called()
+            mock_launch.assert_not_called()
+
+    def test_run_uses_role_and_port_specific_log_on_send_failure(self):
+        from lagent_tablets.agents import agentapi_backend as backend
+
+        tmpdir = Path(tempfile.mkdtemp())
+        logs = tmpdir / ".agent-supervisor" / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        role = "worker"
+        port = 3284
+        log_path = logs / f"agentapi-{role}-{port}.log"
+        log_path.write_text("429 capacity exceeded", encoding="utf-8")
+
+        config = ProviderConfig(provider="claude", model="claude-sonnet")
+
+        class _Resp:
+            def read(self):
+                return json.dumps({"status": "running"}).encode("utf-8")
+
+        with patch.object(backend, "ensure_server", return_value=port), \
+             patch.object(backend, "handle_dialogs"), \
+             patch.object(backend, "send_message", return_value=False), \
+             patch.object(backend, "get_last_agent_message", return_value=""), \
+             patch.object(backend, "stop_server") as mock_stop, \
+             patch("time.sleep"), \
+             patch("urllib.request.urlopen", return_value=_Resp()):
+            result = backend.run(config, "prompt", role=role, work_dir=tmpdir, fresh=False)
+            self.assertFalse(result.ok)
+            self.assertIn("429", result.captured_output)
+            mock_stop.assert_called_once_with(port)
+
+
 class TestWorkerBurstDoneFile(unittest.TestCase):
     """Worker burst always uses worker_handoff.json."""
 

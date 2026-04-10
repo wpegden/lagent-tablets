@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import time
 import copy
+import subprocess
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -75,10 +76,17 @@ from lagent_tablets.tablet import (
     scan_forbidden_keywords,
 )
 from lagent_tablets.check import (
+    check_proof_easy_scope,
+    check_proof_hard_scope,
+    check_proof_worker_delta,
+    check_cleanup_preserving,
     check_node as run_check_node,
     check_tablet as run_check_tablet,
     check_tablet_scoped as run_check_tablet_scoped,
+    check_theorem_target_edit_scope,
+    check_theorem_target_repair_scope,
     is_lake_package_error,
+    snapshot_tablet_node_hashes as canonical_snapshot_tablet_node_hashes,
     validate_json_artifact,
     write_scripts,
 )
@@ -1065,31 +1073,6 @@ def validate_worker_cycle(
     )
 
 
-def _validate_hard_proof_changes(
-    repo_path: Path,
-    active_node: str,
-    snapshot_before: Dict[str, str],
-) -> tuple[Optional[str], Dict[str, List[str]]]:
-    """Reject destructive or out-of-scope file edits in proof-formalization hard mode."""
-    snapshot_after = _snapshot_tablet_dir(repo_path)
-    changes = _detect_changes(snapshot_before, snapshot_after)
-    supervisor_generated = {"INDEX.md", "README.md", "header.tex", "Tablet.lean"}
-    allowed_modified = {f"{active_node}.lean", f"{active_node}.tex", "Preamble.lean"} | supervisor_generated
-
-    if changes["deleted"]:
-        return f"Files were deleted (not allowed): {changes['deleted']}", changes
-
-    unexpected_modified = [f for f in changes["modified"] if f not in allowed_modified]
-    if unexpected_modified:
-        return (
-            f"Unexpected files modified: {unexpected_modified}. "
-            f"Only {active_node}, Preamble.lean, and supervisor-generated support files may be modified.",
-            changes,
-        )
-
-    return None, changes
-
-
 def _theorem_stating_node_kind(
     name: str,
     kind_hints: Dict[str, str],
@@ -1110,97 +1093,30 @@ def validate_worker_cycle_v2(
     tablet: TabletState,
     active_node: str,
     *,
+    snapshot_before: Dict[str, str],
     active_changed: bool,
     new_lean_files: List[str],
 ) -> CycleOutcome:
-    """Validate after a worker burst. Simpler than the old snapshot-based approach.
-
-    Checks:
-    1. Did the active node change? If not, NO_PROGRESS.
-    2. Is the declaration signature intact?
-    3. Are imports valid?
-    4. Any forbidden keywords?
-    5. Does it compile?
-    6. Is it sorry-free? If yes, CLOSED.
-    7. New files: validate names, markers, .tex pairs.
-    """
+    """Compatibility wrapper over the canonical proof-worker delta check."""
     repo = config.repo_path
     forbidden = [kw for kw in FORBIDDEN_KEYWORDS_DEFAULT if kw not in config.workflow.forbidden_keyword_allowlist]
-
-    if not active_changed and not new_lean_files:
-        return CycleOutcome(outcome="NO_PROGRESS", detail="No files were changed.")
-
-    nodes_closed = []
-    nodes_created = []
-
-    # Validate active node using check.py (the SINGLE SOURCE OF TRUTH)
-    if active_changed:
-        stored_hash = tablet.nodes[active_node].lean_statement_hash if active_node in tablet.nodes else ""
-        result = run_check_node(
-            repo, active_node,
-            allowed_prefixes=config.workflow.allowed_import_prefixes,
-            forbidden_keywords=forbidden,
-            expected_hash=stored_hash,
-            approved_axioms_path=config.workflow.approved_axioms_path,
-        )
-        if result["errors"]:
-            # Return the first error as the INVALID detail
-            return CycleOutcome(
-                outcome="INVALID",
-                detail=result["errors"][0],
-                build_output=result.get("build_output", ""),
-            )
-        if result["ok"]:
-            nodes_closed.append(active_node)
-
-    # Validate new files
-    for name in new_lean_files:
-        if name in ("Preamble", "Axioms") or name in tablet.nodes:
-            continue
-        if not is_valid_node_name(name):
-            return CycleOutcome(outcome="INVALID", detail=f"Invalid node name: {name!r}")
-
-        tex_path = node_tex_path(repo, name)
-        if not tex_path.exists():
-            return CycleOutcome(outcome="INVALID", detail=f"New node {name} has .lean but no .tex file")
-
-        result = run_check_node(
-            repo,
-            name,
-            allowed_prefixes=config.workflow.allowed_import_prefixes,
-            forbidden_keywords=forbidden,
-            approved_axioms_path=config.workflow.approved_axioms_path,
-        )
-        if result["errors"]:
-            return CycleOutcome(
-                outcome="INVALID",
-                detail=f"New node {name}: {result['errors'][0]}",
-                build_output=result.get("build_output", ""),
-            )
-
-        lean_path = node_lean_path(repo, name)
-        content = lean_path.read_text(encoding="utf-8")
-        if not has_sorry(content):
-            nodes_closed.append(name)
-        nodes_created.append(name)
-
-    # Build detail
-    parts = []
-    if nodes_closed:
-        parts.append(f"closed: {nodes_closed}")
-    if nodes_created:
-        parts.append(f"created: {nodes_created}")
-    if active_changed and active_node not in nodes_closed:
-        parts.append(f"{active_node} modified (still open)")
-
-    if not parts:
-        return CycleOutcome(outcome="NO_PROGRESS", detail="No meaningful changes detected.")
-
+    existing_nodes = sorted(tablet.nodes.keys())
+    result = check_proof_worker_delta(
+        repo,
+        active_node=active_node,
+        snapshot_before=snapshot_before,
+        existing_nodes=existing_nodes,
+        expected_active_hash=tablet.nodes[active_node].lean_statement_hash if active_node in tablet.nodes else "",
+        allowed_prefixes=config.workflow.allowed_import_prefixes,
+        forbidden_keywords=forbidden,
+        approved_axioms_path=config.workflow.approved_axioms_path,
+    )
     return CycleOutcome(
-        outcome="PROGRESS",
-        detail="; ".join(parts),
-        nodes_closed=nodes_closed,
-        nodes_created=nodes_created,
+        outcome=result["outcome"],
+        detail=result["detail"],
+        nodes_closed=list(result.get("nodes_closed", [])),
+        nodes_created=list(result.get("nodes_created", [])),
+        build_output=result.get("build_output", ""),
     )
 
 
@@ -2244,10 +2160,7 @@ def _current_tablet_node_names(repo_path: Path) -> Set[str]:
 
 
 def _snapshot_tablet_node_hashes(repo_path: Path) -> Dict[str, str]:
-    return {
-        name: _tablet_node_file_hash(repo_path, name)
-        for name in sorted(_current_tablet_node_names(repo_path))
-    }
+    return canonical_snapshot_tablet_node_hashes(repo_path)
 
 
 def _theorem_target_scope(repo_path: Path, target: str) -> Set[str]:
@@ -2257,6 +2170,32 @@ def _theorem_target_scope(repo_path: Path, target: str) -> Set[str]:
 def _theorem_target_edit_mode(state: SupervisorState) -> str:
     mode = str(getattr(state, "theorem_target_edit_mode", "repair") or "repair").strip().lower()
     return mode if mode in {"repair", "restructure"} else "repair"
+
+
+def _theorem_stating_closed_nodes(
+    config: Config,
+    node_names: Sequence[str],
+) -> List[str]:
+    """Return theorem-stating nodes that now pass the exact node checker."""
+    forbidden = [
+        kw for kw in FORBIDDEN_KEYWORDS_DEFAULT
+        if kw not in config.workflow.forbidden_keyword_allowlist
+    ]
+    closed: List[str] = []
+    for name in node_names:
+        if not name or name == PREAMBLE_NAME:
+            continue
+        result = run_check_node(
+            config.repo_path,
+            name,
+            allowed_prefixes=config.workflow.allowed_import_prefixes,
+            forbidden_keywords=forbidden,
+            expected_hash="",
+            approved_axioms_path=config.workflow.approved_axioms_path,
+        )
+        if result.get("ok"):
+            closed.append(name)
+    return sorted(dict.fromkeys(closed))
 
 
 def _changed_tablet_nodes_since_snapshot(repo_path: Path, before_hashes: Dict[str, str]) -> List[str]:
@@ -2277,39 +2216,87 @@ def _validate_theorem_target_edit_scope(
     *,
     initial_scope: Optional[Set[str]] = None,
 ) -> Optional[str]:
-    """Return an error message if theorem-stating edits drift outside the active target scope."""
-    if not target:
-        return None
-    final_names = _current_tablet_node_names(repo_path)
-    if target not in final_names:
-        return f"Current soundness target `{target}` must remain present in the tablet."
+    """Compatibility wrapper over the canonical theorem-target scope check."""
+    result = check_theorem_target_edit_scope(
+        repo_path,
+        target=target,
+        before_hashes=before_hashes,
+        initial_scope=sorted(initial_scope or set()),
+    )
+    return result["errors"][0] if result.get("errors") else None
 
-    changed_nodes = _changed_tablet_nodes_since_snapshot(repo_path, before_hashes)
-    if not changed_nodes:
-        return None
 
-    before_scope = set(initial_scope or set())
-    after_scope = _theorem_target_scope(repo_path, target)
-    allowed = before_scope | after_scope
-    out_of_scope = [name for name in changed_nodes if name not in allowed]
-    if not out_of_scope:
-        return None
+def _validate_theorem_target_repair_changes(
+    repo_path: Path,
+    target: str,
+    snapshot_before: Dict[str, str],
+) -> Optional[str]:
+    """Compatibility wrapper over the canonical theorem target repair check."""
+    result = check_theorem_target_repair_scope(
+        repo_path,
+        target=target,
+        snapshot_before=snapshot_before,
+    )
+    return result["errors"][0] if result.get("errors") else None
 
-    allowed_preview = ", ".join(sorted(allowed)[:12])
-    if len(allowed) > 12:
-        allowed_preview += ", ..."
+
+def _validate_easy_proof_repair_changes(
+    repo_path: Path,
+    active_node: str,
+    snapshot_before: Dict[str, str],
+) -> tuple[Optional[str], List[str]]:
+    """Compatibility wrapper over the canonical easy-mode proof scope check."""
+    result = check_proof_easy_scope(
+        repo_path,
+        active_node=active_node,
+        snapshot_before=snapshot_before,
+    )
     return (
-        f"Out-of-scope theorem-stating edits for target `{target}`: "
-        f"{', '.join(out_of_scope)}. "
-        "When a current soundness target is set, changes must stay within that target's "
-        "authorized impact region (target, prerequisites, and downstream consumers, "
-        "before or after the cycle). "
-        f"Allowed scope: {allowed_preview or '(empty)'}."
+        result["errors"][0] if result.get("errors") else None,
+        list(result.get("created_content_files", [])),
     )
 
 
 def _scoped_tablet_check_payload_path(log_dir: Path) -> Path:
     return log_dir / "theorem_target_scope_check.json"
+
+
+def _theorem_target_repair_scope_payload_path(log_dir: Path) -> Path:
+    return log_dir / "theorem_target_repair_scope.json"
+
+
+def _write_theorem_target_repair_scope_payload(
+    log_dir: Path,
+    target: str,
+    snapshot_before: Dict[str, str],
+) -> Path:
+    payload = {
+        "target": target,
+        "snapshot_before": snapshot_before,
+    }
+    out = _theorem_target_repair_scope_payload_path(log_dir)
+    save_json(out, payload, mode=0o644)
+    return out
+
+
+def _theorem_target_edit_scope_payload_path(log_dir: Path) -> Path:
+    return log_dir / "theorem_target_edit_scope.json"
+
+
+def _write_theorem_target_edit_scope_payload(
+    log_dir: Path,
+    target: str,
+    before_hashes: Dict[str, str],
+    initial_scope: Set[str],
+) -> Path:
+    payload = {
+        "target": target,
+        "before_hashes": before_hashes,
+        "initial_scope": sorted(initial_scope),
+    }
+    out = _theorem_target_edit_scope_payload_path(log_dir)
+    save_json(out, payload, mode=0o644)
+    return out
 
 
 def _write_scoped_tablet_check_payload(
@@ -2367,84 +2354,163 @@ def _run_scoped_tablet_check(
     return None
 
 
-def _validate_theorem_target_repair_changes(
-    repo_path: Path,
-    target: str,
-    snapshot_before: Dict[str, str],
-) -> Optional[str]:
-    """Return an error when theorem target repair edits escape the locked target .tex file."""
-    if not target:
-        return None
-    snapshot_after = _snapshot_tablet_dir(repo_path)
-    changes = _detect_changes(snapshot_before, snapshot_after)
-    target_tex = f"{target}.tex"
-    supervisor_generated = {"INDEX.md", "README.md", "header.tex", "Tablet.lean"}
-
-    if changes["deleted"]:
-        return f"Theorem target repair mode does not allow deleting files: {changes['deleted']}"
-
-    created_content_files = [
-        fname for fname in changes["created"]
-        if fname.endswith(".lean") or fname.endswith(".tex")
-    ]
-    if created_content_files:
-        return (
-            "Theorem target repair mode does not allow creating new node files. "
-            f"Created: {sorted(created_content_files)}"
-        )
-
-    unexpected_modified = [
-        fname for fname in changes["modified"]
-        if fname not in {target_tex} | supervisor_generated
-    ]
-    if unexpected_modified:
-        return (
-            f"Theorem target repair mode only allows editing `{target_tex}`. "
-            f"Modified: {sorted(unexpected_modified)}"
-        )
-
-    return None
+def _cleanup_check_payload_path(log_dir: Path) -> Path:
+    return log_dir / "cleanup_scope_check.json"
 
 
-def _validate_easy_proof_repair_changes(
-    repo_path: Path,
+def _proof_scope_payload_path(log_dir: Path, difficulty: str) -> Path:
+    suffix = "easy" if difficulty == "easy" else "hard"
+    return log_dir / f"proof_scope_{suffix}.json"
+
+
+def _write_proof_scope_payload(
+    log_dir: Path,
+    *,
     active_node: str,
+    difficulty: str,
     snapshot_before: Dict[str, str],
-) -> tuple[Optional[str], List[str]]:
-    """Return an error when proof easy-mode edits escape the locked active .lean file."""
-    snapshot_after = _snapshot_tablet_dir(repo_path)
-    changes = _detect_changes(snapshot_before, snapshot_after)
-    active_lean = f"{active_node}.lean"
+    existing_nodes: Sequence[str],
+    expected_active_hash: str = "",
+    imports_before: Optional[Sequence[str]] = None,
+) -> Path:
+    payload = {
+        "active_node": active_node,
+        "snapshot_before": snapshot_before,
+        "existing_nodes": list(existing_nodes),
+        "expected_active_hash": expected_active_hash,
+    }
+    if imports_before is not None:
+        payload["imports_before"] = list(imports_before)
+    out = _proof_scope_payload_path(log_dir, difficulty)
+    save_json(out, payload, mode=0o644)
+    return out
 
-    if changes["deleted"]:
-        return (
-            f"Easy mode does not allow deleting files: {changes['deleted']}",
-            [],
+
+def _write_cleanup_check_payload(
+    config: Config,
+    tablet: TabletState,
+    log_dir: Path,
+    snapshot_before: Dict[str, str],
+) -> tuple[Path, Dict[str, Any]]:
+    from lagent_tablets.nl_cache import NLCache
+
+    repo = config.repo_path
+    cache = NLCache(config.state_dir / "nl_cache.json")
+    baseline_declaration_hashes: Dict[str, str] = {}
+    baseline_correspondence_hashes: Dict[str, str] = {}
+
+    for name, node in sorted(tablet.nodes.items()):
+        if node.kind == "preamble":
+            continue
+        lean_path = node_lean_path(repo, name)
+        if lean_path.exists():
+            baseline_declaration_hashes[name] = declaration_hash(
+                lean_path.read_text(encoding="utf-8"),
+                name,
+            )
+        fp = cache.correspondence_fingerprint(repo, name)
+        if fp:
+            baseline_correspondence_hashes[name] = fp
+
+    payload = {
+        "snapshot_before": snapshot_before,
+        "baseline_declaration_hashes": baseline_declaration_hashes,
+        "baseline_correspondence_hashes": baseline_correspondence_hashes,
+    }
+    out = _cleanup_check_payload_path(log_dir)
+    save_json(out, payload, mode=0o644)
+    return out, payload
+
+
+def _restore_cleanup_last_good_state(config: Config, ref: str) -> None:
+    if not ref:
+        return
+    repo = config.repo_path
+    try:
+        subprocess.run(
+            ["git", "-C", str(repo), "restore", "--source", ref, "--worktree", "--staged", "--", "Tablet", "Tablet.lean"],
+            capture_output=True,
+            text=True,
+            timeout=60,
         )
-
-    created_content_files = [
-        fname for fname in changes["created"]
-        if fname.endswith(".lean") or fname.endswith(".tex")
-    ]
-    if created_content_files:
-        return (
-            f"Easy mode only allows editing `{active_lean}`. "
-            f"Created: {sorted(created_content_files)}",
-            created_content_files,
+        subprocess.run(
+            ["git", "-C", str(repo), "clean", "-fd", "--", "Tablet"],
+            capture_output=True,
+            text=True,
+            timeout=60,
         )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
 
-    unexpected_modified = [
-        fname for fname in changes["modified"]
-        if fname != active_lean
-    ]
-    if unexpected_modified:
-        return (
-            f"Easy mode only allows editing `{active_lean}`. "
-            f"Modified: {sorted(unexpected_modified)}",
-            [],
-        )
 
-    return None, []
+def _setup_cleanup_permissions(config: Config) -> None:
+    """Allow cleanup workers to edit existing Lean/support files, but not `.tex` or create nodes."""
+    import grp
+    import os
+
+    repo = config.repo_path
+    tdir = repo / "Tablet"
+    staging = config.state_dir / "staging"
+    if not tdir.exists():
+        return
+
+    try:
+        gid = grp.getgrnam("leanagent").gr_gid
+    except KeyError:
+        return
+
+    try:
+        os.chown(str(tdir), -1, gid)
+        os.chmod(str(tdir), 0o2755)
+    except PermissionError:
+        pass
+
+    writable = {"Preamble.lean", "INDEX.md", "README.md", "header.tex"}
+    for path in tdir.iterdir():
+        if not path.is_file():
+            continue
+        target_mode = 0o664 if (path.suffix == ".lean" or path.name in writable) else 0o644
+        try:
+            stat = path.stat()
+            if stat.st_uid == os.getuid():
+                if stat.st_gid != gid:
+                    os.chown(str(path), -1, gid)
+                os.chmod(str(path), target_mode)
+            else:
+                subprocess.run(
+                    ["sudo", "-n", "-u", "lagentworker", "chmod", oct(target_mode)[2:], str(path)],
+                    capture_output=True,
+                    timeout=5,
+                )
+        except (PermissionError, OSError, subprocess.TimeoutExpired):
+            pass
+
+    tablet_root = repo / "Tablet.lean"
+    if tablet_root.exists():
+        try:
+            stat = tablet_root.stat()
+            target_mode = 0o664
+            if stat.st_uid == os.getuid():
+                if stat.st_gid != gid:
+                    os.chown(str(tablet_root), -1, gid)
+                os.chmod(str(tablet_root), target_mode)
+            else:
+                subprocess.run(
+                    ["sudo", "-n", "-u", "lagentworker", "chmod", oct(target_mode)[2:], str(tablet_root)],
+                    capture_output=True,
+                    timeout=5,
+                )
+        except (PermissionError, OSError, subprocess.TimeoutExpired):
+            pass
+
+    try:
+        os.chown(str(repo), -1, gid)
+        os.chmod(str(repo), 0o2755)
+        staging.mkdir(parents=True, exist_ok=True)
+        os.chown(str(staging), -1, gid)
+        os.chmod(str(staging), 0o2775)
+    except PermissionError:
+        pass
 
 
 def _apply_verification_to_tablet(
@@ -2947,6 +3013,8 @@ def run_theorem_stating_cycle(
     )
     target_scope_before_worker = _theorem_target_scope(repo, state.theorem_soundness_target)
     scoped_tablet_check_payload_path: Optional[Path] = None
+    repair_scope_check_payload_path: Optional[Path] = None
+    edit_scope_check_payload_path: Optional[Path] = None
     theorem_tablet_baseline_errors: List[str] = []
     node_hashes_before_worker = _snapshot_tablet_node_hashes(repo) if not resume_from else {}
     tablet_snapshot_before_worker = _snapshot_tablet_dir(repo) if not resume_from else {}
@@ -2985,11 +3053,25 @@ def run_theorem_stating_cycle(
                 state.theorem_soundness_target,
                 target_scope_before_worker,
             )
+            edit_scope_check_payload_path = _write_theorem_target_edit_scope_payload(
+                log_dir,
+                state.theorem_soundness_target,
+                node_hashes_before_worker,
+                target_scope_before_worker,
+            )
+        elif target_repair_mode and state.theorem_soundness_target:
+            repair_scope_check_payload_path = _write_theorem_target_repair_scope_payload(
+                log_dir,
+                state.theorem_soundness_target,
+                tablet_snapshot_before_worker,
+            )
 
         worker_prompt = build_theorem_stating_prompt(
             config, state, tablet, policy, previous_outcome=previous_outcome,
             authorized_region=sorted(target_scope_before_worker),
             scoped_tablet_check_payload_path=scoped_tablet_check_payload_path,
+            repair_scope_check_payload_path=repair_scope_check_payload_path,
+            edit_scope_check_payload_path=edit_scope_check_payload_path,
         )
         worker_artifacts = _clear_artifact_files(config, "worker_handoff.json")
 
@@ -3028,6 +3110,7 @@ def run_theorem_stating_cycle(
                 detail=f"Invalid worker handoff: {handoff_error or 'missing raw/done artifact'}",
             )
         state.last_worker_handoff = worker_handoff
+        worker_status = str(worker_handoff.get("status", "") or "").strip().upper()
 
         fix_lake_permissions(repo)
 
@@ -3044,13 +3127,28 @@ def run_theorem_stating_cycle(
             if n in tablet.nodes and n in all_node_names
         ]
 
+        if worker_status == "CRISIS":
+            if state.theorem_soundness_target:
+                save_state(state_path(config), state)
+                return CycleOutcome(
+                    outcome="INVALID",
+                    detail="status CRISIS is only allowed during broad theorem-stating (no active soundness target).",
+                )
+            if new_nodes or modified_existing_nodes or deleted_nodes:
+                save_state(state_path(config), state)
+                return CycleOutcome(
+                    outcome="INVALID",
+                    detail="status CRISIS may not accompany Tablet edits; escalate the paper-level concern without changing artifacts.",
+                )
+
         repair_error = None
         if target_repair_mode:
-            repair_error = _validate_theorem_target_repair_changes(
+            repair_result = check_theorem_target_repair_scope(
                 repo,
-                state.theorem_soundness_target,
-                tablet_snapshot_before_worker,
+                target=state.theorem_soundness_target,
+                snapshot_before=tablet_snapshot_before_worker,
             )
+            repair_error = repair_result["errors"][0] if repair_result["errors"] else None
         if repair_error:
             print(f"  INVALID: {repair_error}")
             save_state(state_path(config), state)
@@ -3059,12 +3157,13 @@ def run_theorem_stating_cycle(
                 detail=repair_error,
             )
 
-        scope_error = _validate_theorem_target_edit_scope(
+        scope_result = check_theorem_target_edit_scope(
             repo,
-            state.theorem_soundness_target,
-            node_hashes_before_worker,
-            initial_scope=target_scope_before_worker,
+            target=state.theorem_soundness_target,
+            before_hashes=node_hashes_before_worker,
+            initial_scope=sorted(target_scope_before_worker),
         )
+        scope_error = scope_result["errors"][0] if scope_result["errors"] else None
         if scope_error:
             print(f"  INVALID: {scope_error}")
             save_state(state_path(config), state)
@@ -3138,63 +3237,62 @@ def run_theorem_stating_cycle(
                     title="Imports", closed_at_cycle=cycle,
                 )
 
-        # Check: no definitions in Preamble
-        from lagent_tablets.tablet import scan_preamble_definitions
-        preamble_path = repo / "Tablet" / "Preamble.lean"
-        if preamble_path.exists():
-            preamble_defs = scan_preamble_definitions(preamble_path.read_text(encoding="utf-8"))
-            if preamble_defs:
-                defs_list = [h["text"][:80] for h in preamble_defs]
-                print(f"  INVALID: Preamble has {len(preamble_defs)} definitions (must be in own nodes)")
-                for d in defs_list:
-                    print(f"    {d}")
-                save_state(state_path(config), state)
-                return CycleOutcome(
-                    outcome="INVALID",
-                    detail=f"Preamble.lean contains definitions. All definitions must be in their own node files with .tex counterparts. Found: {', '.join(defs_list[:3])}",
-                )
-
-        # Validate: lake build
-        build_ok = False
-        build_output = ""
-        try:
-            import subprocess
-            result = subprocess.run(
-                ["lake", "build", "Tablet"],
-                capture_output=True, text=True, timeout=300,
-                cwd=str(repo),
-            )
-            build_output = result.stdout + result.stderr
-            build_ok = result.returncode == 0
-        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-            build_output = str(e)
-
-        if not build_ok:
-            print(f"  lake build failed")
+        if worker_status == "CRISIS":
             outcome = CycleOutcome(
-                outcome="INVALID",
-                detail=f"lake build Tablet failed",
-                build_output=build_output,
-            )
-        elif new_nodes or deleted_nodes:
-            if new_nodes:
-                print(f"  Created {len(new_nodes)} new nodes: {new_nodes}")
-            if deleted_nodes:
-                print(f"  Deleted {len(deleted_nodes)} nodes: {deleted_nodes}")
-            outcome = CycleOutcome(
-                outcome="PROGRESS",
-                detail=", ".join(
-                    part for part in [
-                        f"Created nodes: {', '.join(new_nodes)}" if new_nodes else "",
-                        f"Deleted nodes: {', '.join(deleted_nodes)}" if deleted_nodes else "",
-                    ]
-                    if part
-                ),
-                nodes_created=new_nodes,
+                outcome="NO_PROGRESS",
+                detail=f"Worker raised CRISIS: {worker_handoff.get('summary', '')}".strip(),
             )
         else:
-            print(f"  No new nodes created (modified existing: {modified_existing_nodes})")
-            outcome = CycleOutcome(outcome="PROGRESS", detail="Modified existing nodes")
+            # Validate: lake build
+            build_ok = False
+            build_output = ""
+            try:
+                import subprocess
+                result = subprocess.run(
+                    ["lake", "build", "Tablet"],
+                    capture_output=True, text=True, timeout=300,
+                    cwd=str(repo),
+                )
+                build_output = result.stdout + result.stderr
+                build_ok = result.returncode == 0
+            except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+                build_output = str(e)
+
+            if not build_ok:
+                print(f"  lake build failed")
+                outcome = CycleOutcome(
+                    outcome="INVALID",
+                    detail=f"lake build Tablet failed",
+                    build_output=build_output,
+                )
+            else:
+                newly_closed = _theorem_stating_closed_nodes(
+                    config,
+                    list(new_nodes) + list(modified_existing_nodes),
+                )
+                for name in newly_closed:
+                    if name in tablet.nodes:
+                        mark_node_closed(tablet, name, cycle)
+                detail_parts: List[str] = []
+                if new_nodes:
+                    print(f"  Created {len(new_nodes)} new nodes: {new_nodes}")
+                    detail_parts.append(f"Created nodes: {', '.join(new_nodes)}")
+                if deleted_nodes:
+                    print(f"  Deleted {len(deleted_nodes)} nodes: {deleted_nodes}")
+                    detail_parts.append(f"Deleted nodes: {', '.join(deleted_nodes)}")
+                if newly_closed:
+                    print(f"  Closed {len(newly_closed)} theorem-stating nodes in Lean: {newly_closed}")
+                    detail_parts.append(f"Closed in Lean: {', '.join(newly_closed)}")
+
+                if new_nodes or deleted_nodes or newly_closed:
+                    outcome = CycleOutcome(
+                        outcome="PROGRESS",
+                        detail=", ".join(detail_parts),
+                        nodes_created=new_nodes,
+                    )
+                else:
+                    print(f"  No new nodes created (modified existing: {modified_existing_nodes})")
+                    outcome = CycleOutcome(outcome="PROGRESS", detail="Modified existing nodes")
 
         # Save checkpoint: worker done
         regenerate_support_files(tablet, repo)
@@ -3202,6 +3300,20 @@ def run_theorem_stating_cycle(
         state.resume_from = "verification"
         save_state(state_path(config), state)
         _save_live_viewer_state(config, tablet, state, source="worker")
+        from lagent_tablets.git_ops import commit_checkpoint as git_commit_checkpoint
+        git_commit_checkpoint(
+            repo,
+            cycle,
+            "worker",
+            phase="theorem_stating",
+            outcome=outcome.outcome,
+            active_node=state.active_node,
+            detail=outcome.detail,
+            meta={
+                "checkpoint_resume_from": "verification",
+                "stage": "worker",
+            },
+        )
     else:
         # Resuming — reconstruct outcome from current state
         all_node_names = [n for n in tablet.nodes if tablet.nodes[n].kind != "preamble"]
@@ -3213,7 +3325,12 @@ def run_theorem_stating_cycle(
     # ---- Stage 2: NL Verification ----
     nl_verification_results: List[Dict[str, Any]] = []
     verification_checkpoint = _verification_results_checkpoint_path(config)
-    if resume_from in ("", "verification"):
+    worker_crisis = str((state.last_worker_handoff or {}).get("status", "") or "").strip().upper() == "CRISIS"
+    if worker_crisis and resume_from in ("", "verification"):
+        print("  Skipping NL verification because worker raised CRISIS")
+        state.resume_from = "reviewer"
+        save_state(state_path(config), state)
+    elif resume_from in ("", "verification"):
         repaired_hashes = _backfill_legacy_correspondence_hashes(tablet, repo)
         repaired_failures = _repair_stale_legacy_correspondence_failures(tablet, state, repo)
         if repaired_hashes or repaired_failures:
@@ -3268,6 +3385,21 @@ def run_theorem_stating_cycle(
         _apply_verification_to_tablet(tablet, nl_verification_results, cycle, repo_path=repo)
         save_tablet(tablet_path(config), tablet)
         _save_live_viewer_state(config, tablet, state, source="verification")
+        from lagent_tablets.git_ops import commit_checkpoint as git_commit_checkpoint
+        git_commit_checkpoint(
+            repo,
+            cycle,
+            "verification",
+            phase="theorem_stating",
+            outcome=outcome.outcome,
+            active_node=state.active_node,
+            detail=outcome.detail,
+            meta={
+                "checkpoint_resume_from": "reviewer",
+                "stage": "verification",
+                "verification_results": nl_verification_results,
+            },
+        )
 
     # ---- Stage 3: Reviewer ----
     if worker_handoff is None:
@@ -3480,6 +3612,12 @@ def preview_next_cycle(
             scoped_tablet_check_payload_path=(
                 Path("<preview-scope.json>") if target and mode == "restructure" else None
             ),
+            repair_scope_check_payload_path=(
+                Path("<theorem-repair-scope.json>") if target and mode == "repair" else None
+            ),
+            edit_scope_check_payload_path=(
+                Path("<theorem-edit-scope.json>") if target and mode == "restructure" else None
+            ),
         )
         return {
             "phase": preview_state.phase,
@@ -3508,6 +3646,16 @@ def preview_next_cycle(
             preview_tablet,
             policy,
             difficulty=node_difficulty,
+            cleanup_check_payload_path=(
+                Path("<cleanup-scope.json>")
+                if preview_state.phase == "proof_complete_style_cleanup"
+                else None
+            ),
+            proof_scope_check_payload_path=(
+                Path("<proof-scope.json>")
+                if preview_state.phase == "proof_formalization"
+                else None
+            ),
         )
         return {
             "phase": preview_state.phase,
@@ -3565,6 +3713,7 @@ def run_cycle(
     # Clear stale verification/reviewer activity from the previous cycle before
     # the new worker burst starts.
     _save_live_viewer_state(config, tablet, state, source="worker")
+    log_dir = config.state_dir / "logs" / f"cycle-{cycle:04d}"
 
     # Regenerate scripts each cycle (hot-reloadable)
     forbidden = [kw for kw in FORBIDDEN_KEYWORDS_DEFAULT if kw not in config.workflow.forbidden_keyword_allowlist]
@@ -3595,18 +3744,36 @@ def run_cycle(
     )
     imports_before: List[str] = []
     tablet_snapshot_before: Dict[str, str] = _snapshot_tablet_dir(repo)
+    proof_scope_check_payload_path = _write_proof_scope_payload(
+        log_dir,
+        active_node=active_node,
+        difficulty=node_difficulty,
+        snapshot_before=tablet_snapshot_before,
+        existing_nodes=sorted(tablet.nodes.keys()),
+        expected_active_hash=tablet.nodes[active_node].lean_statement_hash if active_node in tablet.nodes else "",
+        imports_before=imports_before if easy_mode else None,
+    )
     if easy_mode and active_lean.exists():
         imports_before = extract_imports(active_lean.read_text(encoding="utf-8"))
+        proof_scope_check_payload_path = _write_proof_scope_payload(
+            log_dir,
+            active_node=active_node,
+            difficulty=node_difficulty,
+            snapshot_before=tablet_snapshot_before,
+            existing_nodes=sorted(tablet.nodes.keys()),
+            expected_active_hash=tablet.nodes[active_node].lean_statement_hash if active_node in tablet.nodes else "",
+            imports_before=imports_before,
+        )
 
     # Build worker prompt
     worker_prompt = build_worker_prompt(
         config, state, tablet, policy,
         previous_outcome=previous_outcome,
         difficulty=node_difficulty,
+        proof_scope_check_payload_path=proof_scope_check_payload_path,
     )
 
     # Run worker burst
-    log_dir = config.state_dir / "logs" / f"cycle-{cycle:04d}"
     worker_artifacts = _clear_artifact_files(config, "worker_handoff.json")
 
     worker_result = run_worker_burst(
@@ -3661,11 +3828,13 @@ def run_cycle(
     preamble_changed = "Preamble.lean" in changes["modified"]
 
     if not easy_mode:
-        scope_error, changes = _validate_hard_proof_changes(
+        hard_scope = check_proof_hard_scope(
             repo,
-            active_node,
-            tablet_snapshot_before,
+            active_node=active_node,
+            snapshot_before=tablet_snapshot_before,
         )
+        scope_error = hard_scope["errors"][0] if hard_scope["errors"] else None
+        changes = hard_scope["changes"]
         if scope_error:
             outcome = CycleOutcome(outcome="INVALID", detail=scope_error)
             save_state(state_path(config), state)
@@ -3678,11 +3847,14 @@ def run_cycle(
 
     # Easy-mode enforcement (layer 2: supervisor-side, in addition to filesystem)
     if easy_mode:
-        scope_error, created_content_files = _validate_easy_proof_repair_changes(
+        easy_scope = check_proof_easy_scope(
             repo,
-            active_node,
-            tablet_snapshot_before,
+            active_node=active_node,
+            snapshot_before=tablet_snapshot_before,
+            imports_before=imports_before,
         )
+        scope_error = easy_scope["errors"][0] if easy_scope["errors"] else None
+        created_content_files = list(easy_scope.get("created_content_files", []))
         if scope_error:
             print(f"  Easy-mode violation: {scope_error}")
             for fname in created_content_files:
@@ -3702,29 +3874,10 @@ def run_cycle(
             _save_live_viewer_state(config, tablet, state, source="worker")
             return outcome
 
-        # Reject any import changes, not just additions.
-        if active_lean.exists():
-            imports_after = extract_imports(active_lean.read_text(encoding="utf-8"))
-            if imports_after != imports_before:
-                print(f"  Easy-mode violation: imports changed: before={imports_before}, after={imports_after}")
-                outcome = CycleOutcome(
-                    outcome="INVALID",
-                    detail="Easy-mode node cannot change imports. Only the active `.lean` proof body may change.",
-                )
-                if node_meta:
-                    node_meta.easy_attempts += 1
-                    if node_meta.easy_attempts >= policy.difficulty.easy_max_retries:
-                        node_meta.difficulty = "hard"
-                        node_meta.easy_attempts = 0
-                        print(f"  Auto-elevating {active_node} to hard (after {policy.difficulty.easy_max_retries} easy attempts)")
-                save_state(state_path(config), state)
-                save_tablet(tablet_path(config), tablet)
-                _save_live_viewer_state(config, tablet, state, source="worker")
-                return outcome
-
     # Validate
     outcome = validate_worker_cycle_v2(
         config, tablet, active_node,
+        snapshot_before=tablet_snapshot_before,
         active_changed=active_changed,
         new_lean_files=[f.removesuffix(".lean") for f in new_files if f.endswith(".lean")],
     )
@@ -3822,6 +3975,28 @@ def run_cycle(
     save_tablet(tablet_path(config), tablet)
     save_state(state_path(config), state)
     _save_live_viewer_state(config, tablet, state, source="worker")
+    from lagent_tablets.git_ops import commit_checkpoint as git_commit_checkpoint
+    git_commit_checkpoint(
+        repo,
+        cycle,
+        "worker",
+        phase=state.phase,
+        outcome=outcome.outcome,
+        active_node=active_node,
+        detail=outcome.detail,
+        meta={"stage": "worker"},
+    )
+    from lagent_tablets.git_ops import commit_checkpoint as git_commit_checkpoint
+    git_commit_checkpoint(
+        repo,
+        cycle,
+        "worker",
+        phase=state.phase,
+        outcome=outcome.outcome,
+        active_node=active_node,
+        detail=outcome.detail,
+        meta={"stage": "worker"},
+    )
 
     # Determine if reviewer is needed
     # - PROGRESS/NO_PROGRESS: always
@@ -3839,6 +4014,19 @@ def run_cycle(
     )
 
     if needs_reviewer:
+        git_commit_checkpoint(
+            repo,
+            cycle,
+            "verification",
+            phase=state.phase,
+            outcome=outcome.outcome,
+            active_node=active_node,
+            detail=outcome.detail,
+            meta={
+                "stage": "verification",
+                "verification_results": nl_verification_results if nl_verification_results else None,
+            },
+        )
         reviewer_prompt = build_reviewer_prompt(
             config, state, tablet, policy,
             worker_handoff=worker_handoff,
@@ -3936,5 +4124,209 @@ def run_cycle(
                 parts.append(f"{role}: {data.get('input_tokens',0):,}in/{data.get('output_tokens',0):,}out ({data['calls']} calls)")
         if parts:
             print(f"  Token usage (cumulative): {' | '.join(parts)}")
+
+    return outcome
+
+
+def run_cleanup_cycle(
+    config: Config,
+    state: SupervisorState,
+    tablet: TabletState,
+    policy: Policy,
+    *,
+    previous_outcome: Optional[Dict[str, Any]] = None,
+) -> CycleOutcome:
+    """Run one terminal style-cleanup cycle over an already complete tablet."""
+    cycle = state.cycle + 1
+    cycle_start = time.monotonic()
+    state.cycle = cycle
+    active_node = state.active_node or tablet.active_node
+    if not active_node or active_node not in tablet.nodes:
+        for name, node in sorted(tablet.nodes.items()):
+            if node.kind != "preamble":
+                active_node = name
+                break
+    repo = config.repo_path
+
+    effective_worker = config.hard_worker or config.worker
+    print(f"=== Cleanup Cycle {cycle} | Focus: {active_node or '(none)'} | Worker: {effective_worker.provider}/{effective_worker.model} ===")
+    _save_live_viewer_state(config, tablet, state, source="worker")
+
+    forbidden = [kw for kw in FORBIDDEN_KEYWORDS_DEFAULT if kw not in config.workflow.forbidden_keyword_allowlist]
+    write_scripts(repo, config.state_dir, allowed_prefixes=config.workflow.allowed_import_prefixes, forbidden_keywords=forbidden)
+
+    from lagent_tablets.health import fix_lake_permissions
+
+    fix_lake_permissions(repo)
+    _ensure_lake_build(repo)
+    _setup_cleanup_permissions(config)
+
+    snapshot_before = _snapshot_tablet_dir(repo)
+    log_dir = config.state_dir / "logs" / f"cycle-{cycle:04d}"
+    cleanup_payload_path, cleanup_payload = _write_cleanup_check_payload(
+        config,
+        tablet,
+        log_dir,
+        snapshot_before,
+    )
+
+    worker_prompt = build_worker_prompt(
+        config,
+        state,
+        tablet,
+        policy,
+        previous_outcome=previous_outcome,
+        difficulty="hard",
+        cleanup_check_payload_path=cleanup_payload_path,
+    )
+
+    worker_artifacts = _clear_artifact_files(config, "worker_handoff.json")
+    worker_result = run_worker_burst(
+        effective_worker,
+        worker_prompt,
+        session_name=config.tmux.session_name,
+        work_dir=repo,
+        burst_user=config.tmux.burst_user,
+        timeout_seconds=policy.timing.burst_timeout_seconds,
+        startup_timeout_seconds=config.startup_timeout_seconds,
+        log_dir=log_dir,
+        done_file=worker_artifacts["done"],
+        artifact_prefix=str(worker_artifacts["stem"]),
+    )
+    _accumulate_usage(state, "worker", worker_result.usage)
+
+    if not worker_result.ok:
+        save_state(state_path(config), state)
+        _save_live_viewer_state(config, tablet, state, source="worker")
+        return CycleOutcome(outcome="INVALID", detail=f"Worker burst failed: {worker_result.error}")
+
+    worker_handoff, handoff_error = _accept_validated_artifact(
+        config,
+        "worker_handoff.json",
+        kind="worker-handoff",
+        phase="proof_complete_style_cleanup",
+        repo_for_validation=repo,
+    )
+    if not isinstance(worker_handoff, dict):
+        save_state(state_path(config), state)
+        _save_live_viewer_state(config, tablet, state, source="worker")
+        return CycleOutcome(
+            outcome="INVALID",
+            detail=f"Invalid worker handoff: {handoff_error or 'missing raw/done artifact'}",
+        )
+    state.last_worker_handoff = worker_handoff
+
+    cleanup_result = check_cleanup_preserving(
+        repo,
+        snapshot_before=cleanup_payload["snapshot_before"],
+        baseline_declaration_hashes=cleanup_payload["baseline_declaration_hashes"],
+        baseline_correspondence_hashes=cleanup_payload["baseline_correspondence_hashes"],
+        allowed_prefixes=config.workflow.allowed_import_prefixes,
+        forbidden_keywords=forbidden,
+        approved_axioms_path=config.workflow.approved_axioms_path,
+    )
+    changes = cleanup_result.get("changes", {"created": [], "modified": [], "deleted": []})
+
+    if not changes["created"] and not changes["modified"] and not changes["deleted"]:
+        outcome = CycleOutcome(outcome="NO_PROGRESS", detail="No cleanup changes were made.")
+    elif cleanup_result["errors"]:
+        if state.cleanup_last_good_commit:
+            _restore_cleanup_last_good_state(config, state.cleanup_last_good_commit)
+            fix_lake_permissions(repo)
+        outcome = CycleOutcome(
+            outcome="INVALID",
+            detail=cleanup_result["errors"][0],
+            build_output=cleanup_result.get("build_output", ""),
+        )
+    else:
+        detail_parts = []
+        if cleanup_result.get("changed_nodes"):
+            detail_parts.append(f"lean cleanup: {cleanup_result['changed_nodes']}")
+        if "Preamble.lean" in changes.get("modified", []):
+            detail_parts.append("Preamble imports tidied")
+        if not detail_parts:
+            detail_parts.append("Semantics-preserving cleanup applied")
+        outcome = CycleOutcome(outcome="PROGRESS", detail="; ".join(detail_parts))
+        tablet.last_modified_at_cycle = cycle
+        state.cleanup_last_good_commit = f"cycle-{cycle}"
+
+    state.validation_summary = {"consecutive_invalids": 0 if outcome.outcome != "INVALID" else 1, "last_outcome": outcome.outcome}
+
+    regenerate_support_files(tablet, repo)
+    save_tablet(tablet_path(config), tablet)
+    save_state(state_path(config), state)
+    _save_live_viewer_state(config, tablet, state, source="worker")
+
+    reviewer_prompt = build_reviewer_prompt(
+        config,
+        state,
+        tablet,
+        policy,
+        worker_handoff=worker_handoff,
+        worker_output=worker_result.captured_output[-20000:] if worker_result.captured_output else "",
+        validation_summary={"outcome": outcome.outcome, "detail": outcome.detail, "consecutive_invalids": 0},
+        nl_verification=None,
+    )
+
+    reviewer_artifacts = _clear_artifact_files(config, "reviewer_decision.json")
+    reviewer_result = run_reviewer_burst(
+        config.reviewer,
+        reviewer_prompt,
+        session_name=config.tmux.session_name,
+        work_dir=repo,
+        burst_user=config.tmux.burst_user,
+        timeout_seconds=min(policy.timing.burst_timeout_seconds, 300),
+        log_dir=log_dir,
+        done_file=reviewer_artifacts["done"],
+        artifact_prefix=str(reviewer_artifacts["stem"]),
+    )
+    _accumulate_usage(state, "reviewer", reviewer_result.usage)
+
+    decision = None
+    decision_error = None
+    if reviewer_result.ok:
+        decision, decision_error = _accept_validated_artifact(
+            config,
+            "reviewer_decision.json",
+            kind="reviewer-decision",
+            phase="proof_complete_style_cleanup",
+        )
+    if isinstance(decision, dict):
+        state.last_review = decision
+        state.review_log.append({"cycle": cycle, **decision})
+        next_node = str(decision.get("next_active_node", "") or "").strip()
+        if next_node and next_node in tablet.nodes and tablet.nodes[next_node].kind != "preamble":
+            state.active_node = next_node
+            tablet.active_node = next_node
+        print(f"  Reviewer: {decision.get('decision', '?')} -> next: {state.active_node}")
+    else:
+        print(f"  Reviewer: could not validate decision ({decision_error or 'missing raw/done artifact'})")
+
+    save_tablet(tablet_path(config), tablet)
+    save_state(state_path(config), state)
+    _save_live_viewer_state(config, tablet, state, source="reviewer")
+
+    from lagent_tablets.git_ops import commit_cycle as git_commit
+
+    _save_cycle_viewer_state(
+        config,
+        tablet,
+        state,
+        verification_results=[],
+        source="cycle",
+    )
+    git_commit(
+        repo, cycle,
+        phase=state.phase,
+        outcome=outcome.outcome,
+        active_node=active_node,
+        detail=outcome.detail,
+        meta={
+            "duration_seconds": round(time.monotonic() - cycle_start, 1),
+            "reviewer_decision": state.last_review,
+            "verification_results": None,
+            "token_usage": state.agent_token_usage,
+        },
+    )
 
     return outcome

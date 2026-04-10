@@ -208,6 +208,11 @@ class TestTexValidation(unittest.TestCase):
         errors = validate_tex_format(tex, is_preamble=True)
         self.assertEqual(errors, [])
 
+    def test_valid_preamble_with_definition(self):
+        tex = "\\begin{definition}[thing]\nThing.\n\\end{definition}\n"
+        errors = validate_tex_format(tex, is_preamble=True)
+        self.assertEqual(errors, [])
+
     def test_preamble_rejects_proof(self):
         tex = "\\begin{proposition}\nA\n\\end{proposition}\n\\begin{proof}\nP\n\\end{proof}\n"
         errors = validate_tex_format(tex, is_preamble=True)

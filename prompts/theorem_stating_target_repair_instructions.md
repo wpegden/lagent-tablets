@@ -31,6 +31,7 @@ PROOF EXPECTATIONS:
 - Do not cite nodes that are not already imported by the target's `.lean` file
 
 MANDATORY BEFORE SUBMITTING:
+- Run `{target_repair_scope_check_command}` and fix any scope violations
 - Run `python3 {check_script} tablet {repo_path}` and fix any deterministic errors
 
 WHEN DONE:

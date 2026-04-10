@@ -178,6 +178,7 @@ class TestSupervisorState(unittest.TestCase):
             last_review={"decision": "CONTINUE", "reason": "making progress"},
             open_blockers=[{"node": "foo", "phase": "correspondence", "reason": "statement mismatch"}],
             review_log=[{"cycle": 41, "decision": "CONTINUE"}],
+            trusted_main_result_hashes={"main_thm": "fp-main"},
         )
         d = state.to_dict()
         restored = SupervisorState.from_dict(d)
@@ -190,6 +191,7 @@ class TestSupervisorState(unittest.TestCase):
         self.assertEqual(restored.last_review["decision"], "CONTINUE")
         self.assertEqual(restored.open_rejections[0]["node"], "foo")
         self.assertEqual(len(restored.review_log), 1)
+        self.assertEqual(restored.trusted_main_result_hashes, {"main_thm": "fp-main"})
 
     def test_save_and_load(self):
         tmpdir = Path(tempfile.mkdtemp())

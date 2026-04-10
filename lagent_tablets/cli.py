@@ -37,6 +37,7 @@ from lagent_tablets.cycle import (
     CycleOutcome,
     _normalize_theorem_stating_replay_state,
     preview_next_cycle,
+    run_cleanup_cycle,
     run_cycle,
     run_theorem_stating_cycle,
 )
@@ -126,6 +127,165 @@ def _check_restart_request(config: Config) -> bool:
     return False
 
 
+def _capture_trusted_main_result_hashes(config: Config, tablet: TabletState) -> dict[str, str]:
+    """Snapshot correspondence fingerprints for currently trusted main results."""
+    from lagent_tablets.nl_cache import NLCache
+
+    cache = NLCache(config.state_dir / "nl_cache.json")
+    trusted: dict[str, str] = {}
+    for name, node in sorted(tablet.nodes.items()):
+        if node.kind != "paper_main_result":
+            continue
+        fp = cache.correspondence_fingerprint(config.repo_path, name)
+        if fp:
+            trusted[name] = fp
+    return trusted
+
+
+def _trusted_main_result_review_issues(
+    config: Config,
+    state: SupervisorState,
+    tablet: TabletState,
+) -> list[str]:
+    """Return paper main results whose correspondence drifted after human review."""
+    trusted = dict(state.trusted_main_result_hashes)
+    if not trusted:
+        return []
+
+    from lagent_tablets.nl_cache import NLCache
+
+    cache = NLCache(config.state_dir / "nl_cache.json")
+    current_main_results = {
+        name for name, node in tablet.nodes.items()
+        if node.kind == "paper_main_result"
+    }
+    issues: list[str] = []
+
+    removed = sorted(set(trusted) - current_main_results)
+    issues.extend(f"{name}: removed from the main-result set after human review" for name in removed)
+
+    added = sorted(current_main_results - set(trusted))
+    issues.extend(f"{name}: newly classified as a paper main result after human review" for name in added)
+
+    for name in sorted(current_main_results & set(trusted)):
+        current_fp = cache.correspondence_fingerprint(config.repo_path, name)
+        if not current_fp:
+            issues.append(f"{name}: current correspondence fingerprint could not be computed")
+            continue
+        if current_fp != trusted[name]:
+            issues.append(f"{name}: correspondence changed since the last human-reviewed package")
+
+    return issues
+
+
+def _process_human_feedback_signal(config: Config, state: SupervisorState) -> bool:
+    feedback_path = config.state_dir / "human_feedback.json"
+    if not feedback_path.exists():
+        return False
+    try:
+        fb = json.loads(feedback_path.read_text(encoding="utf-8"))
+        feedback_text = fb.get("feedback", "")
+        print(f"Human feedback received: {str(feedback_text)[:100]}")
+        state.human_input = str(feedback_text)
+        state.human_input_at_cycle = state.cycle
+        state.awaiting_human_input = False
+        state.last_review = {
+            "decision": "CONTINUE",
+            "reason": "Human feedback",
+            "next_prompt": str(feedback_text),
+        }
+        feedback_path.unlink()
+    except Exception:
+        pass
+    return True
+
+
+def _process_human_approval_signal(
+    config: Config,
+    state: SupervisorState,
+    tablet: TabletState,
+    *,
+    next_phase: Optional[str] = None,
+) -> bool:
+    approve_path = config.state_dir / "human_approve.json"
+    if not approve_path.exists():
+        return False
+    try:
+        approve_path.unlink()
+    except OSError:
+        pass
+
+    if next_phase is not None:
+        print(f"Human approved. Advancing phase: {state.phase} -> {next_phase}")
+        if state.phase == "theorem_stating" and next_phase == "proof_formalization":
+            state.trusted_main_result_hashes = _capture_trusted_main_result_hashes(config, tablet)
+            print(f"  Trusted paper main results: {len(state.trusted_main_result_hashes)}")
+        state.phase = next_phase
+        state.last_review = None
+        state.open_rejections = []
+        state.awaiting_human_input = False
+        return True
+
+    if (
+        isinstance(state.last_review, dict)
+        and state.last_review.get("decision") == "NEED_INPUT"
+        and state.last_review.get("human_gate") == "paper_main_result_correspondence"
+    ):
+        state.trusted_main_result_hashes = _capture_trusted_main_result_hashes(config, tablet)
+        state.awaiting_human_input = False
+        state.last_review = {
+            "decision": "CONTINUE",
+            "reason": "Human re-approved the paper main results after correspondence drift.",
+            "next_prompt": "Continue from the current phase with the newly re-trusted paper main results.",
+        }
+        print(f"Human approved updated paper main results. Trusted set: {len(state.trusted_main_result_hashes)}")
+        return True
+
+    state.awaiting_human_input = False
+    state.last_review = {
+        "decision": "CONTINUE",
+        "reason": "Human approved continuation.",
+        "next_prompt": "Continue from the current phase.",
+    }
+    print("Human approved continuation.")
+    return True
+
+
+def _apply_trusted_main_result_review_gate(
+    config: Config,
+    state: SupervisorState,
+    tablet: TabletState,
+) -> bool:
+    """Require renewed human review when trusted paper main results drift."""
+    issues = _trusted_main_result_review_issues(config, state, tablet)
+    if not issues:
+        return False
+    state.awaiting_human_input = True
+    state.last_review = {
+        "decision": "NEED_INPUT",
+        "human_gate": "paper_main_result_correspondence",
+        "reason": "Human-reviewed paper main results lost correspondence and must be reviewed again.",
+        "next_prompt": (
+            "Review the changed paper main results. Approve to re-trust the current package, "
+            "or provide human feedback describing what must be restored."
+        ),
+        "issues": issues,
+    }
+    print("Trusted paper-main-result review gate opened:")
+    for issue in issues:
+        print(f"  - {issue}")
+    write_live_viewer_state(
+        viewer_state_path(config.state_dir),
+        config.repo_path,
+        tablet,
+        state,
+        source="reviewer",
+        fast=False,
+    )
+    save_state(state_path(config), state)
+    return True
+
+
 def _restart_supervisor_process(argv: list[str]) -> None:
     """Replace the current process with a fresh supervisor process."""
     print("Restart requested. Restarting supervisor now.")
@@ -170,43 +330,18 @@ def should_stop(
             print("Already at last phase. Stopping.")
             return True
 
-        # Check for human approval signal (written by web viewer)
-        approve_path = config.state_dir / "human_approve.json"
-        feedback_path = config.state_dir / "human_feedback.json"
-
-        if approve_path.exists():
-            # Human approved — advance
-            try:
-                approve_path.unlink()
-            except OSError:
-                pass
-            next_phase = PHASES[current_idx + 1]
-            print(f"Human approved. Advancing phase: {state.phase} -> {next_phase}")
-            state.phase = next_phase
-            state.last_review = None
-            state.open_rejections = []
+        if _process_human_approval_signal(
+            config,
+            state,
+            tablet,
+            next_phase=PHASES[current_idx + 1],
+        ):
             if stop_at_phase_boundary:
                 print("Stopping at phase boundary as requested.")
                 return True
             return False
 
-        if feedback_path.exists():
-            # Human gave feedback — store persistently and continue
-            try:
-                fb = json.loads(feedback_path.read_text(encoding="utf-8"))
-                feedback_text = fb.get("feedback", "")
-                print(f"Human feedback received: {feedback_text[:100]}")
-                state.human_input = feedback_text
-                state.human_input_at_cycle = state.cycle
-                state.awaiting_human_input = False
-                state.last_review = {
-                    "decision": "CONTINUE",
-                    "reason": "Human feedback",
-                    "next_prompt": feedback_text,
-                }
-                feedback_path.unlink()
-            except Exception:
-                pass
+        if _process_human_feedback_signal(config, state):
             return False
 
         # No human signal — pause and wait for review via web viewer
@@ -217,6 +352,10 @@ def should_stop(
 
     # Reviewer said NEED_INPUT
     if state.last_review and state.last_review.get("decision") == "NEED_INPUT":
+        if _process_human_approval_signal(config, state, tablet):
+            return False
+        if _process_human_feedback_signal(config, state):
+            return False
         print("Reviewer requested human input. Stopping.")
         state.awaiting_human_input = True
         return True
@@ -232,6 +371,7 @@ def should_stop(
         if state.phase == "proof_formalization":
             print("Proof formalization complete. Advancing to cleanup.")
             state.phase = "proof_complete_style_cleanup"
+            state.cleanup_last_good_commit = f"cycle-{state.cycle}"
             if stop_at_phase_boundary:
                 print("Stopping at phase boundary as requested.")
                 return True
@@ -256,6 +396,8 @@ def main(argv: Optional[list] = None) -> int:
                         help="Stop when the phase changes (e.g., theorem_stating -> proof_formalization)")
     parser.add_argument("--rewind-to-cycle", type=int, default=None, metavar="N",
                         help="Rewind repo to cycle N (clears agent sessions) and exit")
+    parser.add_argument("--rewind-stage", choices=["worker", "verification", "reviewer"], default="reviewer",
+                        help="Exact committed checkpoint to restore with --rewind-to-cycle (default: reviewer/final)")
     parser.add_argument("--resume-from", choices=["verification", "reviewer"], default=None,
                         help="Resume current cycle from a mid-cycle checkpoint (skip earlier stages)")
     args = parser.parse_args(argv)
@@ -271,6 +413,7 @@ def main(argv: Optional[list] = None) -> int:
     if args.rewind_to_cycle is not None:
         success = rewind_to_cycle(
             config.repo_path, args.rewind_to_cycle,
+            stage=args.rewind_stage,
             burst_user=config.tmux.burst_user,
         )
         return 0 if success else 1
@@ -336,6 +479,12 @@ def main(argv: Optional[list] = None) -> int:
 
     if args.preview_next_cycle:
         preview = preview_next_cycle(config, state, tablet, policy)
+        trusted_issues = _trusted_main_result_review_issues(config, state, tablet)
+        if trusted_issues:
+            preview["preflight_error"] = (
+                "Human-reviewed paper main results lost correspondence and require renewed human review."
+            )
+            preview["trusted_main_result_issues"] = trusted_issues
         summary = {
             k: v for k, v in preview.items()
             if k != "worker_prompt"
@@ -428,6 +577,7 @@ def main(argv: Optional[list] = None) -> int:
             health.on_cycle_outcome(state.cycle, outcome.outcome, outcome.detail)
             previous_outcome = outcome
             fix_lake_permissions(config.repo_path)
+            _apply_trusted_main_result_review_gate(config, state, tablet)
 
             if remaining_cycles is not None:
                 remaining_cycles -= 1
@@ -447,19 +597,28 @@ def main(argv: Optional[list] = None) -> int:
             print(f"Phase {state.phase} is not yet implemented. Use --dry-run to validate config.")
             return 0
 
-        # Ensure there's an active OPEN node
+        # Ensure there's an active node
         current = state.active_node or tablet.active_node
-        if current and current in tablet.nodes and tablet.nodes[current].status == "closed":
+        if state.phase == "proof_formalization" and current and current in tablet.nodes and tablet.nodes[current].status == "closed":
             current = ""  # Active node is already closed, need a new one
         if not current:
-            open_nodes = [n for n, node in sorted(tablet.nodes.items())
-                         if node.status == "open" and node.kind != "preamble"]
-            if open_nodes:
-                current = open_nodes[0]
-                print(f"  Selecting next open node: {current}")
+            if state.phase == "proof_complete_style_cleanup":
+                cleanup_nodes = [n for n, node in sorted(tablet.nodes.items()) if node.kind != "preamble"]
+                if cleanup_nodes:
+                    current = cleanup_nodes[0]
+                    print(f"  Selecting cleanup focus node: {current}")
+                else:
+                    print("No cleanup-capable nodes found. Stopping.")
+                    break
             else:
-                print("No open nodes. All done?")
-                break
+                open_nodes = [n for n, node in sorted(tablet.nodes.items())
+                             if node.status == "open" and node.kind != "preamble"]
+                if open_nodes:
+                    current = open_nodes[0]
+                    print(f"  Selecting next open node: {current}")
+                else:
+                    print("No open nodes. All done?")
+                    break
         state.active_node = current
         tablet.active_node = current
 
@@ -476,13 +635,20 @@ def main(argv: Optional[list] = None) -> int:
 
         # Run one cycle
         health.on_cycle_start(state.cycle + 1)
-        outcome = run_cycle(
-            config, state, tablet, policy,
-            previous_outcome=previous_outcome.to_dict() if isinstance(previous_outcome, CycleOutcome) else previous_outcome,
-        )
+        if state.phase == "proof_complete_style_cleanup":
+            outcome = run_cleanup_cycle(
+                config, state, tablet, policy,
+                previous_outcome=previous_outcome.to_dict() if isinstance(previous_outcome, CycleOutcome) else previous_outcome,
+            )
+        else:
+            outcome = run_cycle(
+                config, state, tablet, policy,
+                previous_outcome=previous_outcome.to_dict() if isinstance(previous_outcome, CycleOutcome) else previous_outcome,
+            )
         health.on_cycle_outcome(state.cycle, outcome.outcome, outcome.detail)
 
         previous_outcome = outcome
+        _apply_trusted_main_result_review_gate(config, state, tablet)
 
         # Fix .lake permissions after each cycle
         fix_lake_permissions(config.repo_path)

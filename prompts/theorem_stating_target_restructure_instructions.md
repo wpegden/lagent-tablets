@@ -28,15 +28,18 @@ RESTRUCTURE EXPECTATIONS:
 - If you add or revise prerequisite nodes, make the dependency chain explicit in `.lean` imports and `.tex` citations
 - If the target's statement or interface changes, update any downstream consumers only as far as needed to keep the target-centered region internally consistent
 - Every node you touch or create must remain in `{target}`'s authorized impact region by the end of the cycle
+- If you can completely close `{target}` or a newly added prerequisite node in Lean within this authorized region, you may do that in this cycle. In that case, run `python3 {check_script} node <node_name> {repo_path}` and only treat the Lean shortcut as complete if that exact deterministic check passes.
 
 TABLET / NODE RULES:
 - Every node must still have matching `.lean` and `.tex` files
 - Every definition must be concrete: no `opaque`, no `axiom`, no `sorry` in definitions
 - Prefer existing Mathlib definitions over project wrappers whenever feasible
+- Do not use theorem/lemma/corollary nodes as disguised definitions. If you are introducing a paper-facing concept, make it an actual definition node.
 - Use `\noderef{{name}}` to cite other nodes in NL proofs
 - The paper's detail level is a floor, not a ceiling
 
 MANDATORY BEFORE SUBMITTING:
+- Run `{target_edit_scope_check_command}` and fix any scope violations
 - Run `{scoped_tablet_check_command}` and fix any newly introduced deterministic errors in the authorized impact region
 - Pre-existing unrelated deterministic errors outside that authorized region do not need to be fixed in this cycle
 

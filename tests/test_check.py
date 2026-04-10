@@ -139,6 +139,49 @@ class TestAxiomAudit(unittest.TestCase):
         self.assertFalse(result["tex_format_valid"])
         self.assertTrue(any(".tex format errors" in err for err in result["errors"]))
 
+    def test_check_node_warns_when_definition_like_roles_mismatch(self):
+        repo = self._make_repo("-- [TABLET NODE: foo]\ntheorem foo : True := by\n  trivial\n")
+        (repo / "Tablet" / "foo.tex").write_text(
+            "\\begin{definition}[foo]\nFoo.\n\\end{definition}\n",
+            encoding="utf-8",
+        )
+
+        with patch("lagent_tablets.check.run_lake_env_lean", return_value={"ok": True, "returncode": 0, "output": ""}):
+            result = check_node(
+                repo,
+                "foo",
+                allowed_prefixes=["Mathlib"],
+                forbidden_keywords=["sorry", "axiom"],
+            )
+
+        self.assertTrue(any("disguised definitions" in warn for warn in result["warnings"]))
+
+    def test_check_tablet_validates_preamble_tex_with_definitions(self):
+        from lagent_tablets.check import check_tablet
+
+        repo = Path(tempfile.mkdtemp())
+        tablet = repo / "Tablet"
+        tablet.mkdir()
+        (tablet / "Preamble.lean").write_text("import Mathlib\n", encoding="utf-8")
+        (tablet / "Preamble.tex").write_text(
+            "\\begin{definition}[ambient]\nAmbient object.\n\\end{definition}\n"
+            "\\begin{proposition}[notation]\nNotation convention.\n\\end{proposition}\n",
+            encoding="utf-8",
+        )
+        (tablet / "foo.lean").write_text("-- [TABLET NODE: foo]\ntheorem foo : True := by\n  trivial\n", encoding="utf-8")
+        (tablet / "foo.tex").write_text("\\begin{theorem}True\\end{theorem}\n", encoding="utf-8")
+
+        with patch("lagent_tablets.check.run_lake_env_lean", return_value={"ok": True, "returncode": 0, "output": ""}), \
+             patch("lagent_tablets.check.run_lake_build_tablet", return_value={"ok": True, "output": "", "returncode": 0}), \
+             patch("lagent_tablets.check.run_print_axioms", return_value={"ok": True, "returncode": 0, "output": "'foo' does not depend on any axioms"}):
+            result = check_tablet(
+                repo,
+                allowed_prefixes=["Mathlib"],
+                forbidden_keywords=["sorry", "axiom"],
+            )
+
+        self.assertTrue(result["ok"])
+
 
 class TestWriteScripts(unittest.TestCase):
 
@@ -226,6 +269,16 @@ class TestArtifactValidation(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertTrue(any("target_edit_mode must be one of" in err for err in result["errors"]))
 
+    def test_validates_cleanup_reviewer_decision(self):
+        result = validate_reviewer_decision_data({
+            "decision": "DONE",
+            "reason": "Cleanup is complete.",
+            "next_prompt": "",
+            "next_active_node": "",
+            "paper_focus_ranges": [],
+        }, phase="proof_complete_style_cleanup")
+        self.assertTrue(result["ok"])
+
     def test_validates_worker_handoff_new_nodes_exist(self):
         repo = Path(tempfile.mkdtemp())
         tablet = repo / "Tablet"
@@ -252,6 +305,14 @@ class TestArtifactValidation(unittest.TestCase):
         }, phase="theorem_stating")
         self.assertFalse(result["ok"])
         self.assertTrue(any("kind_hints keys must be listed in new_nodes" in err for err in result["errors"]))
+
+    def test_validates_cleanup_worker_handoff(self):
+        result = validate_worker_handoff_data({
+            "summary": "Tidied imports and comments.",
+            "status": "DONE",
+            "new_nodes": [],
+        }, phase="proof_complete_style_cleanup")
+        self.assertTrue(result["ok"])
 
     def test_scoped_tablet_check_ignores_unrelated_baseline_debt(self):
         repo = Path(tempfile.mkdtemp())

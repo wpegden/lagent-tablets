@@ -445,6 +445,9 @@ def correspondence_text_fingerprint(repo: Path, node_name: str) -> Optional[str]
         "node:" + node_name,
         "tex:" + _hash_content(tex_statement),
     ]
+    preamble_tex = _read_file(repo / "Tablet" / "Preamble.tex")
+    if preamble_tex.strip():
+        parts.append("preamble_tex:" + _hash_content(preamble_tex.strip()))
 
     all_deps = _get_recursive_imports(repo, node_name)
     all_deps.discard(node_name)
@@ -473,6 +476,9 @@ def historical_correspondence_text_fingerprint(repo: Path, rev: str, node_name: 
         "node:" + node_name,
         "tex:" + _hash_content(tex_statement),
     ]
+    preamble_tex = _git_read_file(repo, rev, "Tablet/Preamble.tex")
+    if preamble_tex.strip():
+        parts.append("preamble_tex:" + _hash_content(preamble_tex.strip()))
 
     all_deps = _get_recursive_imports_from_reader(node_name, read_lean)
     all_deps.discard(node_name)
@@ -612,4 +618,7 @@ def correspondence_fingerprint(repo: Path, node_name: str) -> Optional[str]:
         "tex:" + _hash_content(tex_statement),
         "lean_semantic:" + _hash_content(semantic_payload),
     ]
+    preamble_tex = _read_file(repo / "Tablet" / "Preamble.tex")
+    if preamble_tex.strip():
+        parts.append("preamble_tex:" + _hash_content(preamble_tex.strip()))
     return _hash_content("|".join(parts))

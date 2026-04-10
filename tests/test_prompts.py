@@ -108,6 +108,27 @@ class TestWorkerPrompt(unittest.TestCase):
         self.assertIn("worker_handoff.raw.json", prompt)
         self.assertIn("worker_handoff.done", prompt)
 
+    def test_cleanup_worker_prompt_uses_cleanup_template(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="closed"),
+        }, active_node="main_thm")
+        state = SupervisorState(cycle=3, phase="proof_complete_style_cleanup", active_node="main_thm")
+
+        prompt = build_worker_prompt(
+            config,
+            state,
+            tablet,
+            Policy(),
+            cleanup_check_payload_path=Path("<cleanup-scope.json>"),
+        )
+        self.assertIn("proof_complete_style_cleanup phase", prompt)
+        self.assertIn("cleanup-preserving", prompt)
+        self.assertIn("--phase proof_complete_style_cleanup", prompt)
+
     def test_proof_worker_prompt_uses_phase_specific_skill_file(self):
         repo = Path(tempfile.mkdtemp())
         _setup_repo(repo)
@@ -302,6 +323,20 @@ class TestReviewerPrompt(unittest.TestCase):
 
         prompt = build_reviewer_prompt(config, state, tablet, Policy())
         self.assertIn("\"paper_focus_ranges\"", prompt)
+
+    def test_cleanup_reviewer_prompt_uses_cleanup_template(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="closed"),
+        })
+        state = SupervisorState(cycle=5, phase="proof_complete_style_cleanup", active_node="main_thm")
+
+        prompt = build_reviewer_prompt(config, state, tablet, Policy())
+        self.assertIn("proof_complete_style_cleanup phase", prompt)
+        self.assertIn("\"decision\": \"CONTINUE | NEED_INPUT | DONE\"", prompt)
 
     def test_shows_orphan_warning(self):
         repo = Path(tempfile.mkdtemp())

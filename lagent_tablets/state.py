@@ -405,6 +405,7 @@ class SupervisorState:
     human_input_at_cycle: int = 0
     awaiting_human_input: bool = False
     cleanup_last_good_commit: str = ""
+    trusted_main_result_hashes: Dict[str, str] = field(default_factory=dict)
     agent_token_usage: Dict[str, Any] = field(default_factory=dict)
     resume_from: str = ""  # mid-cycle checkpoint: "", "verification", "reviewer"
 
@@ -427,6 +428,7 @@ class SupervisorState:
             "human_input_at_cycle": self.human_input_at_cycle,
             "awaiting_human_input": self.awaiting_human_input,
             "cleanup_last_good_commit": self.cleanup_last_good_commit,
+            "trusted_main_result_hashes": self.trusted_main_result_hashes,
             "agent_token_usage": self.agent_token_usage,
             "resume_from": self.resume_from,
         }
@@ -457,6 +459,7 @@ class SupervisorState:
             human_input_at_cycle=int(raw.get("human_input_at_cycle", 0)),
             awaiting_human_input=bool(raw.get("awaiting_human_input", False)),
             cleanup_last_good_commit=str(raw.get("cleanup_last_good_commit", "")),
+            trusted_main_result_hashes=dict(raw.get("trusted_main_result_hashes", {})),
             agent_token_usage=dict(raw.get("agent_token_usage", {})),
             resume_from=str(raw.get("resume_from", "")),
         )

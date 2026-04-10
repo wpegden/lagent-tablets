@@ -12,6 +12,11 @@ from unittest.mock import patch
 
 from lagent_tablets.artifacts import done_marker_path, raw_json_path
 from lagent_tablets.config import Policy, VerificationPolicy
+from lagent_tablets.check import (
+    check_proof_easy_scope,
+    check_theorem_target_edit_scope,
+    check_theorem_target_repair_scope,
+)
 from lagent_tablets.cycle import (
     _apply_verification_to_tablet,
     _backfill_legacy_correspondence_hashes,
@@ -37,8 +42,8 @@ from lagent_tablets.cycle import (
     _theorem_stating_node_kind,
     _theorem_target_scope,
     _validate_easy_proof_repair_changes,
-    _validate_theorem_target_repair_changes,
     _validate_theorem_target_edit_scope,
+    _validate_theorem_target_repair_changes,
     run_cycle,
     run_theorem_stating_cycle,
 )

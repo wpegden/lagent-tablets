@@ -26,6 +26,8 @@ You must NOT:
 - Use `import Mathlib` -- only specific submodule imports (e.g., `import Mathlib.Analysis.SpecialFunctions.Log.Basic`)
 
 MANDATORY BEFORE SUBMITTING: Run the self-check and fix any errors:
+  {proof_scope_check_command}
+  {proof_worker_delta_check_command}
   python3 {check_script} node {node_name} {repo_path}
 You MUST iterate until the checker reports all deterministic node checks pass before writing the handoff.
 
