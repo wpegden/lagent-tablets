@@ -25,6 +25,9 @@ _HOST_RUNTIME_DIRS = (
     Path("/home/leanagent/.local/share"),
     Path("/home/leanagent/.nvm"),
 )
+_HOST_CONFIG_SYMLINKS = (
+    Path("/etc/resolv.conf"),
+)
 
 
 def bwrap_available() -> bool:
@@ -49,6 +52,23 @@ def _ancestor_dirs(paths: Iterable[Path]) -> List[Path]:
     return ordered
 
 
+def _host_extra_readonly_paths() -> List[Path]:
+    """Return extra host paths that must be mounted because config symlinks escape /etc."""
+    extra: list[Path] = []
+    seen: set[Path] = set()
+    for path in _HOST_CONFIG_SYMLINKS:
+        try:
+            resolved = path.resolve(strict=True)
+        except FileNotFoundError:
+            continue
+        if resolved.is_relative_to(Path("/etc")):
+            continue
+        if resolved not in seen:
+            extra.append(resolved)
+            seen.add(resolved)
+    return extra
+
+
 def wrap_command(
     inner_cmd: List[str],
     *,
@@ -67,8 +87,17 @@ def wrap_command(
 
     repo = work_dir.resolve()
     home = (burst_home or (Path(f"/home/{burst_user}") if burst_user else Path.home())).resolve()
+    extra_readonly = _host_extra_readonly_paths()
 
-    bind_targets = [repo, home, Path("/tmp"), Path("/var/tmp"), *[p for p in _SYSTEM_READONLY_DIRS if p.exists()], *[p for p in _HOST_RUNTIME_DIRS if p.exists()]]
+    bind_targets = [
+        repo,
+        home,
+        Path("/tmp"),
+        Path("/var/tmp"),
+        *[p for p in _SYSTEM_READONLY_DIRS if p.exists()],
+        *[p for p in _HOST_RUNTIME_DIRS if p.exists()],
+        *extra_readonly,
+    ]
     cmd: List[str] = [
         "bwrap",
         "--die-with-parent",
@@ -86,6 +115,8 @@ def wrap_command(
     for path in _HOST_RUNTIME_DIRS:
         if path.exists():
             cmd.extend(["--ro-bind", str(path), str(path)])
+    for path in extra_readonly:
+        cmd.extend(["--ro-bind", str(path), str(path)])
 
     cmd.extend(["--bind", str(home), str(home)])
     cmd.extend(["--bind", str(repo), str(repo)])

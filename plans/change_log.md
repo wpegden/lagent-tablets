@@ -36,3 +36,6 @@ Track every source change made during the bwrap isolation effort.
 - Added setup/startup sandbox preflight so bwrap host failures are caught immediately:
   - `scripts/setup_repo.sh`
   - `lagent_tablets/cli.py`
+- Fixed DNS inside the bwrap namespace by mounting escaped config symlink targets such as `/etc/resolv.conf -> /run/systemd/resolve/stub-resolv.conf`:
+  - `lagent_tablets/sandbox.py`
+  - `tests/test_sandbox.py`

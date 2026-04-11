@@ -40,6 +40,9 @@ class TestSandboxCommand(unittest.TestCase):
         self.assertIn(str(repo), rendered)
         self.assertIn(str(home), rendered)
         self.assertNotIn("extremal_vectors_tablets", rendered)
+        resolv_target = Path("/etc/resolv.conf").resolve(strict=True)
+        if not resolv_target.is_relative_to(Path("/etc")):
+            self.assertIn(str(resolv_target), rendered)
 
     def test_real_bwrap_hides_unmounted_sibling_path(self):
         if shutil.which("bwrap") is None:
@@ -65,6 +68,29 @@ class TestSandboxCommand(unittest.TestCase):
                 "-lc",
                 f"test -r {marker} && cat {marker} >/dev/null && test ! -e {hidden}",
             ],
+            sandbox=SandboxConfig(enabled=True, backend="bwrap"),
+            work_dir=repo,
+            burst_user=None,
+            burst_home=home,
+        )
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
+    def test_real_bwrap_keeps_resolv_conf_readable(self):
+        if shutil.which("bwrap") is None:
+            self.skipTest("bwrap not installed")
+        repo = Path(tempfile.mkdtemp())
+        home = Path(tempfile.mkdtemp())
+        ok, detail = probe_sandbox(
+            sandbox=SandboxConfig(enabled=True, backend="bwrap"),
+            work_dir=repo,
+            burst_user=None,
+            burst_home=home,
+        )
+        if not ok:
+            self.skipTest(f"bwrap unusable on this host: {detail}")
+        cmd = wrap_command(
+            ["bash", "-c", "test -r /etc/resolv.conf && cat /etc/resolv.conf >/dev/null"],
             sandbox=SandboxConfig(enabled=True, backend="bwrap"),
             work_dir=repo,
             burst_user=None,
