@@ -42,3 +42,8 @@ Track every source change made during the bwrap isolation effort.
 - Tightened clean setup validation so mathlib cache prewarm must succeed and worker-context scratch import checking is part of setup:
   - `scripts/setup_repo.sh`
   - `tests/test_setup_script.py`
+- Fixed runtime package `.olean` readability after sandboxed worker activity by normalizing `.lake/packages/*/.lake/build` in all post-worker and post-cycle supervisor paths:
+  - `lagent_tablets/cycle.py`
+  - `lagent_tablets/cli.py`
+  - `tests/test_cycle.py`
+  - `tests/test_cli.py`

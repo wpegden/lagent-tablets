@@ -3375,7 +3375,11 @@ def run_theorem_stating_cycle(
         _save_live_viewer_state(config, tablet, state, source="worker", in_flight_cycle=cycle)
 
         (repo / "Tablet").mkdir(parents=True, exist_ok=True)
-        fix_lake_permissions(repo, burst_user=config.tmux.burst_user)
+        fix_lake_permissions(
+            repo,
+            burst_user=config.tmux.burst_user,
+            include_package_builds=True,
+        )
         _setup_theorem_stating_permissions(
             config,
             target=state.theorem_soundness_target,
@@ -3454,7 +3458,11 @@ def run_theorem_stating_cycle(
                 repo_for_validation=repo,
             )
 
-            fix_lake_permissions(repo, burst_user=config.tmux.burst_user)
+            fix_lake_permissions(
+                repo,
+                burst_user=config.tmux.burst_user,
+                include_package_builds=True,
+            )
 
             # Discover what the worker created/modified before deciding whether the
             # attempt is valid, so the reviewer can inspect the actual worktree.
@@ -4134,7 +4142,11 @@ def run_cycle(
 
     # Fix .lake permissions before any compilation
     from lagent_tablets.health import fix_lake_permissions
-    fix_lake_permissions(repo, burst_user=config.tmux.burst_user)
+    fix_lake_permissions(
+        repo,
+        burst_user=config.tmux.burst_user,
+        include_package_builds=True,
+    )
 
     # Ensure oleans are up to date before the burst (so check_node works for the worker)
     _ensure_lake_build(repo)
@@ -4235,7 +4247,11 @@ def run_cycle(
     state.last_worker_handoff = worker_handoff
 
     # Fix .lake permissions after burst (worker may have created oleans)
-    fix_lake_permissions(repo, burst_user=config.tmux.burst_user)
+    fix_lake_permissions(
+        repo,
+        burst_user=config.tmux.burst_user,
+        include_package_builds=True,
+    )
 
     # Check the active node's hash AFTER the burst
     hash_after = hashlib.sha256(active_lean.read_bytes()).hexdigest() if active_lean.exists() else ""
@@ -4657,7 +4673,11 @@ def run_cleanup_cycle(
 
     from lagent_tablets.health import fix_lake_permissions
 
-    fix_lake_permissions(repo, burst_user=config.tmux.burst_user)
+    fix_lake_permissions(
+        repo,
+        burst_user=config.tmux.burst_user,
+        include_package_builds=True,
+    )
     _ensure_lake_build(repo)
     _setup_cleanup_permissions(config)
 
@@ -4734,7 +4754,11 @@ def run_cleanup_cycle(
     elif cleanup_result["errors"]:
         if state.cleanup_last_good_commit:
             _restore_cleanup_last_good_state(config, state.cleanup_last_good_commit)
-            fix_lake_permissions(repo, burst_user=config.tmux.burst_user)
+            fix_lake_permissions(
+                repo,
+                burst_user=config.tmux.burst_user,
+                include_package_builds=True,
+            )
         outcome = CycleOutcome(
             outcome="INVALID",
             detail=cleanup_result["errors"][0],

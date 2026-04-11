@@ -629,7 +629,11 @@ def main(argv: Optional[list] = None) -> int:
             )
             health.on_cycle_outcome(state.cycle, outcome.outcome, outcome.detail)
             previous_outcome = outcome
-            fix_lake_permissions(config.repo_path, burst_user=config.tmux.burst_user)
+            fix_lake_permissions(
+                config.repo_path,
+                burst_user=config.tmux.burst_user,
+                include_package_builds=True,
+            )
             _apply_trusted_main_result_review_gate(config, state, tablet)
 
             if remaining_cycles is not None:
@@ -704,7 +708,11 @@ def main(argv: Optional[list] = None) -> int:
         _apply_trusted_main_result_review_gate(config, state, tablet)
 
         # Fix .lake permissions after each cycle
-        fix_lake_permissions(config.repo_path, burst_user=config.tmux.burst_user)
+        fix_lake_permissions(
+            config.repo_path,
+            burst_user=config.tmux.burst_user,
+            include_package_builds=True,
+        )
 
         if remaining_cycles is not None:
             remaining_cycles -= 1
