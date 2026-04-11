@@ -10,7 +10,9 @@ body { font-family: 'Menlo', 'Monaco', 'Courier New', monospace; font-size: 13px
 
 header { background: #16213e; padding: 8px 16px; display: flex; align-items: center; gap: 16px; border-bottom: 1px solid #333; }
 header h1 { font-size: 14px; color: #8be9fd; }
+header .header-meta { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 header .status { color: #6272a4; font-size: 12px; }
+header .activity { color: #f1fa8c; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .main { display: flex; flex: 1; overflow: hidden; }
 
@@ -47,10 +49,13 @@ header .status { color: #6272a4; font-size: 12px; }
 .chat-entry { margin-bottom: 10px; }
 .chat-entry-label { color: #6272a4; font-size: 11px; text-transform: uppercase; margin-bottom: 4px; }
 
-.timeline { background: #16213e; padding: 8px 16px; border-top: 1px solid #333; display: flex; align-items: center; gap: 12px; }
+.timeline { background: #16213e; padding: 8px 16px; border-top: 1px solid #333; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .timeline label { color: #6272a4; font-size: 12px; white-space: nowrap; }
 .timeline input[type=range] { flex: 1; }
 .timeline .cycle-info { color: #f1fa8c; font-size: 12px; min-width: 200px; }
+.timeline .slot-labels { width: 100%; display: flex; justify-content: space-between; gap: 8px; color: #6272a4; font-size: 10px; line-height: 1.2; }
+.timeline .slot-labels button { flex: 1; min-width: 0; text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; background: transparent; border: none; color: inherit; font: inherit; cursor: pointer; padding: 2px 0; }
+.timeline .slot-labels button.selected { color: #f1fa8c; }
 
 /* DAG nodes */
 svg { width: 100%; height: 100%; }
@@ -81,6 +86,7 @@ svg { width: 100%; height: 100%; }
   header { padding: 6px 10px; gap: 8px; flex-wrap: wrap; }
   header h1 { font-size: 13px; }
   header .status { font-size: 11px; }
+  header .activity { font-size: 11px; white-space: normal; }
 
   .main { flex-direction: column; min-height: 0; }
   .dag-pane { flex: 1; padding: 8px; overflow: hidden; touch-action: none; min-height: 0; }
@@ -113,7 +119,10 @@ svg { width: 100%; height: 100%; }
 
 <header>
   <h1>Proof Tablet Viewer</h1>
-  <div class="status" id="header-status">Loading...</div>
+  <div class="header-meta">
+    <div class="status" id="header-status">Loading...</div>
+    <div class="activity" id="header-activity">Current activity: loading...</div>
+  </div>
 </header>
 
 <div class="main">
@@ -138,6 +147,7 @@ svg { width: 100%; height: 100%; }
   <label>Cycle:</label>
   <input type="range" id="cycle-slider" min="0" max="0" value="0">
   <div class="cycle-info" id="cycle-info">Current</div>
+  <div class="slot-labels" id="timeline-slot-labels"></div>
 </div>
 
 <script>
@@ -202,7 +212,52 @@ function layoutDAG(nodes, edges) {
   return positions;
 }
 
-let allNodes = {}, allCycles = [], timelineSlots = [], selectedNode = null, hoveredNode = null, currentState = {}, detailMode = 'node';
+let allNodes = {}, allCycles = [], timelineSlots = [], selectedNode = null, hoveredNode = null, currentState = {}, liveState = {}, detailMode = 'node', timelineUpdateSeq = 0, chatRenderSeq = 0;
+
+function activeNodeNames(kind) {
+  return Object.entries(allNodes)
+    .filter(([, node]) => !!(node.activity && node.activity[kind]))
+    .map(([name]) => name);
+}
+
+function summarizeNames(names, limit = 3) {
+  if (!names.length) return '';
+  if (names.length <= limit) return names.join(', ');
+  return `${names.slice(0, limit).join(', ')} +${names.length - limit} more`;
+}
+
+function currentActivityText() {
+  const meta = currentState?.meta || {};
+  const state = currentState?.state || {};
+  const corr = activeNodeNames('correspondence');
+  const sound = activeNodeNames('soundness');
+  const review = activeNodeNames('reviewer');
+  const worker = activeNodeNames('worker');
+
+  if (corr.length) return `Current activity: correspondence verification on ${summarizeNames(corr)}`;
+  if (sound.length) return `Current activity: NL proof soundness on ${summarizeNames(sound)}`;
+  if (review.length) return `Current activity: reviewer decision on ${summarizeNames(review)}`;
+  if (worker.length) return `Current activity: worker edits on ${summarizeNames(worker)}`;
+
+  if (meta.source === 'worker') return 'Current activity: worker burst';
+  if (meta.source === 'verification') return 'Current activity: verification';
+  if (meta.source === 'reviewer') return 'Current activity: reviewer decision';
+  if (meta.source === 'invalid') return 'Current activity: invalid attempt review';
+  if (meta.source === 'cycle' || meta.source === 'git') return 'Current activity: committed cycle snapshot';
+  if (state.awaiting_human_input) return 'Current activity: awaiting human input';
+  return 'Current activity: idle';
+}
+
+function renderHeader() {
+  const liveCycle = currentState.meta?.in_flight_cycle ?? currentState.state?.cycle ?? '?';
+  document.getElementById('header-status').textContent =
+    `Cycle ${liveCycle} | Phase: ${currentState.state.phase} | ${Object.values(allNodes).filter(n => n.status === 'closed').length}/${Object.keys(allNodes).length} closed`;
+  document.getElementById('header-activity').textContent = currentActivityText();
+}
+
+function liveCycleNumber() {
+  return liveState?.meta?.in_flight_cycle ?? liveState?.state?.cycle ?? currentState?.meta?.in_flight_cycle ?? currentState?.state?.cycle ?? '?';
+}
 
 function appBasePath() {
   const path = (window.location.pathname || '/').replace(/\/index\.html$/, '');
@@ -230,12 +285,10 @@ async function fetchData() {
       }),
     ]);
     allNodes = viewerRes.nodes || {};
+    liveState = viewerRes;
     currentState = viewerRes;
     allCycles = cyclesRes;
-    const liveCycle = viewerRes.meta?.in_flight_cycle ?? viewerRes.state?.cycle ?? '?';
-
-    document.getElementById('header-status').textContent =
-      `Cycle ${liveCycle} | Phase: ${viewerRes.state.phase} | ${Object.values(allNodes).filter(n => n.status === 'closed').length}/${Object.keys(allNodes).length} closed`;
+    renderHeader();
 
     // Setup slider
     const slider = document.getElementById('cycle-slider');
@@ -244,6 +297,7 @@ async function fetchData() {
     slider.min = 0;
     slider.max = Math.max(timelineSlots.length - 1, 0);
     slider.value = slider.max;
+    renderTimelineSlotLabels();
     updateCycleInfo();
 
     renderDAG();
@@ -251,6 +305,7 @@ async function fetchData() {
     renderCurrentDetail();
   } catch (err) {
     document.getElementById('header-status').textContent = `Viewer load failed: ${err.message}`;
+    document.getElementById('header-activity').textContent = 'Current activity: unavailable';
     console.error(err);
   }
 }
@@ -509,13 +564,32 @@ function selectedTimelineSlot() {
   return timelineSlots[idx];
 }
 
+function renderTimelineSlotLabels() {
+  const container = document.getElementById('timeline-slot-labels');
+  if (!container) return;
+  const selected = selectedTimelineSlot();
+  container.innerHTML = timelineSlots.map((slot, idx) => {
+    const label = slot === 'current' ? `Live ${liveCycleNumber()}` : `Cycle ${slot}`;
+    const cls = slot === selected ? 'selected' : '';
+    return `<button type="button" class="${cls}" onclick="selectTimelineSlot(${idx})">${escHtml(label)}</button>`;
+  }).join('');
+}
+
+function selectTimelineSlot(idx) {
+  const slider = document.getElementById('cycle-slider');
+  slider.value = String(idx);
+  updateCycleInfo();
+}
+
 async function renderChatDetail() {
   const pane = document.getElementById('detail-content');
   pane.innerHTML = '<h2>Chats</h2><p style="color:#6272a4">Loading chat history...</p>';
   const slot = selectedTimelineSlot();
   const url = slot === 'current' ? apiPath('chats.json') : apiPath(`chats-at/${slot}.json`);
+  const seq = ++chatRenderSeq;
   try {
     const data = await fetchViewerState(url);
+    if (seq !== chatRenderSeq) return;
     const title = slot === 'current' ? `Current Cycle ${data.cycle || '?'}` : `Cycle ${slot}`;
     if (!data.artifacts || !data.artifacts.length) {
       pane.innerHTML = `<h2>${title} Chats</h2><p style="color:#6272a4">No chats recorded for this cycle yet.</p>`;
@@ -538,6 +612,7 @@ async function renderChatDetail() {
       </details>
     `).join('');
   } catch (err) {
+    if (seq !== chatRenderSeq) return;
     pane.innerHTML = `<h2>Chats</h2><p style="color:#ff5555">${escHtml(err.message || String(err))}</p>`;
   }
 }
@@ -574,14 +649,20 @@ async function updateCycleInfo() {
   const slot = timelineSlots[idx];
   const info = document.getElementById('cycle-info');
   const isLatest = slot === 'current';
+  const seq = ++timelineUpdateSeq;
+  renderTimelineSlotLabels();
 
   if (isLatest) {
     // Show current live state
-    const liveCycle = currentState.meta?.in_flight_cycle ?? currentState.state?.cycle ?? '?';
+    const liveCycle = liveCycleNumber();
     info.textContent = `Current (live, cycle ${liveCycle})`;
     const live = await fetchViewerState(apiPath('viewer-state.json'));
+    if (seq !== timelineUpdateSeq) return;
+    liveState = live;
     allNodes = live.nodes || {};
     currentState = live;
+    renderTimelineSlotLabels();
+    renderHeader();
     renderDAG();
     renderCurrentDetail();
     return;
@@ -598,10 +679,13 @@ async function updateCycleInfo() {
   // Load historical state from git
   try {
     const resp = await fetch(apiPath(`state-at/${val}.json`));
+    if (seq !== timelineUpdateSeq) return;
     if (resp.ok) {
       const data = await resp.json();
+      if (seq !== timelineUpdateSeq) return;
       allNodes = data.nodes || {};
       currentState = data;
+      renderHeader();
       const svg = document.getElementById('dag-svg');
       const savedVB = svg.getAttribute('viewBox');
       renderDAG();

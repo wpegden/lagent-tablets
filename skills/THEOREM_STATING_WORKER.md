@@ -49,6 +49,7 @@ If Loogle returns a type-mismatch or application-shape error, treat that as a ba
 ## Checks
 
 Run the exact checker command given in the prompt before writing the handoff.
+Wait for that checker command to finish before doing anything else, and only then write the done marker.
 
 ## Lean Build Hygiene
 

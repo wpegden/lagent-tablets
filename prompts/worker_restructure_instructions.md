@@ -44,6 +44,7 @@ WHEN DONE -- write the raw handoff JSON to `{raw_output_path}`:
 }}
 Then run:
   python3 {check_script} worker-handoff {raw_output_path} --phase proof_formalization --repo {repo_path}
-If that passes, write the completion marker `{done_path}` and stop.
+Wait for that command to finish. Do not start any other repo command after launching this final acceptance check.
+If that passes, write the completion marker `{done_path}` and stop. Do not write the completion marker while that checker is still running.
 
 The supervisor will rerun the same checker and then write the canonical result file `{canonical_output_path}`.

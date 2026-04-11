@@ -1102,6 +1102,16 @@ def build_theorem_stating_reviewer_prompt(
         sections.append(f"--- CYCLE OUTCOME: {cycle_outcome or '?'} ---")
         if cycle_detail:
             sections.append(f"Detail: {cycle_detail}")
+        if cycle_outcome == "INVALID":
+            sections.append(
+                "Because this attempt is INVALID, your allowed decisions are only `CONTINUE` or `NEED_INPUT`."
+            )
+            sections.append(
+                "Do not use `ADVANCE_PHASE`. Review the current dirty worktree as-is and give corrective guidance."
+            )
+            sections.append(
+                "If you want a rewind, keep `decision: \"CONTINUE\"` and optionally set `reset_to_checkpoint` to a listed valid checkpoint."
+            )
         if consecutive_invalids > 0:
             sections.append(
                 f"NOTE: The worker has hit {consecutive_invalids} consecutive INVALID attempts on this in-flight cycle."

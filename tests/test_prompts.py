@@ -107,6 +107,8 @@ class TestWorkerPrompt(unittest.TestCase):
         self.assertIn(".agent-supervisor/scripts/check.py node main_thm", prompt)
         self.assertIn("worker_handoff.raw.json", prompt)
         self.assertIn("worker_handoff.done", prompt)
+        self.assertIn("Wait for that command to finish", prompt)
+        self.assertIn("Do not write the completion marker while that checker is still running", prompt)
 
     def test_cleanup_worker_prompt_uses_cleanup_template(self):
         repo = Path(tempfile.mkdtemp())
@@ -581,6 +583,28 @@ class TestTheoremStatingPrompts(unittest.TestCase):
 
         prompt = build_theorem_stating_prompt(config, state, tablet, Policy())
         self.assertIn("THEOREM_STATING_WORKER.md", prompt)
+        self.assertIn("Wait for that command to finish", prompt)
+        self.assertIn("Do not write the completion marker while that checker is still running", prompt)
+
+    def test_theorem_stating_reviewer_prompt_restricts_invalid_attempt_decisions(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open", title="Main"),
+        })
+        state = SupervisorState(cycle=2, phase="theorem_stating")
+
+        prompt = build_theorem_stating_reviewer_prompt(
+            config,
+            state,
+            tablet,
+            Policy(),
+            validation_summary={"outcome": "INVALID", "detail": "synthetic failure", "consecutive_invalids": 1},
+        )
+        self.assertIn("allowed decisions are only `CONTINUE` or `NEED_INPUT`", prompt)
+        self.assertIn("Do not use `ADVANCE_PHASE`", prompt)
 
     def test_target_repair_prompt_does_not_reference_skill_file(self):
         repo = Path(tempfile.mkdtemp())

@@ -80,6 +80,7 @@ class TestTabletNode(unittest.TestCase):
             title="Compactness of K",
             paper_provenance="Lemma 2.1",
             lean_statement_hash="sha256:abc",
+            closed_content_hash="lean789",
             closed_at_cycle=23,
             correspondence_content_hash="corr123",
             soundness_content_hash="sound456",
@@ -93,6 +94,7 @@ class TestTabletNode(unittest.TestCase):
         self.assertEqual(restored.status, "closed")
         self.assertEqual(restored.title, "Compactness of K")
         self.assertEqual(restored.paper_provenance, "Lemma 2.1")
+        self.assertEqual(restored.closed_content_hash, "lean789")
         self.assertEqual(restored.closed_at_cycle, 23)
         self.assertEqual(restored.correspondence_content_hash, "corr123")
         self.assertEqual(restored.soundness_content_hash, "sound456")

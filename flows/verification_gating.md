@@ -39,7 +39,7 @@ run correspondence on frontier only
   +--> else
          |
          v
-      run soundness on the held target only
+      run soundness on the held target only, if a target is currently held
 ```
 
 ## Proof Formalization
@@ -48,10 +48,11 @@ run correspondence on frontier only
 valid proof worker checkpoint
   |
   v
-run correspondence on new nodes + changed active-node interfaces
+compute the stale correspondence frontier from all changed nodes and their
+statement-level consequences
   |
   v
-run soundness only on nodes that remain open
+run soundness on the stale open-node frontier
 ```
 
 ## Notes
@@ -59,3 +60,5 @@ run soundness only on nodes that remain open
 - Correspondence is the gate for soundness.
 - Closed nodes persist `soundness_status = "pass"`.
 - Per-node verifier continuity comes from each verifier seeing its own prior results for the same check.
+- No NL verification runs on theorem-stating `INVALID` attempts or accepted theorem-stating `CRISIS` escalations.
+- No NL verification runs in proof-formalization unless deterministic validation produced `PROGRESS`.

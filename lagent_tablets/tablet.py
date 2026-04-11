@@ -897,11 +897,18 @@ def register_new_node(
     return node
 
 
-def mark_node_closed(tablet: TabletState, name: str, cycle: int) -> None:
+def mark_node_closed(
+    tablet: TabletState,
+    name: str,
+    cycle: int,
+    *,
+    content_hash: str = "",
+) -> None:
     """Mark a node as closed."""
     node = tablet.nodes.get(name)
     if node:
         node.status = "closed"
+        node.closed_content_hash = content_hash
         node.closed_at_cycle = cycle
         node.soundness_status = "pass"
         node.verification_at_cycle = cycle
@@ -912,6 +919,7 @@ def mark_node_open(tablet: TabletState, name: str, cycle: int) -> None:
     node = tablet.nodes.get(name)
     if node:
         node.status = "open"
+        node.closed_content_hash = ""
         node.invalidated_at_cycle = cycle
         node.closed_at_cycle = None
         node.soundness_status = "?"

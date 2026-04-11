@@ -86,6 +86,7 @@ DEFAULT_APPROVED_AXIOMS: Tuple[str, ...] = (
     "Classical.choice",
     "Quot.sound",
 )
+AXIOM_AUDIT_TEMP_PREFIX = "axioms_"
 WORKER_STATUSES: Tuple[str, ...] = ("NOT_STUCK", "STUCK", "DONE", "NEED_INPUT", "CRISIS")
 PROOF_REVIEWER_DECISIONS: Tuple[str, ...] = (
     "CONTINUE",
@@ -272,6 +273,42 @@ def parse_print_axioms_output(output: str) -> Optional[List[str]]:
     return [part.strip() for part in body.split(",") if part.strip()]
 
 
+def _axiom_audit_temp_dir(repo: Path) -> Path:
+    """Prefer a repo-local ignored scratch dir for axiom-audit probes."""
+    temp_dir = repo / ".agent-supervisor" / "scratch" / "check"
+    try:
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(temp_dir, 0o2775)
+        except OSError:
+            pass
+        return temp_dir
+    except OSError:
+        temp_dir = Path(tempfile.gettempdir()) / "lagent-tablets-check"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        return temp_dir
+
+
+def cleanup_axiom_audit_temp_files(repo: Path) -> int:
+    """Remove leftover repo-local axiom-audit temp files."""
+    removed = 0
+    for directory in (
+        repo / ".agent-supervisor" / "scratch" / "check",
+        repo / ".agent-supervisor" / "staging",
+    ):
+        if not directory.exists():
+            continue
+        for path in directory.glob(f"{AXIOM_AUDIT_TEMP_PREFIX}*"):
+            if not path.is_file():
+                continue
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
 def run_print_axioms(
     repo: Path,
     name: str,
@@ -281,22 +318,21 @@ def run_print_axioms(
     """Run `#print axioms <decl>` against a temporary Lean file."""
     temp_path: Optional[Path] = None
     try:
-        temp_dir = repo / ".agent-supervisor" / "staging"
-        try:
-            temp_dir.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            temp_dir = Path(tempfile.gettempdir()) / "lagent-tablets-check"
-            temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_dir = _axiom_audit_temp_dir(repo)
         with tempfile.NamedTemporaryFile(
             mode="w",
             suffix=".lean",
             dir=str(temp_dir),
-            prefix=f"axioms_{name}_",
+            prefix=f"{AXIOM_AUDIT_TEMP_PREFIX}{name}_",
             delete=False,
             encoding="utf-8",
         ) as handle:
             handle.write(f"import Tablet.{name}\n#print axioms {name}\n")
             temp_path = Path(handle.name)
+        try:
+            os.chmod(temp_path, 0o664)
+        except OSError:
+            pass
         lean_arg = (
             os.path.relpath(temp_path, repo)
             if temp_path.is_relative_to(repo)
@@ -1388,7 +1424,7 @@ def check_cleanup_preserving(
     }
 
 
-def validate_reviewer_decision_data(data: Any, *, phase: str) -> Dict[str, Any]:
+def validate_reviewer_decision_data(data: Any, *, phase: str, invalid_attempt: bool = False) -> Dict[str, Any]:
     from lagent_tablets.state import (
         normalize_open_blockers,
         normalize_orphan_resolutions,
@@ -1415,7 +1451,7 @@ def validate_reviewer_decision_data(data: Any, *, phase: str) -> Dict[str, Any]:
     elif phase == "proof_complete_style_cleanup":
         allowed_decisions = CLEANUP_REVIEWER_DECISIONS
     elif phase == "theorem_stating":
-        allowed_decisions = THEOREM_REVIEWER_DECISIONS
+        allowed_decisions = ("CONTINUE", "NEED_INPUT") if invalid_attempt else THEOREM_REVIEWER_DECISIONS
     else:
         return {"ok": False, "errors": [f"unknown reviewer phase: {phase}"], "data": None}
 
@@ -1495,6 +1531,8 @@ def validate_reviewer_decision_data(data: Any, *, phase: str) -> Dict[str, Any]:
     if phase == "theorem_stating" and reset_to_checkpoint and decision != "CONTINUE":
         errors.append("reset_to_checkpoint is only allowed when decision is CONTINUE")
 
+    if phase == "theorem_stating" and invalid_attempt and next_active_node:
+        errors.append("next_active_node must be empty on INVALID theorem_stating attempts")
     if phase == "theorem_stating" and decision == "ADVANCE_PHASE" and not next_active_node:
         errors.append("next_active_node is required when decision is ADVANCE_PHASE")
 
@@ -1508,6 +1546,7 @@ def validate_json_artifact(
     phase: Optional[str] = None,
     node_name: Optional[str] = None,
     repo: Optional[Path] = None,
+    invalid_attempt: bool = False,
 ) -> Dict[str, Any]:
     data, load_errors = _load_json_artifact(path)
     if load_errors:
@@ -1520,7 +1559,7 @@ def validate_json_artifact(
     if kind == "reviewer-decision":
         if phase is None:
             return {"ok": False, "errors": ["phase is required for reviewer-decision"], "data": None}
-        return validate_reviewer_decision_data(data, phase=phase)
+        return validate_reviewer_decision_data(data, phase=phase, invalid_attempt=invalid_attempt)
     if kind == "correspondence-result":
         return validate_correspondence_result_data(data)
     if kind == "soundness-result":

@@ -94,14 +94,19 @@ class TestAxiomAudit(unittest.TestCase):
         self.assertFalse(result["sorry_free"])
         mock_print_axioms.assert_not_called()
 
-    def test_run_print_axioms_uses_supervisor_staging_dir(self):
+    def test_run_print_axioms_uses_repo_local_scratch_dir_and_cleans_up(self):
         repo = self._make_repo("-- [TABLET NODE: foo]\ntheorem foo : True := by\n  trivial\n")
-        (repo / ".agent-supervisor" / "staging").mkdir(parents=True, exist_ok=True)
+        (repo / ".agent-supervisor" / "scratch").mkdir(parents=True, exist_ok=True)
+        seen_path = {}
 
         def fake_run(cmd, capture_output, text, cwd, timeout):
             self.assertEqual(Path(cwd), repo)
             self.assertEqual(cmd[:3], ["lake", "env", "lean"])
-            self.assertTrue(cmd[3].startswith(".agent-supervisor/staging/axioms_foo_"))
+            self.assertTrue(cmd[3].startswith(".agent-supervisor/scratch/check/axioms_foo_"))
+            temp_path = repo / cmd[3]
+            seen_path["path"] = temp_path
+            self.assertTrue(temp_path.exists())
+            self.assertEqual(temp_path.stat().st_mode & 0o777, 0o664)
             class Proc:
                 returncode = 0
                 stdout = "'foo' does not depend on any axioms"
@@ -112,6 +117,7 @@ class TestAxiomAudit(unittest.TestCase):
             result = run_print_axioms(repo, "foo")
 
         self.assertTrue(result["ok"])
+        self.assertFalse(seen_path["path"].exists())
 
     def test_check_node_rejects_marker_mismatch(self):
         repo = self._make_repo("-- [TABLET NODE: bar]\ntheorem foo : True := by\n  trivial\n")
@@ -469,6 +475,32 @@ class TestArtifactValidation(unittest.TestCase):
         }, phase="theorem_stating")
         self.assertFalse(result["ok"])
         self.assertTrue(any("reset_to_checkpoint is only allowed" in err for err in result["errors"]))
+
+    def test_invalid_theorem_attempt_rejects_advance_phase(self):
+        result = validate_reviewer_decision_data({
+            "decision": "ADVANCE_PHASE",
+            "reason": "Advance anyway.",
+            "next_prompt": "",
+            "next_active_node": "main_thm",
+            "paper_focus_ranges": [],
+            "orphan_resolutions": [],
+            "open_blockers": [],
+        }, phase="theorem_stating", invalid_attempt=True)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("decision must be one of" in err for err in result["errors"]))
+
+    def test_invalid_theorem_attempt_rejects_next_active_node(self):
+        result = validate_reviewer_decision_data({
+            "decision": "CONTINUE",
+            "reason": "Keep fixing.",
+            "next_prompt": "Repair the current worktree.",
+            "next_active_node": "main_thm",
+            "paper_focus_ranges": [],
+            "orphan_resolutions": [],
+            "open_blockers": [],
+        }, phase="theorem_stating", invalid_attempt=True)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("next_active_node must be empty" in err for err in result["errors"]))
 
     def test_validates_cleanup_reviewer_decision(self):
         result = validate_reviewer_decision_data({

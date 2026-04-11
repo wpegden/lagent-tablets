@@ -59,6 +59,7 @@ from lagent_tablets.tablet import (
 )
 from lagent_tablets.viewer_state import viewer_state_path, write_live_viewer_state
 from lagent_tablets.git_ops import init_repo, rewind_to_cycle
+from lagent_tablets.history_replay import find_first_history_divergence
 from lagent_tablets.project_paths import (
     project_chats_dir,
     project_scratch_dir,
@@ -404,6 +405,10 @@ def main(argv: Optional[list] = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="Validate config and exit")
     parser.add_argument("--preview-next-cycle", action="store_true",
                         help="Render the next worker cycle prompt/state without launching any agents")
+    parser.add_argument("--history-divergence", action="store_true",
+                        help="Replay committed history and report the first place current code diverges from the recorded run")
+    parser.add_argument("--history-max-cycle", type=int, default=None,
+                        help="Only check committed history up to cycle N (used with --history-divergence)")
     parser.add_argument("--cycles", type=int, default=None,
                         help="Run at most N cycles then stop (overrides config max_cycles)")
     parser.add_argument("--stop-at-phase-boundary", action="store_true",
@@ -508,6 +513,15 @@ def main(argv: Optional[list] = None) -> int:
             print("\n--- WORKER PROMPT ---\n")
             print(preview["worker_prompt"])
         return 1 if preview.get("preflight_error") else 0
+
+    if args.history_divergence:
+        result = find_first_history_divergence(
+            config,
+            policy,
+            max_cycle=args.history_max_cycle,
+        )
+        print(json.dumps(result.to_dict(), indent=2))
+        return 0 if result.status == "match" else 1
 
     # Config manager (for hot-reload)
     config_manager = ConfigManager(config)

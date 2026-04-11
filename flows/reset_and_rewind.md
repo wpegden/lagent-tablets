@@ -17,16 +17,17 @@ reviewer sees dirty worktree
   |      v
   |   continue from current dirty worktree
   |
-  +--> reset_to_checkpoint = valid committed ref
+  +--> CONTINUE + reset_to_checkpoint = valid committed ref
          |
          v
       supervisor enforces target is valid
          |
          v
       git reset --hard <ref>
-      git clean -fdx
+      git clean -fdx  (main repo, preserving nested chats dir entry)
       rewind nested chats repo to matching ref
       clean chats repo
+      delete future cycle tags
          |
          v
       retry from clean checkpoint
@@ -46,7 +47,16 @@ stop live processes
 reset to exact ref
   |
   v
+rewind nested chats repo to exact ref
+  |
+  v
 clean worktree
+  |
+  v
+clear provider session directories
+  |
+  v
+delete future cycle tags
   |
   v
 resume from that committed state only

@@ -23,7 +23,8 @@ GITIGNORE_CONTENT = """\
 # Build artifacts
 .lake/
 
-# Logs (ephemeral, large)
+# Runtime artifacts (ephemeral, large)
+.agent-supervisor/staging/
 .agent-supervisor/logs/
 .agent-supervisor/history/
 .agent-supervisor/chats/
@@ -47,6 +48,25 @@ GITIGNORE_CONTENT = """\
 FINAL_CYCLE_TAG_RE = re.compile(r"^cycle-(\d+)$")
 CHECKPOINT_TAG_RE = re.compile(r"^cycle-(\d+)-(worker|verification)$")
 CHECKPOINT_STAGES = ("worker", "verification")
+
+
+def _ensure_gitignore(repo: Path) -> None:
+    gitignore = repo / ".gitignore"
+    current = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
+    if current != GITIGNORE_CONTENT:
+        gitignore.write_text(GITIGNORE_CONTENT, encoding="utf-8")
+
+
+def _drop_tracked_runtime_artifacts(repo: Path) -> None:
+    # Older repos may already have staging artifacts tracked. Remove them from the
+    # index while leaving the working tree files in place.
+    _git(repo, "rm", "-r", "--cached", "--ignore-unmatch", ".agent-supervisor/staging", check=False)
+
+
+def _scrub_checkpoint_temp_files(repo: Path) -> None:
+    from lagent_tablets.check import cleanup_axiom_audit_temp_files
+
+    cleanup_axiom_audit_temp_files(repo)
 
 
 def _git(repo: Path, *args: str, check: bool = True, timeout: int = 30) -> subprocess.CompletedProcess:
@@ -237,6 +257,9 @@ def _commit_tagged_state(
     """Commit the current state and tag it with an exact checkpoint ref."""
     if not _is_git_repo(repo):
         return None
+    _ensure_gitignore(repo)
+    _drop_tracked_runtime_artifacts(repo)
+    _scrub_checkpoint_temp_files(repo)
     meta_path = repo / ".agent-supervisor" / "cycle_meta.json"
     meta_data = {
         "cycle": cycle,
@@ -277,8 +300,7 @@ def init_repo(repo: Path, *, author_name: str = "lagent-supervisor",
         _git(repo, "config", "user.email", author_email)
 
     # Always ensure .gitignore is up to date
-    gitignore = repo / ".gitignore"
-    gitignore.write_text(GITIGNORE_CONTENT, encoding="utf-8")
+    _ensure_gitignore(repo)
 
     # Set author config (may have changed)
     _git(repo, "config", "user.name", author_name)

@@ -227,6 +227,7 @@ class TabletNode:
     title: str = ""
     paper_provenance: str = ""
     lean_statement_hash: str = ""
+    closed_content_hash: str = ""
     closed_at_cycle: Optional[int] = None
     invalidated_at_cycle: Optional[int] = None
     easy_attempts: int = 0
@@ -251,6 +252,8 @@ class TabletNode:
             d["paper_provenance"] = self.paper_provenance
         if self.lean_statement_hash:
             d["lean_statement_hash"] = self.lean_statement_hash
+        if self.closed_content_hash:
+            d["closed_content_hash"] = self.closed_content_hash
         if self.closed_at_cycle is not None:
             d["closed_at_cycle"] = self.closed_at_cycle
         if self.invalidated_at_cycle is not None:
@@ -298,6 +301,7 @@ class TabletNode:
             title=str(raw.get("title", "")),
             paper_provenance=str(raw.get("paper_provenance", "")),
             lean_statement_hash=str(raw.get("lean_statement_hash", "")),
+            closed_content_hash=str(raw.get("closed_content_hash", "")),
             closed_at_cycle=raw.get("closed_at_cycle"),
             invalidated_at_cycle=raw.get("invalidated_at_cycle"),
             easy_attempts=int(raw.get("easy_attempts", 0)),

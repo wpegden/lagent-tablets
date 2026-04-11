@@ -425,7 +425,7 @@ def _apply_reset_checkpoint_overlay(
     tablet.__dict__.clear()
     tablet.__dict__.update(loaded_tablet.__dict__)
 
-    save_tablet(tablet_path(config), tablet)
+    _save_runtime_tablet(config, tablet, cycle=cycle)
     save_state(state_path(config), state)
 
 
@@ -904,6 +904,11 @@ def _save_cycle_viewer_state(
     )
 
 
+def _save_runtime_tablet(config: Config, tablet: TabletState, *, cycle: int) -> None:
+    _invalidate_closed_node_status(config, tablet, cycle=cycle)
+    save_tablet(tablet_path(config), tablet)
+
+
 def _clear_artifact_files(config: Config, canonical_name: str) -> Dict[str, Path]:
     paths = _artifact_paths(config, canonical_name)
     for key in ("canonical", "raw", "done"):
@@ -919,6 +924,7 @@ def _accept_validated_artifact(
     phase: Optional[str] = None,
     node_name: Optional[str] = None,
     repo_for_validation: Optional[Path] = None,
+    invalid_attempt: bool = False,
 ) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
     paths = _artifact_paths(config, canonical_name)
     validation = validate_json_artifact(
@@ -927,6 +933,7 @@ def _accept_validated_artifact(
         phase=phase,
         node_name=node_name,
         repo=repo_for_validation or config.repo_path,
+        invalid_attempt=invalid_attempt,
     )
     if not validation["ok"]:
         return None, "; ".join(validation["errors"])
@@ -1228,22 +1235,33 @@ def reconcile_tablet_status(config: Config, tablet: TabletState) -> List[str]:
                 approved_axioms_path=config.workflow.approved_axioms_path,
             )
             if result["ok"]:
-                mark_node_closed(tablet, name, 0)
+                mark_node_closed(
+                    tablet,
+                    name,
+                    0,
+                    content_hash=_closed_content_hash(repo, name),
+                )
                 reconciled.append(name)
                 print(f"  Reconciled: {name} passes all checks, marking closed")
             elif result["sorry_free"] and result["compiles"]:
                 # Passes compilation and sorry-free but has other issues (hash, imports)
                 # Still mark closed -- the issues are about the declaration, not the proof
-                mark_node_closed(tablet, name, 0)
+                mark_node_closed(
+                    tablet,
+                    name,
+                    0,
+                    content_hash=_closed_content_hash(repo, name),
+                )
                 reconciled.append(name)
                 print(f"  Reconciled: {name} compiles and sorry-free, marking closed (warnings: {result['warnings']})")
             else:
                 print(f"  Reconciled: {name} sorry-free but has issues: {result['errors'][:1]}")
-        elif node.status == "closed" and file_has_sorry:
-            # Node was closed but file now has sorry (e.g., statement was changed)
-            mark_node_open(tablet, name, 0)
-            reconciled.append(name)
-            print(f"  Reconciled: {name} has sorry, marking open")
+        elif node.status == "closed":
+            current_hash = _closed_content_hash(repo, name)
+            if node.closed_content_hash and node.closed_content_hash != current_hash:
+                mark_node_open(tablet, name, 0)
+                reconciled.append(name)
+                print(f"  Reconciled: {name} Lean content changed, marking open")
 
     return reconciled
 
@@ -2220,6 +2238,98 @@ def _theorem_stating_correspondence_frontier(
     return sorted(dict.fromkeys(frontier))
 
 
+def _proof_correspondence_frontier(
+    tablet: TabletState,
+    repo_path: Path,
+    *,
+    candidate_names: Optional[Sequence[str]] = None,
+) -> List[str]:
+    """Return proof-formalization nodes whose correspondence is stale or unknown.
+
+    This frontier is defined by changed statement semantics and their propagated
+    consequences, not by the active node.
+    """
+    frontier: List[str] = []
+    semantic_candidates: List[str] = []
+    names = candidate_names if candidate_names is not None else tablet.nodes.keys()
+    for raw_name in names:
+        name = str(raw_name)
+        if name not in tablet.nodes:
+            continue
+        node = tablet.nodes[name]
+        if name == PREAMBLE_NAME or node.kind == "preamble":
+            continue
+        current_text_hash = _correspondence_text_hash(repo_path, name)
+        saved_text_hash = node.correspondence_text_hash
+        if not current_text_hash or node.correspondence_status == "?":
+            frontier.append(name)
+            continue
+        if saved_text_hash and saved_text_hash != current_text_hash:
+            frontier.append(name)
+            continue
+        semantic_candidates.append(name)
+
+    if semantic_candidates:
+        prime_correspondence_fingerprints(repo_path, semantic_candidates)
+
+    for name in semantic_candidates:
+        node = tablet.nodes[name]
+        current_text_hash = _correspondence_text_hash(repo_path, name)
+        current_corr_hash = _correspondence_content_hash(repo_path, name)
+        saved_corr_hash = node.correspondence_content_hash or node.verification_content_hash
+        if not current_corr_hash or not saved_corr_hash or saved_corr_hash != current_corr_hash:
+            frontier.append(name)
+            continue
+        node.correspondence_text_hash = current_text_hash
+
+    return sorted(dict.fromkeys(frontier))
+
+
+def _proof_soundness_frontier(
+    tablet: TabletState,
+    repo_path: Path,
+    *,
+    candidate_names: Optional[Sequence[str]] = None,
+) -> List[str]:
+    """Return open proof-formalization nodes whose NL soundness is stale or unknown."""
+    frontier: List[str] = []
+    names = candidate_names if candidate_names is not None else tablet.nodes.keys()
+    for raw_name in names:
+        name = str(raw_name)
+        if name not in tablet.nodes:
+            continue
+        node = tablet.nodes[name]
+        if name == PREAMBLE_NAME or node.kind == "preamble" or node.status == "closed":
+            continue
+        current_hash = _soundness_content_hash(repo_path, name)
+        saved_hash = node.soundness_content_hash or node.verification_content_hash
+        if not current_hash or node.soundness_status == "?":
+            frontier.append(name)
+            continue
+        if not saved_hash or saved_hash != current_hash:
+            frontier.append(name)
+    return sorted(dict.fromkeys(frontier))
+
+
+def _proof_verification_region(
+    repo_path: Path,
+    changed_nodes: Sequence[str],
+) -> List[str]:
+    """Return changed proof nodes plus the import-graph region they can affect."""
+    region: Set[str] = set()
+    for raw_name in changed_nodes:
+        name = str(raw_name).strip()
+        if not name:
+            continue
+        if name == PREAMBLE_NAME:
+            current_names = _current_tablet_node_names(repo_path)
+            region.update(n for n in current_names if n != PREAMBLE_NAME)
+            continue
+        region.add(name)
+        region.update(compute_target_impact_region(repo_path, name))
+    return sorted(region)
+
+
 def _tablet_node_file_hash(repo_path: Path, name: str) -> str:
     """Hash the current on-disk .lean/.tex pair for a node."""
     h = hashlib.sha256()
@@ -2277,6 +2387,41 @@ def _theorem_stating_closed_nodes(
         if result.get("ok"):
             closed.append(name)
     return sorted(dict.fromkeys(closed))
+
+
+def _closed_content_hash(repo_path: Path, name: str) -> str:
+    lean_path = node_lean_path(repo_path, name)
+    if not lean_path.exists():
+        return ""
+    return hashlib.sha256(lean_path.read_bytes()).hexdigest()
+
+
+def _invalidate_closed_node_status(
+    config: Config,
+    tablet: TabletState,
+    *,
+    cycle: int,
+    node_names: Optional[Sequence[str]] = None,
+) -> List[str]:
+    """Reopen closed nodes whose Lean-file content changed since closure."""
+    reopened: List[str] = []
+    candidate_names = node_names if node_names is not None else tablet.nodes.keys()
+    for name in sorted(dict.fromkeys(candidate_names)):
+        if not name or name == PREAMBLE_NAME or name not in tablet.nodes:
+            continue
+        node = tablet.nodes[name]
+        if node.status != "closed":
+            continue
+        current_hash = _closed_content_hash(config.repo_path, name)
+        if not current_hash:
+            mark_node_open(tablet, name, cycle)
+            reopened.append(name)
+            continue
+        saved_hash = str(node.closed_content_hash or "")
+        if saved_hash and saved_hash != current_hash:
+            mark_node_open(tablet, name, cycle)
+            reopened.append(name)
+    return reopened
 
 
 def _changed_tablet_nodes_since_snapshot(repo_path: Path, before_hashes: Dict[str, str]) -> List[str]:
@@ -2993,7 +3138,7 @@ def _run_nl_verification(
     corr_results = [r for r in results if r.get("check") == "correspondence"]
     if corr_results and cycle is not None:
         _apply_verification_to_tablet(tablet, corr_results, cycle, repo_path=repo)
-        save_tablet(tablet_path(config), tablet)
+        _save_runtime_tablet(config, tablet, cycle=cycle)
         _save_live_viewer_state(config, tablet, state, source="verification")
 
     # 2. NL proof soundness check — only if correspondence passed (it's a gate)
@@ -3193,7 +3338,7 @@ def run_theorem_stating_cycle(
     def _theorem_invalid(detail: str, *, build_output: str = "") -> CycleOutcome:
         state.resume_from = ""
         _record_theorem_invalid_attempt(state, cycle=cycle, attempt=attempt, detail=detail)
-        save_tablet(tablet_path(config), tablet)
+        _save_runtime_tablet(config, tablet, cycle=cycle)
         save_state(state_path(config), state)
         _save_live_viewer_state(config, tablet, state, source="invalid", in_flight_cycle=cycle)
         return CycleOutcome(outcome="INVALID", detail=detail, build_output=build_output)
@@ -3426,13 +3571,24 @@ def run_theorem_stating_cycle(
                         build_output=build_output,
                     )
 
+                reopened_nodes = _invalidate_closed_node_status(
+                    config,
+                    tablet,
+                    cycle=cycle,
+                    node_names=list(new_nodes) + list(modified_existing_nodes),
+                )
                 newly_closed = _theorem_stating_closed_nodes(
                     config,
                     list(new_nodes) + list(modified_existing_nodes),
                 )
                 for name in newly_closed:
                     if name in tablet.nodes:
-                        mark_node_closed(tablet, name, cycle)
+                        mark_node_closed(
+                            tablet,
+                            name,
+                            cycle,
+                            content_hash=_closed_content_hash(repo, name),
+                        )
                 detail_parts: List[str] = []
                 if new_nodes:
                     print(f"  Created {len(new_nodes)} new nodes: {new_nodes}")
@@ -3440,11 +3596,14 @@ def run_theorem_stating_cycle(
                 if deleted_nodes:
                     print(f"  Deleted {len(deleted_nodes)} nodes: {deleted_nodes}")
                     detail_parts.append(f"Deleted nodes: {', '.join(deleted_nodes)}")
+                if reopened_nodes:
+                    print(f"  Reopened {len(reopened_nodes)} theorem-stating nodes in Lean: {reopened_nodes}")
+                    detail_parts.append(f"Reopened in Lean: {', '.join(reopened_nodes)}")
                 if newly_closed:
                     print(f"  Closed {len(newly_closed)} theorem-stating nodes in Lean: {newly_closed}")
                     detail_parts.append(f"Closed in Lean: {', '.join(newly_closed)}")
 
-                if new_nodes or deleted_nodes or newly_closed:
+                if new_nodes or deleted_nodes or reopened_nodes or newly_closed:
                     outcome = CycleOutcome(
                         outcome="PROGRESS",
                         detail=", ".join(detail_parts),
@@ -3458,7 +3617,7 @@ def run_theorem_stating_cycle(
             outcome = _theorem_invalid(exc.detail, build_output=exc.build_output)
 
         regenerate_support_files(tablet, repo)
-        save_tablet(tablet_path(config), tablet)
+        _save_runtime_tablet(config, tablet, cycle=cycle)
         if outcome.outcome != "INVALID":
             state.cycle = cycle
             _clear_theorem_invalid_attempt_tracking(state, cycle=cycle, attempt=attempt, outcome=outcome.outcome)
@@ -3505,7 +3664,7 @@ def run_theorem_stating_cycle(
         repaired_hashes = _backfill_legacy_correspondence_hashes(tablet, repo)
         repaired_failures = _repair_stale_legacy_correspondence_failures(tablet, state, repo)
         if repaired_hashes or repaired_failures:
-            save_tablet(tablet_path(config), tablet)
+            _save_runtime_tablet(config, tablet, cycle=cycle)
         all_check_nodes = [n for n in tablet.nodes if tablet.nodes[n].kind != "preamble"]
         forced_corr_nodes = _theorem_stating_persisted_correspondence_nodes(tablet, state)
         corr_check_nodes = _theorem_stating_correspondence_frontier(
@@ -3563,7 +3722,7 @@ def run_theorem_stating_cycle(
     if nl_verification_results:
         _accumulate_verification_usage(state, nl_verification_results)
         _apply_verification_to_tablet(tablet, nl_verification_results, cycle, repo_path=repo)
-        save_tablet(tablet_path(config), tablet)
+        _save_runtime_tablet(config, tablet, cycle=cycle)
         _save_live_viewer_state(config, tablet, state, source="verification")
         from lagent_tablets.git_ops import commit_checkpoint as git_commit_checkpoint
         git_commit_checkpoint(
@@ -3639,6 +3798,7 @@ def run_theorem_stating_cycle(
             "reviewer_decision.json",
             kind="reviewer-decision",
             phase="theorem_stating",
+            invalid_attempt=(outcome.outcome == "INVALID"),
         )
     if isinstance(decision, dict):
         if outcome.outcome == "INVALID":
@@ -3772,7 +3932,7 @@ def run_theorem_stating_cycle(
 
     # Clear resume checkpoint — cycle is complete
     state.resume_from = ""
-    save_tablet(tablet_path(config), tablet)
+    _save_runtime_tablet(config, tablet, cycle=cycle)
     save_state(state_path(config), state)
     if outcome.outcome == "INVALID":
         _save_live_viewer_state(config, tablet, state, source="reviewer", in_flight_cycle=cycle)
@@ -4082,7 +4242,7 @@ def run_cycle(
         if scope_error:
             outcome = CycleOutcome(outcome="INVALID", detail=scope_error)
             save_state(state_path(config), state)
-            save_tablet(tablet_path(config), tablet)
+            _save_runtime_tablet(config, tablet, cycle=cycle)
             _save_live_viewer_state(config, tablet, state, source="worker")
             return outcome
 
@@ -4114,7 +4274,7 @@ def run_cycle(
                     node_meta.easy_attempts = 0
                     print(f"  Auto-elevating {active_node} to hard (after {policy.difficulty.easy_max_retries} easy attempts)")
             save_state(state_path(config), state)
-            save_tablet(tablet_path(config), tablet)
+            _save_runtime_tablet(config, tablet, cycle=cycle)
             _save_live_viewer_state(config, tablet, state, source="worker")
             return outcome
 
@@ -4170,32 +4330,51 @@ def run_cycle(
     nl_verification_results: List[Dict[str, Any]] = []
     needs_nl_review = False
 
-    # Run correspondence/paper-faithfulness on all new nodes plus any changed active node.
-    # Run soundness only on nodes that remain open after this cycle.
+    # Run verification on the full stale frontier induced by the accepted proof delta.
+    # Verification scope is based on changed nodes and their semantic consequences,
+    # not on the active node.
     nodes_to_verify = []
     soundness_nodes_to_verify: List[str] = []
     if outcome.outcome == "PROGRESS":
         for name in outcome.nodes_created:
             if name not in tablet.nodes:
                 register_new_node(tablet, repo, name=name, kind="helper_lemma", cycle=cycle)
-        if outcome.nodes_created:
-            nodes_to_verify.extend(outcome.nodes_created)
-            soundness_nodes_to_verify.extend([n for n in outcome.nodes_created if n not in outcome.nodes_closed])
-        if active_changed or active_tex_changed:
-            if active_node not in nodes_to_verify:
-                nodes_to_verify.append(active_node)
-        if active_changed and active_node not in outcome.nodes_closed:
-            if active_node not in soundness_nodes_to_verify:
-                soundness_nodes_to_verify.append(active_node)
+        changed_nodes = sorted(
+            {
+                Path(fname).stem
+                for fname in changes["modified"]
+                if fname.endswith(".lean") or fname.endswith(".tex")
+            }
+            | set(outcome.nodes_created)
+        )
+        verification_region = _proof_verification_region(repo, changed_nodes)
+        nodes_to_verify = _proof_correspondence_frontier(
+            tablet,
+            repo,
+            candidate_names=verification_region,
+        )
+        soundness_nodes_to_verify = _proof_soundness_frontier(
+            tablet,
+            repo,
+            candidate_names=verification_region,
+        )
+        soundness_nodes_to_verify = [
+            name for name in soundness_nodes_to_verify
+            if name not in set(outcome.nodes_closed)
+        ]
 
-    if nodes_to_verify:
-        print(f"  Running NL verification for nodes: {nodes_to_verify}")
+    if nodes_to_verify or soundness_nodes_to_verify:
+        print(
+            "  Running NL verification for correspondence nodes: "
+            f"{nodes_to_verify} | soundness nodes: {soundness_nodes_to_verify}"
+        )
         needs_nl_review = True
         from lagent_tablets.nl_cache import NLCache
         nl_cache = NLCache(config.state_dir / "nl_cache.json")
         nl_verification_results = _run_nl_verification(
-            config, policy, tablet, nodes_to_verify, state=state, cycle=cycle, log_dir=log_dir, nl_cache=nl_cache,
+            config, policy, tablet, nodes_to_verify or soundness_nodes_to_verify, state=state, cycle=cycle, log_dir=log_dir, nl_cache=nl_cache,
             human_input=state.human_input,
+            correspondence_node_names=nodes_to_verify,
             soundness_node_names=soundness_nodes_to_verify,
         )
 
@@ -4254,7 +4433,12 @@ def run_cycle(
     # Apply results to tablet state
     if outcome.outcome in {"PROGRESS", "REJECTED"}:
         for name in outcome.nodes_closed:
-            mark_node_closed(tablet, name, cycle)
+            mark_node_closed(
+                tablet,
+                name,
+                cycle,
+                content_hash=_closed_content_hash(repo, name),
+            )
 
         if proof_coarse_restructure_mode and coarse_restructure_verified:
             refresh_coarse_package_hashes(
@@ -4268,20 +4452,9 @@ def run_cycle(
 
     tablet.active_node = active_node
     regenerate_support_files(tablet, repo)
-    save_tablet(tablet_path(config), tablet)
+    _save_runtime_tablet(config, tablet, cycle=cycle)
     save_state(state_path(config), state)
     _save_live_viewer_state(config, tablet, state, source="worker")
-    from lagent_tablets.git_ops import commit_checkpoint as git_commit_checkpoint
-    git_commit_checkpoint(
-        repo,
-        cycle,
-        "worker",
-        phase=state.phase,
-        outcome=outcome.outcome,
-        active_node=active_node,
-        detail=outcome.detail,
-        meta={"stage": "worker"},
-    )
     from lagent_tablets.git_ops import commit_checkpoint as git_commit_checkpoint
     git_commit_checkpoint(
         repo,
@@ -4398,7 +4571,7 @@ def run_cycle(
         else:
             print(f"  Reviewer: could not validate decision ({decision_error or 'missing raw/done artifact'})")
 
-        save_tablet(tablet_path(config), tablet)
+        _save_runtime_tablet(config, tablet, cycle=cycle)
         save_state(state_path(config), state)
         _save_live_viewer_state(config, tablet, state, source="reviewer")
 
@@ -4562,7 +4735,7 @@ def run_cleanup_cycle(
     state.validation_summary = {"consecutive_invalids": 0 if outcome.outcome != "INVALID" else 1, "last_outcome": outcome.outcome}
 
     regenerate_support_files(tablet, repo)
-    save_tablet(tablet_path(config), tablet)
+    _save_runtime_tablet(config, tablet, cycle=cycle)
     save_state(state_path(config), state)
     _save_live_viewer_state(config, tablet, state, source="worker")
 
@@ -4611,9 +4784,9 @@ def run_cleanup_cycle(
     else:
         print(f"  Reviewer: could not validate decision ({decision_error or 'missing raw/done artifact'})")
 
-    save_tablet(tablet_path(config), tablet)
-    save_state(state_path(config), state)
-    _save_live_viewer_state(config, tablet, state, source="reviewer")
+        _save_runtime_tablet(config, tablet, cycle=cycle)
+        save_state(state_path(config), state)
+        _save_live_viewer_state(config, tablet, state, source="reviewer")
 
     from lagent_tablets.git_ops import commit_cycle as git_commit
 

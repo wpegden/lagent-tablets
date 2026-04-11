@@ -438,6 +438,10 @@ class TestGitOps(unittest.TestCase):
         init_repo(self.repo)
         self.assertTrue((self.repo / ".git").exists())
         self.assertTrue((self.repo / ".gitignore").exists())
+        self.assertIn(
+            ".agent-supervisor/staging/\n",
+            (self.repo / ".gitignore").read_text(encoding="utf-8"),
+        )
 
     def test_commit_cycle(self):
         from lagent_tablets.git_ops import init_repo, commit_cycle
@@ -498,6 +502,35 @@ class TestGitOps(unittest.TestCase):
         (self.repo / "Tablet" / "a.lean").write_text("test2")
         commit_cycle(self.repo, 5, phase="test", outcome="PROGRESS")
         self.assertEqual(current_cycle_from_git(self.repo), 5)
+
+    def test_commit_cycle_drops_tracked_staging_and_scrubs_axiom_temp_files(self):
+        from lagent_tablets.git_ops import init_repo, commit_cycle
+
+        init_repo(self.repo)
+        staging = self.repo / ".agent-supervisor" / "staging"
+        staging.mkdir(parents=True, exist_ok=True)
+        tracked_raw = staging / "worker_handoff.raw.json"
+        tracked_raw.write_text("{}\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "seed tracked staging"], cwd=self.repo, check=True)
+
+        axiom_temp = staging / "axioms_foo_temp.lean"
+        axiom_temp.write_text("import Tablet.foo\n#print axioms foo\n", encoding="utf-8")
+        axiom_temp.chmod(0o600)
+        (self.repo / "Tablet" / "test.lean").write_text("theorem test := sorry")
+
+        sha = commit_cycle(self.repo, 1, phase="test", outcome="PROGRESS")
+
+        self.assertIsNotNone(sha)
+        self.assertFalse(axiom_temp.exists())
+        tracked = subprocess.run(
+            ["git", "ls-files", ".agent-supervisor/staging"],
+            capture_output=True,
+            text=True,
+            cwd=self.repo,
+            check=True,
+        )
+        self.assertEqual(tracked.stdout.strip(), "")
 
 
 # ---------------------------------------------------------------------------

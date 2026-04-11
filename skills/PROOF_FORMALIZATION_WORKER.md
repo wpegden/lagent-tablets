@@ -9,6 +9,7 @@ The emitted prompt is authoritative.
 - Prove one assigned Lean node at a time.
 - Do not pick your own node.
 - Run the exact checker command from the prompt before writing the handoff.
+- Wait for that checker command to finish before doing anything else, and only then write the done marker.
 
 ## Loogle First
 
