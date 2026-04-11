@@ -13,6 +13,7 @@ from lagent_tablets.config import (
     ConfigManager,
     Policy,
     PolicyManager,
+    SandboxConfig,
     load_config,
     policy_to_dict,
 )
@@ -56,6 +57,8 @@ class TestLoadConfig(unittest.TestCase):
         self.assertEqual(config.workflow.allowed_import_prefixes, ["Mathlib"])
         self.assertEqual(config.max_cycles, 0)
         self.assertIsNotNone(config.policy_path)
+        self.assertTrue(config.sandbox.enabled)
+        self.assertEqual(config.sandbox.backend, "bwrap")
 
     def test_rejects_missing_repo(self):
         path = Path(tempfile.mkdtemp()) / "config.json"
@@ -170,6 +173,12 @@ class TestLoadConfig(unittest.TestCase):
         config = load_config(path)
         self.assertEqual(config.chat.root_dir, (repo / ".agent-supervisor" / "chats").resolve())
 
+    def test_can_disable_sandbox_explicitly(self):
+        repo = self._make_repo()
+        path = self._write_config(repo, sandbox={"enabled": False, "backend": "bwrap"})
+        config = load_config(path)
+        self.assertFalse(config.sandbox.enabled)
+
 
 class TestPolicyManager(unittest.TestCase):
 
@@ -181,6 +190,7 @@ class TestPolicyManager(unittest.TestCase):
             worker=ProviderConfig(provider="claude"), reviewer=ProviderConfig(provider="claude"),
             verification=VerificationConfig(),
             tmux=TmuxConfig(session_name="t", dashboard_window_name="d", kill_windows_after_capture=True, burst_user="u"),
+            sandbox=SandboxConfig(),
             workflow=WorkflowConfig(start_phase="paper_check", paper_tex_path=None, approved_axioms_path=tmpdir / "ax.json", allowed_import_prefixes=["Mathlib"], forbidden_keyword_allowlist=[], human_input_path=tmpdir / "h.md", input_request_path=tmpdir / "i.md"),
             chat=ChatConfig(root_dir=tmpdir, repo_name="test", project_name="test", public_base_url="http://x"),
             git=GitConfig(remote_url=None, remote_name="origin", branch="main", author_name="test", author_email="test@test"),
@@ -204,6 +214,7 @@ class TestPolicyManager(unittest.TestCase):
             worker=ProviderConfig(provider="claude"), reviewer=ProviderConfig(provider="claude"),
             verification=VerificationConfig(),
             tmux=TmuxConfig(session_name="t", dashboard_window_name="d", kill_windows_after_capture=True, burst_user="u"),
+            sandbox=SandboxConfig(),
             workflow=WorkflowConfig(start_phase="paper_check", paper_tex_path=None, approved_axioms_path=tmpdir / "ax.json", allowed_import_prefixes=["Mathlib"], forbidden_keyword_allowlist=[], human_input_path=tmpdir / "h.md", input_request_path=tmpdir / "i.md"),
             chat=ChatConfig(root_dir=tmpdir, repo_name="test", project_name="test", public_base_url="http://x"),
             git=GitConfig(remote_url=None, remote_name="origin", branch="main", author_name="test", author_email="test@test"),
@@ -230,6 +241,7 @@ class TestPolicyManager(unittest.TestCase):
             worker=ProviderConfig(provider="claude"), reviewer=ProviderConfig(provider="claude"),
             verification=VerificationConfig(),
             tmux=TmuxConfig(session_name="t", dashboard_window_name="d", kill_windows_after_capture=True, burst_user="u"),
+            sandbox=SandboxConfig(),
             workflow=WorkflowConfig(start_phase="paper_check", paper_tex_path=None, approved_axioms_path=tmpdir / "ax.json", allowed_import_prefixes=["Mathlib"], forbidden_keyword_allowlist=[], human_input_path=tmpdir / "h.md", input_request_path=tmpdir / "i.md"),
             chat=ChatConfig(root_dir=tmpdir, repo_name="test", project_name="test", public_base_url="http://x"),
             git=GitConfig(remote_url=None, remote_name="origin", branch="main", author_name="test", author_email="test@test"),
@@ -262,6 +274,7 @@ class TestPolicyManager(unittest.TestCase):
             worker=ProviderConfig(provider="claude"), reviewer=ProviderConfig(provider="claude"),
             verification=VerificationConfig(),
             tmux=TmuxConfig(session_name="t", dashboard_window_name="d", kill_windows_after_capture=True, burst_user="u"),
+            sandbox=SandboxConfig(),
             workflow=WorkflowConfig(start_phase="paper_check", paper_tex_path=None, approved_axioms_path=tmpdir / "ax.json", allowed_import_prefixes=["Mathlib"], forbidden_keyword_allowlist=[], human_input_path=tmpdir / "h.md", input_request_path=tmpdir / "i.md"),
             chat=ChatConfig(root_dir=tmpdir, repo_name="test", project_name="test", public_base_url="http://x"),
             git=GitConfig(remote_url=None, remote_name="origin", branch="main", author_name="test", author_email="test@test"),

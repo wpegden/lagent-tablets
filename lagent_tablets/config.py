@@ -39,6 +39,12 @@ class TmuxConfig:
 
 
 @dataclass
+class SandboxConfig:
+    enabled: bool = True
+    backend: str = "bwrap"
+
+
+@dataclass
 class PhaseOverride:
     """Per-phase overrides for provider models."""
     worker_model: Optional[str] = None
@@ -113,6 +119,7 @@ class Config:
     reviewer: ProviderConfig
     verification: VerificationConfig
     tmux: TmuxConfig
+    sandbox: SandboxConfig
     workflow: WorkflowConfig
     chat: ChatConfig
     git: GitConfig
@@ -393,6 +400,19 @@ def load_config(path: Path) -> Config:
         burst_home=Path(tmux_raw["burst_home"]) if tmux_raw.get("burst_home") else None,
     )
 
+    sandbox_raw = raw.get("sandbox", {})
+    if sandbox_raw is None:
+        sandbox_raw = {}
+    if not isinstance(sandbox_raw, dict):
+        raise ConfigError("config.sandbox must be a dict")
+    sandbox_backend = str(sandbox_raw.get("backend", "bwrap")).strip().lower() or "bwrap"
+    if sandbox_backend not in {"bwrap"}:
+        raise ConfigError(f"config.sandbox.backend must be 'bwrap', got {sandbox_backend!r}")
+    sandbox = SandboxConfig(
+        enabled=bool(sandbox_raw.get("enabled", True)),
+        backend=sandbox_backend,
+    )
+
     # workflow
     wf_raw = raw.get("workflow", {})
     if not isinstance(wf_raw, dict):
@@ -485,6 +505,7 @@ def load_config(path: Path) -> Config:
         reviewer=reviewer,
         verification=verification,
         tmux=tmux,
+        sandbox=sandbox,
         workflow=workflow,
         chat=chat,
         git=git,

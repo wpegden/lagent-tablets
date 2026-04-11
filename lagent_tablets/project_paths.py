@@ -25,6 +25,18 @@ def project_scratch_dir(state_dir: Path) -> Path:
     return state_dir / "scratch"
 
 
+def project_runtime_dir(state_dir: Path) -> Path:
+    return state_dir / "runtime"
+
+
+def project_runtime_src_dir(state_dir: Path) -> Path:
+    return project_runtime_dir(state_dir) / "src"
+
+
+def project_runtime_skills_dir(state_dir: Path) -> Path:
+    return project_runtime_dir(state_dir) / "skills"
+
+
 def project_viewer_dir(state_dir: Path) -> Path:
     return state_dir / "viewer"
 

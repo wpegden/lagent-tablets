@@ -6,9 +6,11 @@ Demonstrate that a clean reseed using the new bwrap isolation system can run thr
 
 ## Clean-start protocol
 
+This validation starts from the setup script itself. No hand-built project state counts.
+
 1. stop any existing `extremal` run
 2. wipe the repo
-3. reseed from the paper
+3. run `scripts/setup_repo.sh --reset ...` from the paper
 4. confirm sandbox is enabled in the generated config
 5. confirm the worker cannot read a sibling repo from inside the sandbox before the supervisor starts
 6. start the supervisor

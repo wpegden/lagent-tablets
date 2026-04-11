@@ -9,7 +9,7 @@ from pathlib import Path
 
 from lagent_tablets.config import (
     BranchingConfig, ChatConfig, Config, GitConfig, Policy,
-    ProviderConfig, TmuxConfig, VerificationConfig, WorkflowConfig,
+    ProviderConfig, SandboxConfig, TmuxConfig, VerificationConfig, WorkflowConfig,
     VerificationPolicy,
 )
 from lagent_tablets.state import SupervisorState, TabletNode, TabletState
@@ -31,6 +31,7 @@ def _make_config(repo: Path) -> Config:
         worker=ProviderConfig(provider="claude"), reviewer=ProviderConfig(provider="claude"),
         verification=VerificationConfig(),
         tmux=TmuxConfig(session_name="t", dashboard_window_name="d", kill_windows_after_capture=True, burst_user="u"),
+        sandbox=SandboxConfig(),
         workflow=WorkflowConfig(
             start_phase="proof_formalization", paper_tex_path=repo / "paper.tex",
             approved_axioms_path=repo / "ax.json", allowed_import_prefixes=["Mathlib"],

@@ -29,6 +29,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from lagent_tablets.nl_cache import correspondence_fingerprint
+from lagent_tablets.project_paths import project_runtime_src_dir
+from lagent_tablets.runtime_snapshot import materialize_project_runtime
 
 
 # ---------------------------------------------------------------------------
@@ -1983,6 +1985,7 @@ def write_scripts(
     The key script is check.py -- the single source of truth used by both the
     supervisor and workers. The shell wrappers are conveniences only.
     """
+    materialize_project_runtime(repo_path, state_dir)
     scripts_dir = state_dir / "scripts"
     scripts_dir.mkdir(parents=True, exist_ok=True)
     gid: Optional[int] = None
@@ -1997,7 +2000,7 @@ def write_scripts(
 
     check_src = Path(__file__)
     check_dst = scripts_dir / "check.py"
-    source_root = str(Path(__file__).resolve().parent.parent)
+    source_root = str(project_runtime_src_dir(state_dir).resolve())
     check_text = check_src.read_text(encoding="utf-8")
     bootstrap = (
         "import sys as _sys\n"

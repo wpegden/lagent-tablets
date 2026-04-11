@@ -92,6 +92,34 @@ if ! sudo -n -u "$BURST_USER" true >/dev/null 2>&1; then
   echo "       Expected: sudo -n -u $BURST_USER true" >&2
   exit 1
 fi
+if ! command -v bwrap >/dev/null 2>&1; then
+  echo "ERROR: bwrap is required for sandboxed agent bursts." >&2
+  exit 1
+fi
+if ! PYTHONPATH="$SOURCE_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - "$REPO" "$BURST_USER" "$BURST_HOME" <<'PY'
+import sys
+from pathlib import Path
+
+from lagent_tablets.config import SandboxConfig
+from lagent_tablets.sandbox import probe_sandbox
+
+repo = Path(sys.argv[1]).resolve()
+burst_user = sys.argv[2]
+burst_home = Path(sys.argv[3]).resolve()
+ok, detail = probe_sandbox(
+    sandbox=SandboxConfig(enabled=True, backend="bwrap"),
+    work_dir=repo.parent if repo.exists() else Path.cwd(),
+    burst_user=burst_user,
+    burst_home=burst_home,
+)
+if not ok:
+    print(detail, file=sys.stderr)
+    raise SystemExit(1)
+PY
+then
+  echo "ERROR: bwrap exists but is not usable for sandboxed bursts on this host." >&2
+  exit 1
+fi
 
 if [ "$RESET" -eq 1 ]; then
   echo "  Resetting existing project artifacts..."
@@ -109,6 +137,7 @@ fi
 mkdir -p "$REPO/paper" "$REPO/Tablet"
 mkdir -p "$REPO/.agent-supervisor/logs" "$REPO/.agent-supervisor/scripts" "$REPO/.agent-supervisor/checkpoints"
 mkdir -p "$REPO/.agent-supervisor/staging" "$REPO/.agent-supervisor/viewer/state-at" "$REPO/.agent-supervisor/chats" "$REPO/.agent-supervisor/scratch"
+mkdir -p "$REPO/.agent-supervisor/runtime"
 
 cp "$PAPER" "$REPO/paper/$PAPER_NAME"
 echo "  Copied paper to $REPO/paper/$PAPER_NAME"
@@ -195,6 +224,10 @@ data = parsed
 data["repo_path"] = str(repo)
 data["state_dir"] = ".agent-supervisor"
 data["policy_path"] = "lagent.policy.json"
+
+sandbox = data.setdefault("sandbox", {})
+sandbox["enabled"] = True
+sandbox["backend"] = "bwrap"
 
 tmux = data.setdefault("tmux", {})
 tmux["session_name"] = slug

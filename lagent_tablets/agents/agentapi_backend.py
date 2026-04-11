@@ -30,6 +30,8 @@ from typing import Any, Dict, List, Optional
 
 from lagent_tablets.adapters import BurstResult, ProviderConfig
 from lagent_tablets.chat_history import copy_chat_artifact, ensure_chat_file_link
+from lagent_tablets.config import SandboxConfig
+from lagent_tablets.sandbox import wrap_command
 
 WORKER_PATH = "/home/leanagent/.local/bin:/home/leanagent/.elan/bin:/home/leanagent/.nvm/versions/node/v22.22.2/bin:/usr/local/bin:/usr/bin:/bin"
 WORKER_ELAN_HOME = "/home/leanagent/.elan"
@@ -49,10 +51,12 @@ def _session_meta_path(work_dir: Path, role: str, port: int) -> Path:
     return work_dir / ".agent-supervisor" / "logs" / f"agentapi-{role}-{port}.json"
 
 
-def _agent_env(burst_user: Optional[str]) -> str:
+def _agent_env(burst_user: Optional[str], burst_home: Optional[Path] = None) -> str:
     """Build the env vars string for sudo."""
     parts = [f"PATH={shlex.quote(WORKER_PATH)}"]
-    if burst_user:
+    if burst_home is not None:
+        parts.append(f"HOME={shlex.quote(str(burst_home))}")
+    elif burst_user:
         parts.append(f"HOME=/home/{shlex.quote(burst_user)}")
     parts.append(f"ELAN_HOME={shlex.quote(WORKER_ELAN_HOME)}")
     # Forward API keys
@@ -133,6 +137,8 @@ def start_server(
     role: str,
     work_dir: Path,
     burst_user: Optional[str] = None,
+    burst_home: Optional[Path] = None,
+    sandbox: Optional[SandboxConfig] = None,
     port: Optional[int] = None,
     initial_prompt: Optional[str] = None,
 ) -> int:
@@ -145,6 +151,7 @@ def start_server(
     time.sleep(1)
 
     _launch_server(config, role=role, work_dir=work_dir, burst_user=burst_user,
+                   burst_home=burst_home, sandbox=sandbox,
                    port=port, initial_prompt=initial_prompt)
     return port
 
@@ -155,6 +162,8 @@ def _launch_server(
     role: str,
     work_dir: Path,
     burst_user: Optional[str] = None,
+    burst_home: Optional[Path] = None,
+    sandbox: Optional[SandboxConfig] = None,
     port: int,
     initial_prompt: Optional[str] = None,
 ) -> None:
@@ -163,16 +172,24 @@ def _launch_server(
     agent_type = config.provider
 
     # Build the full command
-    cmd = ["agentapi", "server", "-p", str(port), "-t", agent_type]
+    inner_cmd = ["agentapi", "server", "-p", str(port), "-t", agent_type]
     if initial_prompt:
-        cmd.extend(["-I", initial_prompt])
-    cmd.append("--")
+        inner_cmd.extend(["-I", initial_prompt])
+    inner_cmd.append("--")
 
+    inner_cmd.extend(agent_cmd)
+    sandbox_cmd = wrap_command(
+        inner_cmd,
+        sandbox=sandbox,
+        work_dir=work_dir,
+        burst_user=burst_user,
+        burst_home=burst_home,
+    )
     if burst_user:
-        env_str = _agent_env(burst_user)
-        cmd.extend(["sudo", "-n", "-u", burst_user, "env", *env_str.split()])
-
-    cmd.extend(agent_cmd)
+        env_str = _agent_env(burst_user, burst_home)
+        cmd = ["sudo", "-n", "-u", burst_user, "env", *env_str.split(), *sandbox_cmd]
+    else:
+        cmd = sandbox_cmd
 
     # Launch detached
     log_path = _server_log_path(work_dir, role, port)
@@ -225,6 +242,8 @@ def ensure_server(
     role: str,
     work_dir: Path,
     burst_user: Optional[str] = None,
+    burst_home: Optional[Path] = None,
+    sandbox: Optional[SandboxConfig] = None,
     port: Optional[int] = None,
 ) -> int:
     """Ensure an agentapi server is running for this role. Reuses existing sessions.
@@ -279,7 +298,7 @@ def ensure_server(
 
     # No server running (or wrong provider) — start one
     _launch_server(config, role=role, work_dir=work_dir, burst_user=burst_user,
-                   port=port)
+                   burst_home=burst_home, sandbox=sandbox, port=port)
     return port
 
 
@@ -774,6 +793,8 @@ def run(
     done_file: Optional[Path] = None,
     log_dir: Optional[Path] = None,
     artifact_prefix: Optional[str] = None,
+    sandbox: Optional[SandboxConfig] = None,
+    burst_home: Optional[Path] = None,
 ) -> BurstResult:
     """Run a burst via agentapi: start server, handle dialogs, send message, wait for response.
 
@@ -790,10 +811,12 @@ def run(
     try:
         if fresh:
             port = start_server(config, role=role, work_dir=work_dir,
-                               burst_user=burst_user, port=port)
+                               burst_user=burst_user, burst_home=burst_home,
+                               sandbox=sandbox, port=port)
         else:
             port = ensure_server(config, role=role, work_dir=work_dir,
-                                burst_user=burst_user, port=port)
+                                burst_user=burst_user, burst_home=burst_home,
+                                sandbox=sandbox, port=port)
     except RuntimeError as e:
         return BurstResult(ok=False, exit_code=None, captured_output="",
                           duration_seconds=time.monotonic() - start, error=str(e))

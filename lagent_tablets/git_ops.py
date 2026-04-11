@@ -29,6 +29,7 @@ GITIGNORE_CONTENT = """\
 .agent-supervisor/history/
 .agent-supervisor/chats/
 .agent-supervisor/scratch/
+.agent-supervisor/runtime/
 .agent-supervisor/viewer/
 
 # Signal files

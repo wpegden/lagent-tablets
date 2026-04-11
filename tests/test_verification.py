@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import py_compile
 import tempfile
 import unittest
 from pathlib import Path
 
+from lagent_tablets.project_paths import project_runtime_skills_dir, project_runtime_src_dir
 from lagent_tablets.verification import (
     FORBIDDEN_KEYWORDS_DEFAULT,
     NodeCheckResult,
@@ -103,9 +105,9 @@ class TestScriptGeneration(unittest.TestCase):
         )
         self.assertTrue((state / "scripts" / "check_node.sh").exists())
         self.assertTrue((state / "scripts" / "check_tablet.sh").exists())
-        # Check they're executable
-        import os
         self.assertTrue(os.access(state / "scripts" / "check_node.sh", os.X_OK))
+        self.assertTrue((project_runtime_src_dir(state) / "lagent_tablets" / "check.py").exists())
+        self.assertTrue((project_runtime_skills_dir(state) / "THEOREM_STATING_WORKER.md").exists())
 
     def test_generated_check_py_compiles(self):
         repo = Path(tempfile.mkdtemp())
@@ -116,6 +118,18 @@ class TestScriptGeneration(unittest.TestCase):
             forbidden_keywords=FORBIDDEN_KEYWORDS_DEFAULT,
         )
         py_compile.compile(str(state / "scripts" / "check.py"), doraise=True)
+
+    def test_generated_check_py_bootstraps_project_runtime(self):
+        repo = Path(tempfile.mkdtemp())
+        state = Path(tempfile.mkdtemp())
+        write_scripts(
+            repo, state,
+            allowed_prefixes=["Mathlib"],
+            forbidden_keywords=FORBIDDEN_KEYWORDS_DEFAULT,
+        )
+        content = (state / "scripts" / "check.py").read_text(encoding="utf-8")
+        self.assertIn(str(project_runtime_src_dir(state).resolve()), content)
+        self.assertNotIn("/home/leanagent/src/lagent-tablets", content)
 
     def test_scripts_include_custom_prefixes(self):
         repo = Path(tempfile.mkdtemp())

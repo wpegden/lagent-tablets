@@ -62,6 +62,9 @@ from lagent_tablets.git_ops import init_repo, rewind_to_cycle
 from lagent_tablets.history_replay import find_first_history_divergence
 from lagent_tablets.project_paths import (
     project_chats_dir,
+    project_runtime_dir,
+    project_runtime_skills_dir,
+    project_runtime_src_dir,
     project_scratch_dir,
     project_viewer_dir,
 )
@@ -75,6 +78,9 @@ def ensure_directories(config: Config) -> None:
     (config.state_dir / "scripts").mkdir(parents=True, exist_ok=True)
     (config.state_dir / "staging").mkdir(parents=True, exist_ok=True)
     (config.state_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+    project_runtime_dir(config.state_dir).mkdir(parents=True, exist_ok=True)
+    project_runtime_src_dir(config.state_dir).mkdir(parents=True, exist_ok=True)
+    project_runtime_skills_dir(config.state_dir).mkdir(parents=True, exist_ok=True)
     project_viewer_dir(config.state_dir).mkdir(parents=True, exist_ok=True)
     project_chats_dir(config.state_dir).mkdir(parents=True, exist_ok=True)
     project_scratch_dir(config.state_dir).mkdir(parents=True, exist_ok=True)
@@ -92,6 +98,9 @@ def ensure_directories(config: Config) -> None:
         config.state_dir / "scripts": 0o2755,
         config.state_dir / "staging": 0o2775,
         config.state_dir / "checkpoints": 0o2755,
+        project_runtime_dir(config.state_dir): 0o2755,
+        project_runtime_src_dir(config.state_dir): 0o2755,
+        project_runtime_skills_dir(config.state_dir): 0o2755,
         project_viewer_dir(config.state_dir): 0o2775,
         project_chats_dir(config.state_dir): 0o2775,
         project_scratch_dir(config.state_dir): 0o2775,
@@ -104,15 +113,27 @@ def ensure_directories(config: Config) -> None:
             pass
 
 
-def check_dependencies() -> None:
+def check_dependencies(config: Config) -> None:
     """Verify required tools are available."""
     import shutil
+    from lagent_tablets.sandbox import probe_sandbox
+
     missing = []
-    for tool in ["tmux", "lake"]:
+    for tool in ["tmux", "lake", "bwrap"]:
         if not shutil.which(tool):
             missing.append(tool)
     if missing:
         print(f"ERROR: Required tools not found: {missing}")
+        sys.exit(1)
+    ok, detail = probe_sandbox(
+        sandbox=config.sandbox,
+        work_dir=config.repo_path,
+        burst_user=config.tmux.burst_user,
+        burst_home=config.tmux.burst_home,
+    )
+    if not ok:
+        print("ERROR: sandbox preflight failed")
+        print(f"  detail: {detail}")
         sys.exit(1)
 
 
@@ -459,7 +480,7 @@ def main(argv: Optional[list] = None) -> int:
         print(f"  stop at phase boundary: yes")
 
     # Check dependencies
-    check_dependencies()
+    check_dependencies(config)
 
     # Ensure directories
     ensure_directories(config)

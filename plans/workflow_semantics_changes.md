@@ -7,3 +7,4 @@ If a change is strictly about filesystem isolation, runtime snapshotting, or lau
 ## Entries
 
 - none yet
+- none so far in the bwrap milestone; current changes are runtime isolation, launch plumbing, and preflight checks rather than supervisor workflow semantics

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from lagent_tablets.adapters import BurstResult, ProviderConfig
+from lagent_tablets.config import SandboxConfig
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +164,8 @@ def run_worker_burst(
     port: Optional[int] = None,
     done_file: Optional[Path] = None,
     artifact_prefix: Optional[str] = None,
+    sandbox: Optional[SandboxConfig] = None,
+    burst_home: Optional[Path] = None,
     **_kwargs,
 ) -> BurstResult:
     """Run a worker burst -- dispatches to the right backend."""
@@ -177,7 +180,8 @@ def run_worker_burst(
                       work_dir=work_dir, burst_user=burst_user,
                       startup_timeout=startup_timeout_seconds,
                       burst_timeout=timeout_seconds, log_dir=log_dir,
-                      artifact_prefix=prefix, fresh=False)
+                      artifact_prefix=prefix, fresh=False,
+                      sandbox=sandbox, burst_home=burst_home)
 
         if config.provider in ("claude", "gemini"):
             from lagent_tablets.agents.agentapi_backend import run
@@ -186,7 +190,9 @@ def run_worker_burst(
                       port=port,
                       log_dir=log_dir,
                       artifact_prefix=prefix,
-                      done_file=handoff_file)
+                      done_file=handoff_file,
+                      sandbox=sandbox,
+                      burst_home=burst_home)
 
         # Unknown providers: script-based headless (-p mode)
         from lagent_tablets.agents.script_headless import run
@@ -194,7 +200,9 @@ def run_worker_burst(
                   work_dir=work_dir, burst_user=burst_user,
                   startup_timeout=startup_timeout_seconds,
                   burst_timeout=timeout_seconds, log_dir=log_dir,
-                  artifact_prefix=prefix)
+                  artifact_prefix=prefix,
+                  sandbox=sandbox,
+                  burst_home=burst_home)
 
     return run_with_retry(_run, max_retries=max_rate_limit_retries, rate_limit_delay=120.0,
                           config=config, port=port)
@@ -215,6 +223,8 @@ def run_reviewer_burst(
     fresh: bool = False,
     done_file: Optional[Path] = None,
     artifact_prefix: Optional[str] = None,
+    sandbox: Optional[SandboxConfig] = None,
+    burst_home: Optional[Path] = None,
     **_kwargs,
 ) -> BurstResult:
     """Run a reviewer burst -- dispatches to the right backend.
@@ -231,7 +241,8 @@ def run_reviewer_burst(
                       work_dir=work_dir, burst_user=burst_user,
                       startup_timeout=startup_timeout_seconds,
                       burst_timeout=timeout_seconds, log_dir=log_dir,
-                      artifact_prefix=prefix, fresh=fresh)
+                      artifact_prefix=prefix, fresh=fresh,
+                      sandbox=sandbox, burst_home=burst_home)
 
         if config.provider in ("claude", "gemini"):
             from lagent_tablets.agents.agentapi_backend import run
@@ -240,7 +251,9 @@ def run_reviewer_burst(
                       port=port, fresh=fresh,
                       log_dir=log_dir,
                       artifact_prefix=prefix,
-                      done_file=done_file or work_dir / "reviewer_decision.json")
+                      done_file=done_file or work_dir / "reviewer_decision.json",
+                      sandbox=sandbox,
+                      burst_home=burst_home)
 
         # Unknown providers: script-based headless
         from lagent_tablets.agents.script_headless import run
@@ -248,7 +261,9 @@ def run_reviewer_burst(
                   work_dir=work_dir, burst_user=burst_user,
                   startup_timeout=startup_timeout_seconds,
                   burst_timeout=timeout_seconds, log_dir=log_dir,
-                  artifact_prefix=prefix)
+                  artifact_prefix=prefix,
+                  sandbox=sandbox,
+                  burst_home=burst_home)
 
     return run_with_retry(_run, max_retries=max_rate_limit_retries, rate_limit_delay=60.0,
                           config=config, port=port)

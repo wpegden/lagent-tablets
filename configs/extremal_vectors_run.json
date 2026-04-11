@@ -80,6 +80,11 @@
     "burst_group": "leanagent"
   },
 
+  "sandbox": {
+    "enabled": true,
+    "backend": "bwrap"
+  },
+
   "workflow": {
     "start_phase": "theorem_stating",
     "paper_tex_path": "paper/Extremal_Vectors.tex",

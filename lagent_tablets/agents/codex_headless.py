@@ -21,6 +21,8 @@ from typing import Any, Dict, List, Optional
 
 from lagent_tablets.adapters import BurstResult, ProviderConfig
 from lagent_tablets.chat_history import ensure_chat_file_link
+from lagent_tablets.config import SandboxConfig
+from lagent_tablets.sandbox import wrap_command
 
 WORKER_PATH = "/home/leanagent/.local/bin:/home/leanagent/.elan/bin:/home/leanagent/.nvm/versions/node/v22.22.2/bin:/usr/local/bin:/usr/bin:/bin"
 WORKER_ELAN_HOME = "/home/leanagent/.elan"
@@ -81,6 +83,7 @@ def build_script(
     exit_file: Path,
     work_dir: Path,
     burst_user: Optional[str] = None,
+    burst_home: Optional[Path] = None,
     log_prefix: str = "worker",
     fresh: bool = False,
     resume_thread_id: str = "",
@@ -112,7 +115,9 @@ def build_script(
         f"export PATH={shlex.quote(WORKER_PATH)}",
         f"export ELAN_HOME={shlex.quote(WORKER_ELAN_HOME)}",
     ]
-    if burst_user:
+    if burst_home is not None:
+        env_lines.append(f"export HOME={shlex.quote(str(burst_home))}")
+    elif burst_user:
         env_lines.append(f"export HOME=/home/{shlex.quote(burst_user)}")
     for key in ("ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENAI_API_KEY"):
         val = os.environ.get(key)
@@ -182,6 +187,8 @@ def run(
     log_dir: Optional[Path] = None,
     artifact_prefix: Optional[str] = None,
     fresh: bool = False,
+    sandbox: Optional[SandboxConfig] = None,
+    burst_home: Optional[Path] = None,
 ) -> BurstResult:
     """Run a Codex burst via the script-based pattern."""
     start = time.monotonic()
@@ -228,6 +235,7 @@ def run(
         exit_file=exit_file,
         work_dir=work_dir,
         burst_user=burst_user,
+        burst_home=burst_home,
         log_prefix=prefix,
         fresh=fresh,
         resume_thread_id=resume_thread_id,
@@ -252,10 +260,29 @@ def run(
     window_id, pane_id = proc.stdout.strip().split()
     tmux_cmd("set-window-option", "-t", window_id, "remain-on-exit", "on")
 
+    inner_cmd = [str(script_path)]
     if burst_user:
-        launch_cmd = f"sudo -n -u {shlex.quote(burst_user)} {shlex.quote(str(script_path))}; exit"
+        sandbox_cmd = wrap_command(
+            inner_cmd,
+            sandbox=sandbox,
+            work_dir=work_dir,
+            burst_user=burst_user,
+            burst_home=burst_home,
+        )
+        launch_cmd = (
+            f"sudo -n -u {shlex.quote(burst_user)} "
+            + " ".join(shlex.quote(part) for part in sandbox_cmd)
+            + "; exit"
+        )
     else:
-        launch_cmd = f"{shlex.quote(str(script_path))}; exit"
+        sandbox_cmd = wrap_command(
+            inner_cmd,
+            sandbox=sandbox,
+            work_dir=work_dir,
+            burst_user=burst_user,
+            burst_home=burst_home,
+        )
+        launch_cmd = " ".join(shlex.quote(part) for part in sandbox_cmd) + "; exit"
     tmux_cmd("send-keys", "-t", pane_id, launch_cmd, "C-m")
 
     # Wait for start marker

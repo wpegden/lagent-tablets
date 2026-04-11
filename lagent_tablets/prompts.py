@@ -22,6 +22,7 @@ from lagent_tablets.state import (
     normalize_orphan_resolutions,
 )
 from lagent_tablets.project_paths import project_scratch_dir
+from lagent_tablets.project_paths import project_runtime_skills_dir
 from lagent_tablets.tablet import (
     PREAMBLE_NAME,
     extract_tex_statement_items,
@@ -70,7 +71,10 @@ def _load_template(name: str) -> str:
 
 def _skill_path(repo_path: Path, filename: str) -> Path:
     """Resolve a skill file, preferring a repo-local override when present."""
-    path = repo_path / ".agent-supervisor" / "skills" / filename
+    legacy_path = repo_path / ".agent-supervisor" / "skills" / filename
+    if legacy_path.exists():
+        return legacy_path
+    path = project_runtime_skills_dir(repo_path / ".agent-supervisor") / filename
     if path.exists():
         return path
     return Path(__file__).resolve().parent.parent / "skills" / filename

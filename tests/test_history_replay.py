@@ -14,6 +14,7 @@ from lagent_tablets.config import (
     GitConfig,
     Policy,
     ProviderConfig,
+    SandboxConfig,
     TmuxConfig,
     VerificationConfig,
     WorkflowConfig,
@@ -48,6 +49,7 @@ def _make_config(repo: Path) -> Config:
             kill_windows_after_capture=True,
             burst_user="lagentworker",
         ),
+        sandbox=SandboxConfig(),
         workflow=WorkflowConfig(
             start_phase="theorem_stating",
             paper_tex_path=repo / "paper.tex",

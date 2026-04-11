@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
 from lagent_tablets.adapters import BurstResult, ProviderConfig
+from lagent_tablets.config import SandboxConfig
 
 
 def _fake_result(**kwargs):
@@ -441,6 +442,8 @@ class TestFullConfigLoad(unittest.TestCase):
         # Reviewer
         self.assertEqual(config.reviewer.provider, "codex")
         self.assertEqual(config.reviewer.effort, "xhigh")
+        self.assertTrue(config.sandbox.enabled)
+        self.assertEqual(config.sandbox.backend, "bwrap")
 
         # Correspondence agents
         corr = config.verification.correspondence_agents
@@ -577,6 +580,50 @@ class TestWorkerBurstDoneFile(unittest.TestCase):
             with patch("lagent_tablets.burst.run_with_retry", side_effect=lambda fn, **kw: fn()):
                 run_worker_burst(config, "test", session_name="t", work_dir=tmpdir)
             self.assertTrue(mock_run.called)
+
+
+class TestSandboxKwargPropagation(unittest.TestCase):
+    def test_worker_burst_passes_sandbox_to_codex_backend(self):
+        config = ProviderConfig(provider="codex", model="test")
+        tmpdir = Path(tempfile.mkdtemp())
+        sandbox = SandboxConfig(enabled=True, backend="bwrap")
+        burst_home = tmpdir / "home"
+
+        with patch("lagent_tablets.agents.codex_headless.run") as mock_run:
+            mock_run.return_value = _fake_result()
+            from lagent_tablets.burst import run_worker_burst
+            with patch("lagent_tablets.burst.run_with_retry", side_effect=lambda fn, **kw: fn()):
+                run_worker_burst(
+                    config,
+                    "test",
+                    session_name="t",
+                    work_dir=tmpdir,
+                    sandbox=sandbox,
+                    burst_home=burst_home,
+                )
+            self.assertEqual(mock_run.call_args.kwargs["sandbox"], sandbox)
+            self.assertEqual(mock_run.call_args.kwargs["burst_home"], burst_home)
+
+    def test_reviewer_burst_passes_sandbox_to_agentapi_backend(self):
+        config = ProviderConfig(provider="claude", model="test")
+        tmpdir = Path(tempfile.mkdtemp())
+        sandbox = SandboxConfig(enabled=True, backend="bwrap")
+        burst_home = tmpdir / "home"
+
+        with patch("lagent_tablets.agents.agentapi_backend.run") as mock_run:
+            mock_run.return_value = _fake_result()
+            from lagent_tablets.burst import run_reviewer_burst
+            with patch("lagent_tablets.burst.run_with_retry", side_effect=lambda fn, **kw: fn()):
+                run_reviewer_burst(
+                    config,
+                    "test",
+                    session_name="t",
+                    work_dir=tmpdir,
+                    sandbox=sandbox,
+                    burst_home=burst_home,
+                )
+            self.assertEqual(mock_run.call_args.kwargs["sandbox"], sandbox)
+            self.assertEqual(mock_run.call_args.kwargs["burst_home"], burst_home)
 
 
 if __name__ == "__main__":
