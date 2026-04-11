@@ -369,9 +369,10 @@ sudo -n -u "$BURST_USER" env \
     git config --global --add safe.directory '$REPO' >/dev/null 2>&1 || true
     cd '$REPO'
     lake update
-    lake exe cache get >/dev/null 2>&1 || true
+    lake exe cache get
     lake build Tablet.Preamble
     lake build Tablet
+    lake env lean .agent-supervisor/scratch/example.lean
     python3 .agent-supervisor/scripts/check.py tablet '$REPO'
   "
 

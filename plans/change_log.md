@@ -39,3 +39,6 @@ Track every source change made during the bwrap isolation effort.
 - Fixed DNS inside the bwrap namespace by mounting escaped config symlink targets such as `/etc/resolv.conf -> /run/systemd/resolve/stub-resolv.conf`:
   - `lagent_tablets/sandbox.py`
   - `tests/test_sandbox.py`
+- Tightened clean setup validation so mathlib cache prewarm must succeed and worker-context scratch import checking is part of setup:
+  - `scripts/setup_repo.sh`
+  - `tests/test_setup_script.py`
