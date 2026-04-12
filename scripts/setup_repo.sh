@@ -12,6 +12,11 @@ usage() {
 Usage: ./scripts/setup_repo.sh [--reset] <repo_path> <paper_tex_path> [project_slug]
 
   --reset         Stop any existing project process and recreate the repo from scratch
+  --yes           Skip the target confirmation prompt
+  --main-result-labels labels
+                  Comma-separated paper TeX labels to use as the human-reviewed target set.
+                  If omitted, setup infers all paper theorem/corollary statements, using labels
+                  when present and line ranges when not.
   repo_path       Where to create the formalization repo
   paper_tex_path  Path to the source paper .tex file
   project_slug    Optional viewer/session slug (defaults to basename(repo_path))
@@ -19,11 +24,25 @@ EOF
 }
 
 RESET=0
+ASSUME_YES=0
+MAIN_RESULT_LABELS=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --reset|--force)
       RESET=1
       shift
+      ;;
+    --yes|-y)
+      ASSUME_YES=1
+      shift
+      ;;
+    --main-result-labels)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --main-result-labels requires a comma-separated argument" >&2
+        exit 1
+      fi
+      MAIN_RESULT_LABELS="$2"
+      shift 2
       ;;
     -h|--help)
       usage
@@ -77,8 +96,18 @@ if [ ! -f "$CONFIG_TEMPLATE" ]; then
   echo "ERROR: Config template not found: $CONFIG_TEMPLATE" >&2
   exit 1
 fi
+if [ -e "$REPO" ] && [ "$RESET" -ne 1 ]; then
+  echo "ERROR: Repo path already exists. Re-run with --reset to recreate it." >&2
+  exit 1
+fi
 
 PAPER_NAME="$(basename "$PAPER")"
+TARGETS_JSON="$(mktemp)"
+TARGETS_PREVIEW="$(mktemp)"
+cleanup_preview_files() {
+  rm -f "$TARGETS_JSON" "$TARGETS_PREVIEW"
+}
+trap cleanup_preview_files EXIT
 
 echo "Setting up repo at: $REPO"
 echo "  Paper: $PAPER ($PAPER_NAME)"
@@ -86,6 +115,118 @@ echo "  Project slug: $PROJECT_SLUG"
 echo "  Burst user: $BURST_USER"
 echo "  Burst group: $BURST_GROUP"
 echo "  Config out: $CONFIG_OUT"
+if [[ -n "$MAIN_RESULT_LABELS" ]]; then
+  echo "  Main-result labels: $MAIN_RESULT_LABELS"
+fi
+
+PYTHONPATH="$SOURCE_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - "$PAPER" "$MAIN_RESULT_LABELS" "$TARGETS_JSON" "$TARGETS_PREVIEW" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from lagent_tablets.tablet import (
+    extract_paper_statement_blocks,
+    extract_paper_statement_labels,
+    format_main_result_target,
+    infer_main_result_targets_from_paper,
+    main_result_target_key,
+    resolve_main_result_targets,
+)
+
+paper_path = Path(sys.argv[1]).resolve()
+raw_main_result_labels = sys.argv[2]
+targets_json = Path(sys.argv[3]).resolve()
+targets_preview = Path(sys.argv[4]).resolve()
+
+if raw_main_result_labels.strip():
+    labels = []
+    seen = set()
+    for raw_label in raw_main_result_labels.split(","):
+        label = raw_label.strip()
+        if not label or label in seen:
+            continue
+        seen.add(label)
+        labels.append(label)
+    available_labels = extract_paper_statement_labels(paper_path)
+    missing = [label for label in labels if label not in available_labels]
+    if missing:
+        raise SystemExit(
+            "Configured main_result_labels are not present as labeled paper statements: "
+            + ", ".join(missing)
+        )
+    targets = resolve_main_result_targets(paper_path=paper_path, raw_labels=labels)
+else:
+    labels = []
+    targets = infer_main_result_targets_from_paper(paper_path)
+
+paper_text = paper_path.read_text(encoding="utf-8", errors="replace")
+blocks = extract_paper_statement_blocks(paper_text)
+preview_lines = ["Resolved main-result targets:"]
+
+def match_block(target: dict) -> dict | None:
+    label = str(target.get("tex_label", "") or "").strip()
+    start_line = int(target.get("start_line", 0) or 0)
+    end_line = int(target.get("end_line", 0) or 0)
+    if label and start_line and end_line:
+        for block in blocks:
+            if (
+                label in block.get("labels", [])
+                and int(block.get("start_line", 0) or 0) == start_line
+                and int(block.get("end_line", 0) or 0) == end_line
+            ):
+                return block
+    if label:
+        for block in blocks:
+            if label in block.get("labels", []):
+                return block
+    if start_line and end_line:
+        for block in blocks:
+            if (
+                int(block.get("start_line", 0) or 0) == start_line
+                and int(block.get("end_line", 0) or 0) == end_line
+            ):
+                return block
+    return None
+
+if not targets:
+    preview_lines.append("(none)")
+else:
+    for idx, target in enumerate(targets, start=1):
+        block = match_block(target)
+        if block is None:
+            raise SystemExit(
+                f"Could not locate paper text for resolved main-result target {format_main_result_target(target)}."
+            )
+        target_header = f"{idx}. {format_main_result_target(target)} [{block.get('env', '').strip()}]"
+        preview_lines.append(target_header)
+        preview_lines.append(str(block.get("text", "") or "").strip())
+        preview_lines.append("")
+
+targets_json.write_text(
+    json.dumps({"labels": labels, "targets": targets}, indent=2) + "\n",
+    encoding="utf-8",
+)
+targets_preview.write_text("\n".join(preview_lines).rstrip() + "\n", encoding="utf-8")
+PY
+
+echo ""
+cat "$TARGETS_PREVIEW"
+echo ""
+if [ "$ASSUME_YES" -eq 0 ]; then
+  if [ ! -t 0 ]; then
+    echo "ERROR: setup requires target confirmation. Re-run with --yes in non-interactive mode." >&2
+    exit 1
+  fi
+  read -r -p "Proceed with these targets? [y/N] " TARGET_CONFIRM
+  case "$TARGET_CONFIRM" in
+    y|Y|yes|YES)
+      ;;
+    *)
+      echo "Aborted."
+      exit 1
+      ;;
+  esac
+fi
 
 if ! sudo -n -u "$BURST_USER" true >/dev/null 2>&1; then
   echo "ERROR: passwordless sudo to $BURST_USER is required for setup and runtime bursts." >&2
@@ -127,11 +268,6 @@ if [ "$RESET" -eq 1 ]; then
   tmux kill-session -t "$PROJECT_SLUG" >/dev/null 2>&1 || true
   rm -rf "$REPO"
   rm -rf "$PROJECT_STATIC_DIR"
-fi
-
-if [ -e "$REPO" ]; then
-  echo "ERROR: Repo path already exists. Re-run with --reset to recreate it." >&2
-  exit 1
 fi
 
 mkdir -p "$REPO/paper" "$REPO/Tablet"
@@ -189,7 +325,7 @@ cat > "$REPO/INPUT_REQUEST.md" <<'REQUEST'
 The supervisor will write explicit requests for human input here when needed.
 REQUEST
 
-PYTHONPATH="$SOURCE_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - "$REPO" "$CONFIG_TEMPLATE" "$CONFIG_OUT" "$POLICY_TEMPLATE" "$POLICY_OUT" "$PAPER_NAME" "$PROJECT_SLUG" <<'PY'
+PYTHONPATH="$SOURCE_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - "$REPO" "$CONFIG_TEMPLATE" "$CONFIG_OUT" "$POLICY_TEMPLATE" "$POLICY_OUT" "$PAPER_NAME" "$PROJECT_SLUG" "$TARGETS_JSON" <<'PY'
 import json
 import shutil
 import sys
@@ -200,7 +336,9 @@ from lagent_tablets.config import FORBIDDEN_KEYWORDS_DEFAULT, load_config
 from lagent_tablets.git_ops import init_repo
 from lagent_tablets.project_paths import project_chats_dir, project_scratch_dir
 from lagent_tablets.state import SupervisorState, TabletState, save_state, save_tablet, state_path, tablet_path
-from lagent_tablets.tablet import regenerate_support_files
+from lagent_tablets.tablet import (
+    regenerate_support_files,
+)
 from lagent_tablets.viewer_state import viewer_state_path, write_live_viewer_state
 
 repo = Path(sys.argv[1]).resolve()
@@ -210,7 +348,9 @@ policy_template = Path(sys.argv[4]).resolve()
 policy_out = Path(sys.argv[5]).resolve()
 paper_name = sys.argv[6]
 slug = sys.argv[7]
+resolved_targets_path = Path(sys.argv[8]).resolve()
 state_dir = repo / ".agent-supervisor"
+paper_path = repo / "paper" / paper_name
 
 init_repo(repo)
 save_state(state_path(state_dir), SupervisorState(cycle=0, phase="theorem_stating"))
@@ -237,6 +377,14 @@ workflow["paper_tex_path"] = f"paper/{paper_name}"
 workflow["approved_axioms_path"] = "APPROVED_AXIOMS.json"
 workflow["human_input_path"] = "HUMAN_INPUT.md"
 workflow["input_request_path"] = "INPUT_REQUEST.md"
+
+resolved_targets = json.loads(resolved_targets_path.read_text(encoding="utf-8"))
+if not isinstance(resolved_targets, dict):
+    raise SystemExit("Resolved main-result targets must be a JSON object")
+labels = resolved_targets.get("labels", [])
+targets = resolved_targets.get("targets", [])
+workflow["main_result_labels"] = labels
+workflow["main_result_targets"] = targets
 
 chat = data.setdefault("chat", {})
 chat["root_dir"] = str(project_chats_dir(state_dir))
@@ -358,15 +506,14 @@ CHATREADME
 git -C "$REPO/.agent-supervisor/chats" add README.md >/dev/null 2>&1
 git -C "$REPO/.agent-supervisor/chats" commit -m "Initialize local chat history repo" >/dev/null 2>&1 || true
 
-echo "  Prewarming Lean dependencies and build artifacts as $BURST_USER..."
-sudo -n -u "$BURST_USER" env \
-  HOME="$BURST_HOME" \
+echo "  Prewarming Lean dependencies and build artifacts as supervisor user..."
+env \
+  HOME="${HOME:-/home/leanagent}" \
   ELAN_HOME="$ELAN_HOME" \
   PATH="$BURST_PATH" \
   bash -lc "
     set -euo pipefail
     umask 0002
-    git config --global --add safe.directory '$REPO' >/dev/null 2>&1 || true
     cd '$REPO'
     lake update
     lake exe cache get
@@ -387,6 +534,19 @@ burst_user = sys.argv[2]
 fix_lake_permissions(repo, burst_user=burst_user, include_package_builds=True)
 PY
 echo "  Fixed shared Lean build permissions for supervisor access"
+
+echo "  Validating worker-side shared access..."
+sudo -n -u "$BURST_USER" env \
+  HOME="$BURST_HOME" \
+  ELAN_HOME="$ELAN_HOME" \
+  PATH="$BURST_PATH" \
+  bash -lc "
+    set -euo pipefail
+    umask 0002
+    git config --global --add safe.directory '$REPO' >/dev/null 2>&1 || true
+    cd '$REPO'
+    lake env lean .agent-supervisor/scratch/example.lean
+  "
 
 echo "  Validating supervisor-side deterministic checks..."
 python3 "$REPO/.agent-supervisor/scripts/check.py" tablet "$REPO"

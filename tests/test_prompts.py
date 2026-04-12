@@ -16,6 +16,7 @@ from lagent_tablets.state import SupervisorState, TabletNode, TabletState
 from lagent_tablets.tablet import generate_node_lean, node_lean_path, node_tex_path
 from lagent_tablets.prompts import (
     build_correspondence_prompt,
+    build_nl_proof_prompt,
     build_node_soundness_prompt,
     build_reviewer_prompt,
     build_theorem_stating_prompt,
@@ -67,6 +68,44 @@ def _setup_repo(repo: Path) -> None:
 
 class TestWorkerPrompt(unittest.TestCase):
 
+    def test_all_role_prompts_include_feedback_instruction(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(
+                name="main_thm",
+                kind="paper_main_result",
+                status="open",
+                title="Main",
+                paper_provenance={"start_line": 1, "end_line": 3, "tex_label": "main"},
+            ),
+        }, active_node="main_thm")
+        state = SupervisorState(cycle=1, phase="proof_formalization", active_node="main_thm")
+
+        prompts = [
+            build_worker_prompt(config, state, tablet, Policy()),
+            build_theorem_stating_prompt(config, SupervisorState(cycle=1, phase="theorem_stating"), tablet, Policy()),
+            build_reviewer_prompt(config, state, tablet, Policy()),
+            build_theorem_stating_reviewer_prompt(
+                config,
+                SupervisorState(cycle=1, phase="theorem_stating"),
+                tablet,
+                Policy(),
+            ),
+            build_correspondence_prompt(config, tablet, node_names=["main_thm"]),
+            build_nl_proof_prompt(config, tablet, node_names=["main_thm"]),
+            build_node_soundness_prompt(config, tablet, node_name="main_thm"),
+        ]
+        for prompt in prompts:
+            self.assertIn("--- FEEDBACK ---", prompt)
+            self.assertIn("`feedback` string in your JSON output", prompt)
+            self.assertIn("agent_feedback.jsonl", prompt)
+            self.assertIn("impossible, inconsistent, or poorly supported", prompt)
+            self.assertIn("used to debug future versions of this system", prompt)
+            self.assertIn("continue with the best work you can", prompt)
+
     def test_includes_goal(self):
         repo = Path(tempfile.mkdtemp())
         _setup_repo(repo)
@@ -110,6 +149,24 @@ class TestWorkerPrompt(unittest.TestCase):
         self.assertIn("worker_handoff.done", prompt)
         self.assertIn("Wait for that command to finish", prompt)
         self.assertIn("Do not write the completion marker while that checker is still running", prompt)
+
+    def test_proof_worker_prompt_allows_paper_anchored_nodes_with_provenance(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open"),
+        }, active_node="main_thm")
+        state = SupervisorState(cycle=1, phase="proof_formalization", active_node="main_thm")
+
+        prompt = build_worker_prompt(config, state, tablet, Policy())
+        self.assertIn(
+            "New paper-anchored `theorem`/`lemma`/`corollary` nodes in proof_formalization can be legitimate when the local proof work exposes a missing statement",
+            prompt,
+        )
+        self.assertIn("paper_provenance_hints", prompt)
+        self.assertIn("must not mutate the accepted coarse package", prompt)
 
     def test_cleanup_worker_prompt_uses_cleanup_template(self):
         repo = Path(tempfile.mkdtemp())
@@ -399,6 +456,24 @@ class TestReviewerPrompt(unittest.TestCase):
         self.assertIn("\"paper_focus_ranges\"", prompt)
         self.assertIn("\"proof_edit_mode\"", prompt)
 
+    def test_proof_reviewer_prompt_scrutinizes_new_paper_anchored_nodes(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open"),
+        })
+        state = SupervisorState(cycle=1, phase="proof_formalization")
+
+        prompt = build_reviewer_prompt(config, state, tablet, Policy())
+        self.assertIn(
+            "can be legitimate when the local proof work exposes a missing statement",
+            prompt,
+        )
+        self.assertIn("full node spec, including structured provenance", prompt)
+        self.assertIn("does not by itself justify changing accepted coarse-node statements", prompt)
+
     def test_cleanup_reviewer_prompt_uses_cleanup_template(self):
         repo = Path(tempfile.mkdtemp())
         _setup_repo(repo)
@@ -413,7 +488,7 @@ class TestReviewerPrompt(unittest.TestCase):
         self.assertIn("proof_complete_style_cleanup phase", prompt)
         self.assertIn("\"decision\": \"CONTINUE | NEED_INPUT | DONE\"", prompt)
 
-    def test_shows_orphan_warning(self):
+    def test_shows_unsupported_node_warning(self):
         repo = Path(tempfile.mkdtemp())
         _setup_repo(repo)
         # Add an orphan node
@@ -423,15 +498,21 @@ class TestReviewerPrompt(unittest.TestCase):
         (tdir / "orphan_helper.tex").write_text("\\begin{lemma}\nTrue.\n\\end{lemma}\n\\begin{proof}\nTrivial.\n\\end{proof}\n")
 
         config = _make_config(repo)
+        config.workflow.main_result_labels = ["main"]
         tablet = TabletState(nodes={
             "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
-            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open"),
+            "main_thm": TabletNode(
+                name="main_thm",
+                kind="paper_main_result",
+                status="open",
+                paper_provenance={"start_line": 1, "end_line": 3, "tex_label": "main"},
+            ),
             "orphan_helper": TabletNode(name="orphan_helper", kind="helper_lemma", status="open"),
         })
         state = SupervisorState(cycle=1, phase="proof_formalization")
 
         prompt = build_reviewer_prompt(config, state, tablet, Policy())
-        self.assertIn("Orphan", prompt)
+        self.assertIn("Unsupported nodes", prompt)
         self.assertIn("orphan_helper", prompt)
 
     def test_reviewer_prompt_includes_reject_biased_soundness_split_note(self):
@@ -495,7 +576,7 @@ class TestTheoremStatingPrompts(unittest.TestCase):
         self.assertIn("Theorem-stating continues until this list is empty", prompt)
         self.assertIn("[correspondence] main_thm: The Lean statement drops a quantifier.", prompt)
 
-    def test_worker_prompt_includes_orphan_node_actions(self):
+    def test_worker_prompt_includes_target_support_actions(self):
         repo = Path(tempfile.mkdtemp())
         _setup_repo(repo)
         config = _make_config(repo)
@@ -508,8 +589,8 @@ class TestTheoremStatingPrompts(unittest.TestCase):
             phase="theorem_stating",
             last_review={
                 "decision": "CONTINUE",
-                "next_prompt": "Resolve the orphan candidates.",
-                "orphan_resolutions": [
+                "next_prompt": "Resolve the unsupported nodes.",
+                "support_resolutions": [
                     {
                         "node": "helper_a",
                         "action": "remove",
@@ -521,7 +602,7 @@ class TestTheoremStatingPrompts(unittest.TestCase):
         )
 
         prompt = build_theorem_stating_prompt(config, state, tablet, Policy())
-        self.assertIn("ORPHAN NODE ACTIONS", prompt)
+        self.assertIn("TARGET-SUPPORT ACTIONS", prompt)
         self.assertIn("[remove] helper_a: No downstream node needs it.", prompt)
 
     def test_worker_prompt_references_files_not_contents(self):
@@ -852,13 +933,20 @@ class TestTheoremStatingPrompts(unittest.TestCase):
         self.assertIn("Do NOT advance while `open_blockers` is non-empty.", prompt)
         self.assertIn("PREVIOUS OPEN BLOCKERS", prompt)
 
-    def test_reviewer_prompt_includes_current_orphan_candidates(self):
+    def test_reviewer_prompt_includes_current_unsupported_nodes(self):
         repo = Path(tempfile.mkdtemp())
         _setup_repo(repo)
         config = _make_config(repo)
+        config.workflow.main_result_labels = ["main"]
         tablet = TabletState(nodes={
             "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
-            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open", title="Main"),
+            "main_thm": TabletNode(
+                name="main_thm",
+                kind="paper_main_result",
+                status="open",
+                title="Main",
+                paper_provenance={"start_line": 1, "end_line": 3, "tex_label": "main"},
+            ),
             "orphan_helper": TabletNode(name="orphan_helper", kind="helper_lemma", status="open", title="Orphan"),
         })
 
@@ -867,10 +955,11 @@ class TestTheoremStatingPrompts(unittest.TestCase):
             SupervisorState(cycle=2, phase="theorem_stating"),
             tablet,
             Policy(),
-            orphan_candidates=["orphan_helper"],
+            main_result_issues=[],
+            unsupported_nodes=["orphan_helper"],
         )
-        self.assertIn("\"orphan_resolutions\"", prompt)
-        self.assertIn("CURRENT ORPHAN CANDIDATES", prompt)
+        self.assertIn("\"support_resolutions\"", prompt)
+        self.assertIn("CURRENT UNSUPPORTED NODES", prompt)
         self.assertIn("orphan_helper", prompt)
 
     def test_theorem_reviewer_prompt_uses_phase_specific_skill_file(self):
@@ -1124,6 +1213,24 @@ class TestVerificationPrompt(unittest.TestCase):
 
         self.assertIn("Put only CURRENTLY OPEN failures", prompt)
         self.assertIn("mention that in `summary`, not in `issues`", prompt)
+
+    def test_correspondence_prompt_allows_collective_target_coverage(self):
+        repo = Path(tempfile.mkdtemp())
+        _setup_repo(repo)
+        config = _make_config(repo)
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_thm": TabletNode(name="main_thm", kind="ordinary", status="open"),
+        })
+
+        prompt = build_correspondence_prompt(
+            config,
+            tablet,
+            node_names=["main_thm"],
+        )
+
+        self.assertIn("covered collectively by multiple non-`helper` nodes", prompt)
+        self.assertIn("one branch or clause of a cited target item", prompt)
 
     def test_includes_new_nodes(self):
         repo = Path(tempfile.mkdtemp())

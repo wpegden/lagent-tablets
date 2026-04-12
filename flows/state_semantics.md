@@ -24,7 +24,7 @@ NL proof soundness
      its direct children's NL statements?"
 ```
 
-The intended end state for a theorem/lemma node is:
+The intended end state for a proof-bearing node is:
 
 ```text
 closed in Lean
@@ -32,7 +32,7 @@ closed in Lean
 correspondence passed
 ```
 
-Soundness is a scaffold for still-open theorem nodes. Once a node is Lean-closed,
+Soundness is a scaffold for still-open proof-bearing nodes. Once a node is Lean-closed,
 the system treats NL proof soundness as satisfied.
 
 ## Lean Closure
@@ -118,7 +118,7 @@ check whether its NL proof follows from its direct children's NL statements
 
 Meaning:
 
-- soundness is only needed for still-open theorem/lemma nodes
+- soundness is only needed for still-open proof-bearing nodes
 - closed nodes are treated as `soundness = pass`
 - soundness is about NL proof adequacy, not correspondence
 

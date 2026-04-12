@@ -8,7 +8,8 @@ Write your assessment as JSON to the raw file `{raw_output_path}`:
     "issues": [{{"node": "name", "description": "..."}}]
   }},
   "overall": "APPROVE" or "REJECT",
-  "summary": "brief overall assessment"
+  "summary": "brief overall assessment",
+  "feedback": "optional short note if the task/setup seems impossible, inconsistent, or poorly supported"
 }}
 
 MANDATORY:

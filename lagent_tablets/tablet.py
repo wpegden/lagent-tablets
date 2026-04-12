@@ -13,7 +13,13 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from lagent_tablets.state import TabletNode, TabletState, save_tablet
+from lagent_tablets.state import (
+    TabletNode,
+    TabletState,
+    format_paper_provenance,
+    normalize_paper_provenance,
+    save_tablet,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -33,15 +39,19 @@ LEAN_DECL_RE = re.compile(
 NODEREF_RE = re.compile(r"\\noderef\{([^}]+)\}")
 
 # .tex environments
-TEX_STATEMENT_ENVS = {"theorem", "lemma", "definition", "corollary", "proposition"}
-TEX_MAIN_NODE_ENVS = {"theorem", "lemma", "definition", "corollary"}
+TEX_STATEMENT_ENVS = {"theorem", "lemma", "definition", "corollary", "proposition", "helper"}
+TEX_PROOF_BEARING_ENVS = {"theorem", "lemma", "corollary", "helper"}
+TEX_MAIN_NODE_ENVS = {"theorem", "lemma", "definition", "corollary", "helper"}
 TEX_PREAMBLE_ENVS = {"definition", "proposition"}
+TEX_PAPER_STATEMENT_ENVS = {"theorem", "lemma", "corollary"}
 TEX_STMT_BEGIN_RE = re.compile(r"\\begin\{(" + "|".join(TEX_STATEMENT_ENVS) + r")\}")
 TEX_STMT_END_RE = re.compile(r"\\end\{(" + "|".join(TEX_STATEMENT_ENVS) + r")\}")
 TEX_STMT_BLOCK_RE = re.compile(
     r"\\begin\{(" + "|".join(TEX_STATEMENT_ENVS) + r")\}(?:\[(.*?)\])?(.*?)\\end\{\1\}",
     re.DOTALL,
 )
+TEX_DOCUMENT_BEGIN_RE = re.compile(r"\\begin\{document\}")
+TEX_DOCUMENT_END_RE = re.compile(r"\\end\{document\}")
 TEX_PROOF_BEGIN_RE = re.compile(r"\\begin\{proof\}")
 TEX_PROOF_END_RE = re.compile(r"\\end\{proof\}")
 
@@ -50,6 +60,8 @@ PLACEHOLDER_PHRASES = [
     "straightforward", "clear from", "follows immediately",
     "by a standard argument", "well known", "easy to see",
 ]
+PAPER_LABEL_RE = re.compile(r"\\label\{([^{}]+)\}")
+DEFAULT_MAIN_RESULT_ENVS = {"theorem", "corollary"}
 
 
 # ---------------------------------------------------------------------------
@@ -345,9 +357,10 @@ def scan_preamble_definitions(preamble_content: str) -> List[Dict[str, Any]]:
 
 
 def scan_sorry_in_definitions(lean_content: str) -> List[Dict[str, Any]]:
-    """Check for sorry used in definitions (not theorems/lemmas).
+    """Check for sorry used in definitions (not proof-bearing declarations).
 
-    sorry is allowed in theorem/lemma proof bodies but NEVER in definitions,
+    sorry is allowed in proof-bearing theorem-like declaration bodies
+    (`helper`, `lemma`, `theorem`, `corollary`) but NEVER in definitions,
     as a sorry'd definition provides no properties and makes downstream proofs impossible.
     """
     masked = mask_comments_and_strings(lean_content)
@@ -419,14 +432,14 @@ def validate_tex_format(tex_content: str, *, is_preamble: bool = False) -> List[
     proof_begins = TEX_PROOF_BEGIN_RE.findall(tex_content)
 
     if len(stmt_begins) == 0:
-        errors.append("Missing statement environment (theorem/lemma/definition/corollary)")
+        errors.append("Missing statement environment (theorem/lemma/definition/corollary/helper)")
     elif len(stmt_begins) > 1:
         errors.append(f"Multiple statement environments found ({len(stmt_begins)}), expected exactly 1")
     else:
         stmt_env = stmt_begins[0]
         if stmt_env not in TEX_MAIN_NODE_ENVS:
             errors.append(
-                "Ordinary tablet nodes must use theorem/lemma/definition/corollary environments, "
+                "Ordinary tablet nodes must use theorem/lemma/definition/corollary/helper environments, "
                 f"found {stmt_env}"
             )
 
@@ -462,6 +475,490 @@ def extract_tex_statement_items(
             }
         )
     return items
+
+
+def tex_statement_env_from_content(
+    tex_content: str,
+    *,
+    is_preamble: bool = False,
+) -> str:
+    items = extract_tex_statement_items(tex_content, is_preamble=is_preamble)
+    if not items:
+        return ""
+    return str(items[0].get("env", "") or "").strip().lower()
+
+
+def node_statement_environment(repo_path: Path, node_name: str) -> str:
+    if node_name == PREAMBLE_NAME:
+        tex_path = tablet_dir(repo_path) / "Preamble.tex"
+        if not tex_path.exists():
+            return ""
+        return tex_statement_env_from_content(
+            tex_path.read_text(encoding="utf-8"),
+            is_preamble=True,
+        )
+    tex_path = node_tex_path(repo_path, node_name)
+    if not tex_path.exists():
+        return ""
+    return tex_statement_env_from_content(tex_path.read_text(encoding="utf-8"))
+
+
+def is_paper_statement_environment(env: str) -> bool:
+    return str(env or "").strip().lower() in TEX_PAPER_STATEMENT_ENVS
+
+
+def is_proof_bearing_statement_environment(env: str) -> bool:
+    return str(env or "").strip().lower() in TEX_PROOF_BEARING_ENVS
+
+
+def strip_tex_comments_preserve_lines(tex: str) -> str:
+    """Remove TeX comments while preserving line structure.
+
+    A `%` starts a comment unless it is escaped by an odd number of immediately
+    preceding backslashes. Newlines are preserved so downstream line numbers
+    still refer to the original source.
+    """
+    stripped_lines: List[str] = []
+    for line in tex.splitlines(keepends=True):
+        newline = ""
+        body = line
+        if line.endswith("\r\n"):
+            newline = "\r\n"
+            body = line[:-2]
+        elif line.endswith("\n"):
+            newline = "\n"
+            body = line[:-1]
+        cut = len(body)
+        backslashes = 0
+        for idx, ch in enumerate(body):
+            if ch == "\\":
+                backslashes += 1
+                continue
+            if ch == "%":
+                if backslashes % 2 == 0:
+                    cut = idx
+                    break
+                backslashes = 0
+                continue
+            backslashes = 0
+        stripped_lines.append(body[:cut] + newline)
+    return "".join(stripped_lines)
+
+
+def extract_paper_statement_blocks(
+    paper_text: str,
+    *,
+    envs: Optional[Set[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Extract statement-like TeX blocks from a paper with labels and line ranges."""
+    wanted_envs = {str(env).strip().lower() for env in (envs or TEX_STATEMENT_ENVS)}
+    search_start = 0
+    search_end = len(paper_text)
+    begin_match = TEX_DOCUMENT_BEGIN_RE.search(paper_text)
+    end_match = TEX_DOCUMENT_END_RE.search(paper_text)
+    if begin_match and end_match and end_match.start() >= begin_match.end():
+        search_start = begin_match.end()
+        search_end = end_match.start()
+    blocks: List[Dict[str, Any]] = []
+    search_text = strip_tex_comments_preserve_lines(paper_text[search_start:search_end])
+    line_offset = paper_text.count("\n", 0, search_start)
+    for match in TEX_STMT_BLOCK_RE.finditer(search_text):
+        env = str(match.group(1) or "").strip().lower()
+        if env not in wanted_envs:
+            continue
+        title = str(match.group(2) or "").strip()
+        body = str(match.group(3) or "").strip()
+        full_block = str(match.group(0) or "")
+        labels = []
+        seen_labels: Set[str] = set()
+        for label in PAPER_LABEL_RE.findall(full_block):
+            if label not in seen_labels:
+                seen_labels.add(label)
+                labels.append(label)
+        start_line = line_offset + search_text.count("\n", 0, match.start()) + 1
+        end_line = line_offset + search_text.count("\n", 0, match.end()) + 1
+        blocks.append(
+            {
+                "env": env,
+                "title": title,
+                "body": body,
+                "text": full_block.strip(),
+                "labels": labels,
+                "start_line": start_line,
+                "end_line": end_line,
+            }
+        )
+    return blocks
+
+
+def extract_paper_statement_labels(
+    paper_path: Path,
+    *,
+    envs: Optional[Set[str]] = None,
+) -> Set[str]:
+    """Return the set of TeX labels attached to statement environments in a paper."""
+    if not paper_path.exists():
+        return set()
+    paper_text = paper_path.read_text(encoding="utf-8", errors="replace")
+    labels: Set[str] = set()
+    for block in extract_paper_statement_blocks(paper_text, envs=envs):
+        for label in block.get("labels", []):
+            cleaned = str(label).strip()
+            if cleaned:
+                labels.add(cleaned)
+    return labels
+
+
+def normalize_main_result_target(raw: Any) -> Dict[str, Any]:
+    """Normalize a configured main-result target selector.
+
+    A target may be identified by:
+    - `{"tex_label": "main"}`
+    - `{"start_line": 120, "end_line": 140}`
+    - `{"start_line": 120, "end_line": 140, "tex_label": "main"}`
+    - `"main"` as a shorthand for `{"tex_label": "main"}`
+    """
+    if isinstance(raw, str):
+        label = raw.strip()
+        return {"tex_label": label} if label else {}
+    if not isinstance(raw, dict):
+        return {}
+
+    label = str(raw.get("tex_label", "") or "").strip()
+    normalized = normalize_paper_provenance(raw)
+    if normalized:
+        if label:
+            normalized["tex_label"] = label
+        return normalized
+    if label:
+        return {"tex_label": label}
+    return {}
+
+
+def format_main_result_target(raw: Any) -> str:
+    target = normalize_main_result_target(raw)
+    if not target:
+        return "(invalid target)"
+    label = str(target.get("tex_label", "") or "").strip()
+    if "start_line" in target and "end_line" in target:
+        start_line = int(target["start_line"])
+        end_line = int(target["end_line"])
+        line_text = f"line {start_line}" if start_line == end_line else f"lines {start_line}-{end_line}"
+        return f"{label} ({line_text})" if label else line_text
+    return label or "(invalid target)"
+
+
+def main_result_target_key(raw: Any) -> str:
+    target = normalize_main_result_target(raw)
+    if not target:
+        return ""
+    label = str(target.get("tex_label", "") or "").strip()
+    if label:
+        return f"label:{label}"
+    if "start_line" in target and "end_line" in target:
+        return f"lines:{int(target['start_line'])}-{int(target['end_line'])}"
+    return ""
+
+
+def infer_main_result_targets_from_paper(
+    paper_path: Path,
+    *,
+    envs: Optional[Set[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Infer default main-result target selectors from paper statements.
+
+    Labeled statements become label-based targets with their line range attached.
+    Unlabeled statements become line-range targets.
+    """
+    if not paper_path.exists():
+        return []
+    paper_text = paper_path.read_text(encoding="utf-8", errors="replace")
+    blocks = extract_paper_statement_blocks(
+        paper_text,
+        envs=envs or DEFAULT_MAIN_RESULT_ENVS,
+    )
+    targets: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for block in blocks:
+        block_labels = [str(label).strip() for label in block.get("labels", []) if str(label).strip()]
+        if block_labels:
+            target = {
+                "start_line": int(block["start_line"]),
+                "end_line": int(block["end_line"]),
+                "tex_label": block_labels[0],
+            }
+        else:
+            target = {
+                "start_line": int(block["start_line"]),
+                "end_line": int(block["end_line"]),
+            }
+        key = main_result_target_key(target)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        targets.append(target)
+    return targets
+
+
+def infer_main_result_labels_from_paper(
+    paper_path: Path,
+    *,
+    strict: bool = False,
+) -> List[str]:
+    """Infer default main-result labels from labeled paper theorems/corollaries."""
+    if not paper_path.exists():
+        return []
+    blocks = infer_main_result_targets_from_paper(
+        paper_path,
+        envs=DEFAULT_MAIN_RESULT_ENVS,
+    )
+    labels: List[str] = []
+    seen_labels: Set[str] = set()
+    unlabeled: List[str] = []
+    for block in blocks:
+        block_labels = [str(block.get("tex_label", "") or "").strip()] if str(block.get("tex_label", "") or "").strip() else []
+        if not block_labels:
+            unlabeled.append(
+                f"statement lines {block['start_line']}-{block['end_line']}"
+            )
+            continue
+        for label in block_labels:
+            if label in seen_labels:
+                continue
+            seen_labels.add(label)
+            labels.append(label)
+    if strict and unlabeled:
+        raise ValueError(
+            "Default main-result label inference requires every paper theorem/corollary to carry a TeX label. "
+            f"Missing labels for: {', '.join(unlabeled)}"
+        )
+    return labels
+
+
+def resolve_main_result_targets(
+    *,
+    paper_path: Optional[Path],
+    raw_targets: Any = None,
+    raw_labels: Any = None,
+) -> List[Dict[str, Any]]:
+    """Resolve configured main-result selectors to normalized target objects."""
+    resolved: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+
+    label_index: Dict[str, Dict[str, Any]] = {}
+    if paper_path and paper_path.exists():
+        for target in infer_main_result_targets_from_paper(paper_path):
+            label = str(target.get("tex_label", "") or "").strip()
+            if label and label not in label_index:
+                label_index[label] = dict(target)
+
+    def add_target(raw: Any) -> None:
+        target = normalize_main_result_target(raw)
+        if not target:
+            return
+        label = str(target.get("tex_label", "") or "").strip()
+        if label and label in label_index:
+            enriched = dict(label_index[label])
+            target = enriched
+        key = main_result_target_key(target)
+        if not key or key in seen:
+            return
+        seen.add(key)
+        resolved.append(target)
+
+    if isinstance(raw_targets, list) and raw_targets:
+        for raw_target in raw_targets:
+            add_target(raw_target)
+        return resolved
+
+    if isinstance(raw_labels, list) and raw_labels:
+        for raw_label in raw_labels:
+            add_target(str(raw_label))
+        return resolved
+
+    if paper_path and paper_path.exists():
+        return infer_main_result_targets_from_paper(paper_path)
+    return []
+
+
+def main_result_target_matches_provenance(target: Any, provenance_raw: Any) -> bool:
+    target_norm = normalize_main_result_target(target)
+    provenance = normalize_paper_provenance(provenance_raw)
+    if not target_norm or not provenance:
+        return False
+    target_label = str(target_norm.get("tex_label", "") or "").strip()
+    if target_label:
+        return str(provenance.get("tex_label", "") or "").strip() == target_label
+    return (
+        int(provenance.get("start_line", 0) or 0) == int(target_norm.get("start_line", 0) or 0)
+        and int(provenance.get("end_line", 0) or 0) == int(target_norm.get("end_line", 0) or 0)
+    )
+
+
+def main_result_target_coverage(
+    tablet: TabletState,
+    repo_path: Path,
+    main_result_targets: Sequence[Any],
+) -> Dict[str, Dict[str, Any]]:
+    """Return non-helper and helper coverage for each configured main-result target."""
+    coverage: Dict[str, Dict[str, Any]] = {}
+    ordered_keys: List[str] = []
+    for raw_target in main_result_targets:
+        target = normalize_main_result_target(raw_target)
+        key = main_result_target_key(target)
+        if not key or key in coverage:
+            continue
+        ordered_keys.append(key)
+        coverage[key] = {"target": target, "nodes": [], "helper_nodes": []}
+
+    if not coverage:
+        return {}
+
+    for name, node in sorted(tablet.nodes.items()):
+        if name in {PREAMBLE_NAME, AXIOMS_NAME}:
+            continue
+        provenance = normalize_paper_provenance(node.paper_provenance)
+        env = node_statement_environment(repo_path, name)
+        for key in ordered_keys:
+            target = coverage[key]["target"]
+            if not main_result_target_matches_provenance(target, provenance):
+                continue
+            if env == "helper":
+                coverage[key]["helper_nodes"].append(name)
+            else:
+                coverage[key]["nodes"].append(name)
+
+    for key in ordered_keys:
+        coverage[key]["nodes"].sort()
+        coverage[key]["helper_nodes"].sort()
+    return coverage
+
+
+def main_result_target_issues(
+    tablet: TabletState,
+    repo_path: Path,
+    main_result_targets: Sequence[Any],
+) -> List[Dict[str, Any]]:
+    """Describe missing/invalid configured main-result target coverage."""
+    issues: List[Dict[str, Any]] = []
+    coverage = main_result_target_coverage(tablet, repo_path, main_result_targets)
+    for key, entry in coverage.items():
+        target = dict(entry.get("target", {}))
+        target_text = format_main_result_target(target)
+        helper_nodes = list(entry.get("helper_nodes", []))
+        nodes = list(entry.get("nodes", []))
+        if helper_nodes:
+            issues.append(
+                {
+                    "target": target,
+                    "target_key": key,
+                    "kind": "helper_forbidden",
+                    "nodes": helper_nodes,
+                    "reason": f"Configured main-result target `{target_text}` is attached to helper node(s): {', '.join(helper_nodes)}.",
+                }
+            )
+        if not nodes:
+            issues.append(
+                {
+                    "target": target,
+                    "target_key": key,
+                    "kind": "missing",
+                    "nodes": [],
+                    "reason": f"Configured main-result target `{target_text}` is not covered by any non-helper node.",
+                }
+            )
+    return issues
+
+
+def main_result_label_coverage(
+    tablet: TabletState,
+    repo_path: Path,
+    main_result_labels: Sequence[str],
+) -> Dict[str, Dict[str, List[str]]]:
+    """Backward-compatible label-only coverage view."""
+    coverage = main_result_target_coverage(
+        tablet,
+        repo_path,
+        [{"tex_label": str(raw).strip()} for raw in main_result_labels if str(raw).strip()],
+    )
+    return {
+        str(entry["target"].get("tex_label", "")): {
+            "nodes": list(entry.get("nodes", [])),
+            "helper_nodes": list(entry.get("helper_nodes", [])),
+        }
+        for entry in coverage.values()
+        if str(entry.get("target", {}).get("tex_label", "")).strip()
+    }
+
+
+def main_result_label_issues(
+    tablet: TabletState,
+    repo_path: Path,
+    main_result_labels: Sequence[str],
+) -> List[Dict[str, Any]]:
+    """Backward-compatible label-only issues view."""
+    raw_issues = main_result_target_issues(
+        tablet,
+        repo_path,
+        [{"tex_label": str(raw).strip()} for raw in main_result_labels if str(raw).strip()],
+    )
+    issues: List[Dict[str, Any]] = []
+    for entry in raw_issues:
+        target = normalize_main_result_target(entry.get("target", {}))
+        label = str(target.get("tex_label", "") or "").strip()
+        reason = str(entry.get("reason", "") or "").strip()
+        if label:
+            reason = reason.replace("main-result target", "main-result label")
+        issues.append(
+            {
+                "label": label,
+                "kind": str(entry.get("kind", "") or "").strip(),
+                "nodes": list(entry.get("nodes", [])),
+                "reason": reason,
+            }
+        )
+    return issues
+
+
+def main_result_covering_nodes(
+    tablet: TabletState,
+    repo_path: Path,
+    main_result_targets: Sequence[Any],
+) -> Set[str]:
+    """Return the non-helper node set currently covering configured targets."""
+    coverage = main_result_target_coverage(tablet, repo_path, main_result_targets)
+    nodes: Set[str] = set()
+    for entry in coverage.values():
+        nodes.update(entry.get("nodes", []))
+    return nodes
+
+
+def find_unsupported_nodes(
+    tablet: TabletState,
+    repo_path: Path,
+    main_result_targets: Sequence[Any],
+) -> List[str]:
+    """Find nodes outside the support closure of all configured covered targets.
+
+    This pruning is suspended until every configured target label has at least one
+    non-helper covering node.
+    """
+    targets = [normalize_main_result_target(raw) for raw in main_result_targets]
+    targets = [target for target in targets if target]
+    if not targets:
+        return []
+    if any(issue.get("kind") == "missing" for issue in main_result_target_issues(tablet, repo_path, targets)):
+        return []
+    supported = main_result_covering_nodes(tablet, repo_path, targets)
+    for name in sorted(list(supported)):
+        supported |= compute_import_closure(repo_path, name)
+    unsupported = [
+        name
+        for name in sorted(tablet.nodes.keys())
+        if name not in {PREAMBLE_NAME, AXIOMS_NAME}
+        and name not in supported
+    ]
+    return unsupported
 
 
 def extract_noderefs(tex_content: str) -> List[str]:
@@ -662,10 +1159,15 @@ def freeze_current_coarse_package(
 
 
 def find_orphan_nodes(tablet: TabletState, repo_path: Path) -> List[str]:
-    """Find nodes that are not imported by any other node and are not paper_main_result."""
+    """Legacy helper: return simple leaf nodes without any env-based exemptions.
+
+    Main runtime semantics now use configured main-result labels plus support
+    closure via ``find_unsupported_nodes``. This helper remains only for
+    compatibility with older callers/tests that still ask for raw leaf nodes.
+    """
     imported_by_something: Set[str] = set()
     for name in tablet.nodes:
-        if name == PREAMBLE_NAME:
+        if name in {PREAMBLE_NAME, AXIOMS_NAME}:
             continue
         lean_path = node_lean_path(repo_path, name)
         if lean_path.exists():
@@ -674,10 +1176,8 @@ def find_orphan_nodes(tablet: TabletState, repo_path: Path) -> List[str]:
                 imported_by_something.add(dep)
 
     orphans = []
-    for name, node in tablet.nodes.items():
-        if name == PREAMBLE_NAME or name == AXIOMS_NAME:
-            continue
-        if node.kind == "paper_main_result":
+    for name in tablet.nodes:
+        if name in {PREAMBLE_NAME, AXIOMS_NAME}:
             continue
         if name not in imported_by_something:
             orphans.append(name)
@@ -727,20 +1227,25 @@ def validate_preamble_diff(old_content: str, new_content: str, allowed_prefixes:
 def generate_index_md(tablet: TabletState, repo_path: Path) -> str:
     """Generate Tablet/INDEX.md content."""
     lines = ["# Tablet Index", ""]
-    lines.append("| Name | Kind | Status | Title | Imports |")
-    lines.append("|------|------|--------|-------|---------|")
+    lines.append("| Name | Env | Status | Paper Ref | Title | Imports |")
+    lines.append("|------|-----|--------|-----------|-------|---------|")
 
     for name in sorted(tablet.nodes.keys()):
         node = tablet.nodes[name]
         lean_path = node_lean_path(repo_path, name)
         imports_str = ""
+        env = "-"
+        if name == PREAMBLE_NAME:
+            env = "preamble"
+        elif (repo_path / "Tablet" / f"{name}.tex").exists():
+            env = node_statement_environment(repo_path, name) or "-"
         if lean_path.exists() and name != PREAMBLE_NAME:
             content = lean_path.read_text(encoding="utf-8")
             tablet_imports = extract_tablet_imports(content)
             imports_str = ", ".join(tablet_imports) if tablet_imports else "-"
 
         lines.append(
-            f"| {name} | {node.kind} | {node.status} | {node.title} | {imports_str} |"
+            f"| {name} | {env} | {node.status} | {format_paper_provenance(node.paper_provenance) or '-'} | {node.title} | {imports_str} |"
         )
 
     lines.append("")
@@ -754,25 +1259,35 @@ def generate_readme_md(tablet: TabletState) -> str:
     """Generate Tablet/README.md content (paper-facing summary)."""
     lines = ["# Proof Tablet", ""]
 
-    main_results = [(n, node) for n, node in sorted(tablet.nodes.items()) if node.kind == "paper_main_result"]
-    intermediates = [(n, node) for n, node in sorted(tablet.nodes.items()) if node.kind == "paper_intermediate"]
+    referenced_nodes = [
+        (n, node)
+        for n, node in sorted(tablet.nodes.items())
+        if node.kind != "preamble" and node.paper_provenance
+    ]
+    structural_nodes = [
+        (n, node)
+        for n, node in sorted(tablet.nodes.items())
+        if node.kind != "preamble" and not node.paper_provenance
+    ]
 
-    if main_results:
-        lines.append("## Paper Main Results")
+    if referenced_nodes:
+        lines.append("## Nodes With Paper References")
         lines.append("")
         lines.append("| Name | Provenance | Title | Status |")
         lines.append("|------|------------|-------|--------|")
-        for name, node in main_results:
-            lines.append(f"| {name} | {node.paper_provenance} | {node.title} | {node.status} |")
+        for name, node in referenced_nodes:
+            lines.append(
+                f"| {name} | {format_paper_provenance(node.paper_provenance)} | {node.title} | {node.status} |"
+            )
         lines.append("")
 
-    if intermediates:
-        lines.append("## Paper Intermediate Results")
+    if structural_nodes:
+        lines.append("## Nodes Without Paper References")
         lines.append("")
-        lines.append("| Name | Provenance | Title | Status |")
-        lines.append("|------|------------|-------|--------|")
-        for name, node in intermediates:
-            lines.append(f"| {name} | {node.paper_provenance} | {node.title} | {node.status} |")
+        lines.append("| Name | Title | Status |")
+        lines.append("|------|-------|--------|")
+        for name, node in structural_nodes:
+            lines.append(f"| {name} | {node.title} | {node.status} |")
         lines.append("")
 
     m = tablet.metrics()
@@ -877,7 +1392,7 @@ def register_new_node(
     name: str,
     kind: str,
     title: str = "",
-    paper_provenance: str = "",
+    paper_provenance: Optional[Dict[str, Any]] = None,
     cycle: Optional[int] = None,
 ) -> TabletNode:
     """Register a new node in the tablet state (after its .lean and .tex files exist)."""
@@ -888,7 +1403,7 @@ def register_new_node(
         kind=kind,
         status="open",
         title=title,
-        paper_provenance=paper_provenance,
+        paper_provenance=dict(paper_provenance or {}),
         lean_statement_hash=declaration_hash(lean_content, node_name=name),
     )
     tablet.nodes[name] = node

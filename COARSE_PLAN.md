@@ -104,11 +104,11 @@ verification complete successfully:
 Only after that sweep is accepted should the coarse package be refreshed and the
 newly created nodes be promoted to `coarse = true`.
 
-### 6. Interaction with human-reviewed main results
+### 6. Interaction with human-reviewed paper statements
 
-The existing human-reviewed `paper_main_result` gate remains stronger and separate.
+The existing human-reviewed paper-statement gate remains stronger and separate.
 
-If a `coarse_restructure` causes a trusted `paper_main_result` to lose
+If a `coarse_restructure` causes a trusted paper-anchored `theorem`/`lemma`/`corollary` node to lose
 correspondence, the existing human re-review gate must reopen after the automated
 coarse-wide correspondence sweep.
 

@@ -122,6 +122,33 @@ class TestLoadConfig(unittest.TestCase):
         self.assertEqual(config.workflow.allowed_import_prefixes, ["Mathlib", "MyLib"])
         self.assertEqual(config.workflow.forbidden_keyword_allowlist, ["native_decide"])
 
+    def test_loads_main_result_targets_with_unlabeled_target(self):
+        repo = self._make_repo()
+        (repo / "paper.tex").write_text(
+            "\\begin{theorem}\\label{main}\nA.\n\\end{theorem}\n"
+            "\\begin{corollary}\nB.\n\\end{corollary}\n",
+            encoding="utf-8",
+        )
+        path = self._write_config(
+            repo,
+            workflow={
+                "paper_tex_path": "paper.tex",
+                "main_result_targets": [
+                    {"tex_label": "main"},
+                    {"start_line": 4, "end_line": 5},
+                ],
+            },
+        )
+        config = load_config(path)
+        self.assertEqual(
+            config.workflow.main_result_targets,
+            [
+                {"start_line": 1, "end_line": 3, "tex_label": "main"},
+                {"start_line": 4, "end_line": 5},
+            ],
+        )
+        self.assertEqual(config.workflow.main_result_labels, ["main"])
+
     def test_reads_branching_overrides(self):
         repo = self._make_repo()
         path = self._write_config(repo, branching={

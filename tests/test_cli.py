@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from lagent_tablets.cli import (
-    _trusted_main_result_review_issues,
+    _trusted_main_result_label_review_issues,
     main,
     should_stop,
 )
@@ -23,11 +23,33 @@ class TestHumanInputHandling(unittest.TestCase):
             state_dir=root,
             repo_path=root,
             max_cycles=0,
+            workflow=SimpleNamespace(main_result_labels=["main"]),
+        )
+
+    def _write_paper_statement_node(
+        self,
+        root: Path,
+        name: str,
+        *,
+        env: str = "theorem",
+        paper_tex: str = "\\begin{theorem}\\label{main}\nMain statement.\n\\end{theorem}\n",
+    ) -> None:
+        (root / "paper.tex").write_text(paper_tex, encoding="utf-8")
+        tablet_dir = root / "Tablet"
+        tablet_dir.mkdir(exist_ok=True)
+        (tablet_dir / f"{name}.lean").write_text(
+            f"import Tablet.Preamble\n\n-- [TABLET NODE: {name}]\n\ntheorem {name} : True := by\n  trivial\n",
+            encoding="utf-8",
+        )
+        (tablet_dir / f"{name}.tex").write_text(
+            f"\\begin{{{env}}}\nTrue.\n\\end{{{env}}}\n\\begin{{proof}}\nProof.\n\\end{{proof}}\n",
+            encoding="utf-8",
         )
 
     def test_advance_phase_approval_captures_trusted_main_result_hashes(self):
         root = Path(tempfile.mkdtemp())
         (root / "human_approve.json").write_text("{}", encoding="utf-8")
+        self._write_paper_statement_node(root, "main")
         config = self._config(root)
         state = SupervisorState(
             cycle=8,
@@ -35,16 +57,27 @@ class TestHumanInputHandling(unittest.TestCase):
             last_review={"decision": "ADVANCE_PHASE"},
         )
         tablet = TabletState(nodes={
-            "main": TabletNode(name="main", kind="paper_main_result", status="open"),
+            "main": TabletNode(
+                name="main",
+                kind="ordinary",
+                status="open",
+                paper_provenance={"start_line": 1, "end_line": 3, "tex_label": "main"},
+            ),
         })
 
-        with patch("lagent_tablets.cli._capture_trusted_main_result_hashes", return_value={"main": "fp-main"}), \
+        with patch(
+            "lagent_tablets.cli._capture_trusted_main_result_target_state",
+            return_value={"main": {"nodes": ["main"], "fingerprint": "fp-main"}},
+        ), \
              patch("lagent_tablets.cli.freeze_current_coarse_package") as mock_freeze:
             stop = should_stop(config, state, tablet, CycleOutcome("CONTINUE", "ok"))
 
         self.assertFalse(stop)
         self.assertEqual(state.phase, "proof_formalization")
-        self.assertEqual(state.trusted_main_result_hashes, {"main": "fp-main"})
+        self.assertEqual(
+            state.trusted_main_result_target_state,
+            {"main": {"nodes": ["main"], "fingerprint": "fp-main"}},
+        )
         self.assertIsNone(state.last_review)
         mock_freeze.assert_called_once_with(tablet, config.repo_path, cycle=state.cycle)
 
@@ -69,26 +102,40 @@ class TestHumanInputHandling(unittest.TestCase):
     def test_need_input_approval_retrusts_main_results_for_trust_gate(self):
         root = Path(tempfile.mkdtemp())
         (root / "human_approve.json").write_text("{}", encoding="utf-8")
+        self._write_paper_statement_node(root, "main")
         config = self._config(root)
         state = SupervisorState(
             cycle=12,
             phase="proof_formalization",
             last_review={
                 "decision": "NEED_INPUT",
-                "human_gate": "paper_main_result_correspondence",
-                "reason": "Trusted paper main results drifted.",
+                "human_gate": "main_result_target_correspondence",
+                "reason": "Trusted main-result targets drifted.",
             },
-            trusted_main_result_hashes={"main": "old"},
+            trusted_main_result_target_state={
+                "main": {"nodes": ["main"], "fingerprint": "old"},
+            },
         )
         tablet = TabletState(nodes={
-            "main": TabletNode(name="main", kind="paper_main_result", status="closed"),
+            "main": TabletNode(
+                name="main",
+                kind="ordinary",
+                status="closed",
+                paper_provenance={"start_line": 1, "end_line": 3, "tex_label": "main"},
+            ),
         })
 
-        with patch("lagent_tablets.cli._capture_trusted_main_result_hashes", return_value={"main": "new"}):
+        with patch(
+            "lagent_tablets.cli._capture_trusted_main_result_target_state",
+            return_value={"main": {"nodes": ["main"], "fingerprint": "new"}},
+        ):
             stop = should_stop(config, state, tablet, CycleOutcome("CONTINUE", "ok"))
 
         self.assertFalse(stop)
-        self.assertEqual(state.trusted_main_result_hashes, {"main": "new"})
+        self.assertEqual(
+            state.trusted_main_result_target_state,
+            {"main": {"nodes": ["main"], "fingerprint": "new"}},
+        )
         self.assertEqual(state.last_review["decision"], "CONTINUE")
         self.assertFalse(state.awaiting_human_input)
 
@@ -98,7 +145,7 @@ class TestHumanInputHandling(unittest.TestCase):
         state = SupervisorState(cycle=14, phase="proof_formalization")
         tablet = TabletState(nodes={
             "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
-            "main": TabletNode(name="main", kind="paper_main_result", status="closed"),
+            "main": TabletNode(name="main", kind="ordinary", status="closed"),
         })
 
         stop = should_stop(config, state, tablet, CycleOutcome("PROGRESS", "all done"))
@@ -108,27 +155,54 @@ class TestHumanInputHandling(unittest.TestCase):
         self.assertEqual(state.cleanup_last_good_commit, "cycle-14")
 
 
-class TestTrustedMainResultReviewIssues(unittest.TestCase):
+class TestTrustedPaperStatementReviewIssues(unittest.TestCase):
 
     def _config(self, root: Path) -> SimpleNamespace:
         return SimpleNamespace(
             state_dir=root,
             repo_path=root,
             max_cycles=0,
+            workflow=SimpleNamespace(main_result_labels=["main", "gone"]),
         )
 
-    def test_detects_changed_added_and_removed_main_results(self):
+    def test_detects_changed_added_and_removed_paper_statements(self):
         root = Path(tempfile.mkdtemp())
+        (root / "paper.tex").write_text(
+            "\\begin{theorem}\\label{main}\nMain.\n\\end{theorem}\n"
+            "\\begin{lemma}\\label{extra}\nExtra.\n\\end{lemma}\n",
+            encoding="utf-8",
+        )
+        tablet_dir = root / "Tablet"
+        tablet_dir.mkdir()
+        for name, env in [("main", "theorem"), ("extra", "lemma")]:
+            (tablet_dir / f"{name}.lean").write_text(
+                f"import Tablet.Preamble\n\n-- [TABLET NODE: {name}]\n\ntheorem {name} : True := by\n  trivial\n",
+                encoding="utf-8",
+            )
+            (tablet_dir / f"{name}.tex").write_text(
+                f"\\begin{{{env}}}\nTrue.\n\\end{{{env}}}\n\\begin{{proof}}\nProof.\n\\end{{proof}}\n",
+                encoding="utf-8",
+            )
         config = self._config(root)
         state = SupervisorState(
-            trusted_main_result_hashes={
-                "main": "old-main",
-                "gone": "old-gone",
+            trusted_main_result_target_state={
+                "label:main": {"target": {"tex_label": "main"}, "nodes": ["main"], "fingerprint": "old-main"},
+                "label:gone": {"target": {"tex_label": "gone"}, "nodes": ["gone"], "fingerprint": "old-gone"},
             }
         )
         tablet = TabletState(nodes={
-            "main": TabletNode(name="main", kind="paper_main_result", status="closed"),
-            "extra": TabletNode(name="extra", kind="paper_main_result", status="open"),
+            "main": TabletNode(
+                name="main",
+                kind="ordinary",
+                status="closed",
+                paper_provenance={"start_line": 1, "end_line": 3, "tex_label": "main"},
+            ),
+            "extra": TabletNode(
+                name="extra",
+                kind="ordinary",
+                status="open",
+                paper_provenance={"start_line": 4, "end_line": 6, "tex_label": "extra"},
+            ),
         })
 
         def fake_fp(_repo: Path, node_name: str) -> str:
@@ -139,16 +213,26 @@ class TestTrustedMainResultReviewIssues(unittest.TestCase):
             raise AssertionError(f"unexpected node: {node_name}")
 
         with patch("lagent_tablets.nl_cache.NLCache.correspondence_fingerprint", autospec=True, side_effect=lambda self, repo, node_name: fake_fp(repo, node_name)):
-            issues = _trusted_main_result_review_issues(config, state, tablet)
+            issues = _trusted_main_result_label_review_issues(config, state, tablet)
 
         self.assertEqual(
             issues,
             [
-                "gone: removed from the main-result set after human review",
-                "extra: newly classified as a paper main result after human review",
-                "main: correspondence changed since the last human-reviewed package",
+                "Configured main-result target `gone` is not covered by any non-helper node.",
+                "main: correspondence changed since the last human-reviewed target package",
+                "gone: covering node set changed since the last human-reviewed package (was ['gone'], now ['(none)'])",
             ],
         )
+
+    def test_ignores_review_gate_before_any_targets_are_trusted(self):
+        root = Path(tempfile.mkdtemp())
+        config = self._config(root)
+        state = SupervisorState(trusted_main_result_target_state={})
+        tablet = TabletState()
+
+        issues = _trusted_main_result_label_review_issues(config, state, tablet)
+
+        self.assertEqual(issues, [])
 
 
 class TestCliPermissionRepair(unittest.TestCase):
@@ -166,6 +250,7 @@ class TestCliPermissionRepair(unittest.TestCase):
                 phase_overrides={},
                 allowed_import_prefixes=["Mathlib"],
                 forbidden_keyword_allowlist=[],
+                main_result_labels=[],
             ),
             sandbox=SimpleNamespace(enabled=True, backend="bwrap"),
             startup_timeout_seconds=60.0,
@@ -234,7 +319,7 @@ class TestCliPermissionRepair(unittest.TestCase):
 
     def test_theorem_stating_cli_repairs_include_package_builds_after_cycle(self):
         root = Path(tempfile.mkdtemp())
-        tablet = TabletState(nodes={"foo": TabletNode(name="foo", kind="paper_intermediate", status="open")})
+        tablet = TabletState(nodes={"foo": TabletNode(name="foo", kind="ordinary", status="open")})
         state = SupervisorState(cycle=0, phase="theorem_stating")
         self._run_main_once(
             phase="theorem_stating",

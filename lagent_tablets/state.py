@@ -25,7 +25,7 @@ T = TypeVar("T")
 OPEN_BLOCKER_PHASES = ("correspondence", "paper_faithfulness", "soundness")
 # Backward-compatible alias for older code/tests/state.
 OPEN_REJECTION_PHASES = OPEN_BLOCKER_PHASES
-ORPHAN_RESOLUTION_ACTIONS = ("remove", "keep_and_add_dependency")
+SUPPORT_RESOLUTION_ACTIONS = ("remove", "keep_and_add_dependency")
 DEFAULT_JSON_FILE_MODE = 0o664
 
 
@@ -137,12 +137,12 @@ def normalize_open_rejections(raw: Any) -> List[Dict[str, str]]:
     return normalize_open_blockers(raw)
 
 
-def normalize_orphan_resolutions(
+def normalize_support_resolutions(
     raw: Any,
     *,
     allowed_nodes: Optional[set[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """Normalize structured reviewer decisions for theorem-stating orphan nodes."""
+    """Normalize reviewer decisions for unsupported theorem-stating nodes."""
     if not isinstance(raw, list):
         return []
 
@@ -158,7 +158,7 @@ def normalize_orphan_resolutions(
             continue
         if allowed_nodes is not None and node not in allowed_nodes:
             continue
-        if action not in ORPHAN_RESOLUTION_ACTIONS or not reason:
+        if action not in SUPPORT_RESOLUTION_ACTIONS or not reason:
             continue
 
         suggested_parents: List[str] = []
@@ -180,6 +180,15 @@ def normalize_orphan_resolutions(
             "suggested_parents": suggested_parents,
         })
     return normalized
+
+
+def normalize_orphan_resolutions(
+    raw: Any,
+    *,
+    allowed_nodes: Optional[set[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Backward-compatible alias for legacy orphan-resolution naming."""
+    return normalize_support_resolutions(raw, allowed_nodes=allowed_nodes)
 
 
 def normalize_paper_focus_ranges(raw: Any) -> List[Dict[str, Any]]:
@@ -213,6 +222,120 @@ def normalize_paper_focus_ranges(raw: Any) -> List[Dict[str, Any]]:
     return normalized
 
 
+def normalize_paper_provenance(raw: Any) -> Dict[str, Any]:
+    """Normalize structured paper provenance metadata.
+
+    New-format provenance requires a line range and may include an optional
+    TeX label. Older persisted string values are preserved under a `legacy`
+    key so old history can still render readably.
+    """
+    if raw is None:
+        return {}
+    if isinstance(raw, str):
+        text = raw.strip()
+        return {"legacy": text} if text else {}
+    if not isinstance(raw, dict):
+        return {}
+
+    try:
+        start_line = int(raw.get("start_line", 0))
+        end_line = int(raw.get("end_line", 0))
+    except (TypeError, ValueError):
+        return {}
+    if start_line <= 0 or end_line <= 0:
+        return {}
+    if end_line < start_line:
+        start_line, end_line = end_line, start_line
+
+    normalized: Dict[str, Any] = {
+        "start_line": start_line,
+        "end_line": end_line,
+    }
+    tex_label = str(raw.get("tex_label", "") or "").strip()
+    if tex_label:
+        normalized["tex_label"] = tex_label
+    return normalized
+
+
+def has_structured_paper_provenance(raw: Any) -> bool:
+    provenance = normalize_paper_provenance(raw)
+    return "start_line" in provenance and "end_line" in provenance
+
+
+def format_paper_provenance(raw: Any) -> str:
+    provenance = normalize_paper_provenance(raw)
+    if not provenance:
+        return ""
+    legacy = str(provenance.get("legacy", "") or "").strip()
+    if legacy:
+        return legacy
+
+    start_line = int(provenance["start_line"])
+    end_line = int(provenance["end_line"])
+    line_text = (
+        f"line {start_line}"
+        if start_line == end_line
+        else f"lines {start_line}-{end_line}"
+    )
+    tex_label = str(provenance.get("tex_label", "") or "").strip()
+    if tex_label:
+        return f"{line_text}; label={tex_label}"
+    return line_text
+
+
+def _normalize_trusted_main_result_target_state(
+    raw: Any,
+    *,
+    fallback_hashes: Any = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Normalize persisted trusted-main-result snapshots.
+
+    New state stores per-label node membership and a combined fingerprint.
+    Older state stored only ``label -> fingerprint``; preserve that data as a
+    minimal snapshot so legacy runs can still load safely.
+    """
+    normalized: Dict[str, Dict[str, Any]] = {}
+
+    if isinstance(raw, dict):
+        for raw_label, raw_entry in raw.items():
+            label = str(raw_label).strip()
+            if not label or not isinstance(raw_entry, dict):
+                continue
+            fingerprint = str(raw_entry.get("fingerprint", "") or "").strip()
+            nodes: List[str] = []
+            raw_nodes = raw_entry.get("nodes", [])
+            if isinstance(raw_nodes, list):
+                seen_nodes: set[str] = set()
+                for raw_node in raw_nodes:
+                    node = str(raw_node).strip()
+                    if not node or node in seen_nodes:
+                        continue
+                    seen_nodes.add(node)
+                    nodes.append(node)
+            if not nodes and not fingerprint:
+                continue
+            normalized[label] = {
+                "nodes": nodes,
+                "fingerprint": fingerprint,
+            }
+
+    if normalized:
+        return normalized
+
+    if isinstance(fallback_hashes, dict):
+        for raw_label, raw_fp in fallback_hashes.items():
+            label = str(raw_label).strip()
+            fingerprint = str(raw_fp).strip()
+            if not label or not fingerprint:
+                continue
+            normalized[label] = {
+                "nodes": [],
+                "fingerprint": fingerprint,
+            }
+
+    return normalized
+
+
 # ---------------------------------------------------------------------------
 # Tablet node dataclass
 # ---------------------------------------------------------------------------
@@ -221,11 +344,11 @@ def normalize_paper_focus_ranges(raw: Any) -> List[Dict[str, Any]]:
 class TabletNode:
     """A single node in the proof tablet."""
     name: str
-    kind: str  # "preamble", "paper_main_result", "paper_intermediate", "helper_lemma"
+    kind: str  # "preamble", "ordinary", "helper_lemma"
     status: str  # "open", "closed"
     difficulty: str = "hard"  # "easy" or "hard"
     title: str = ""
-    paper_provenance: str = ""
+    paper_provenance: Dict[str, Any] = field(default_factory=dict)
     lean_statement_hash: str = ""
     closed_content_hash: str = ""
     closed_at_cycle: Optional[int] = None
@@ -295,11 +418,11 @@ class TabletNode:
         soundness_hash = str(raw.get("soundness_content_hash", legacy_hash))
         return cls(
             name=name,
-            kind=str(raw.get("kind", "helper_lemma")),
+            kind=str(raw.get("kind", "ordinary")),
             status=str(raw.get("status", "open")),
             difficulty=diff,
             title=str(raw.get("title", "")),
-            paper_provenance=str(raw.get("paper_provenance", "")),
+            paper_provenance=normalize_paper_provenance(raw.get("paper_provenance", {})),
             lean_statement_hash=str(raw.get("lean_statement_hash", "")),
             closed_content_hash=str(raw.get("closed_content_hash", "")),
             closed_at_cycle=raw.get("closed_at_cycle"),
@@ -420,7 +543,7 @@ class SupervisorState:
     human_input_at_cycle: int = 0
     awaiting_human_input: bool = False
     cleanup_last_good_commit: str = ""
-    trusted_main_result_hashes: Dict[str, str] = field(default_factory=dict)
+    trusted_main_result_target_state: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     agent_token_usage: Dict[str, Any] = field(default_factory=dict)
     resume_from: str = ""  # mid-cycle checkpoint: "", "verification", "reviewer"
 
@@ -444,7 +567,17 @@ class SupervisorState:
             "human_input_at_cycle": self.human_input_at_cycle,
             "awaiting_human_input": self.awaiting_human_input,
             "cleanup_last_good_commit": self.cleanup_last_good_commit,
-            "trusted_main_result_hashes": self.trusted_main_result_hashes,
+            "trusted_main_result_target_state": self.trusted_main_result_target_state,
+            "trusted_paper_statement_hashes": {
+                label: str(entry.get("fingerprint", ""))
+                for label, entry in sorted(self.trusted_main_result_target_state.items())
+                if isinstance(entry, dict) and str(entry.get("fingerprint", "")).strip()
+            },
+            "trusted_main_result_hashes": {
+                label: str(entry.get("fingerprint", ""))
+                for label, entry in sorted(self.trusted_main_result_target_state.items())
+                if isinstance(entry, dict) and str(entry.get("fingerprint", "")).strip()
+            },
             "agent_token_usage": self.agent_token_usage,
             "resume_from": self.resume_from,
         }
@@ -479,7 +612,16 @@ class SupervisorState:
             human_input_at_cycle=int(raw.get("human_input_at_cycle", 0)),
             awaiting_human_input=bool(raw.get("awaiting_human_input", False)),
             cleanup_last_good_commit=str(raw.get("cleanup_last_good_commit", "")),
-            trusted_main_result_hashes=dict(raw.get("trusted_main_result_hashes", {})),
+            trusted_main_result_target_state=_normalize_trusted_main_result_target_state(
+                raw.get(
+                    "trusted_main_result_target_state",
+                    raw.get("trusted_main_result_label_state"),
+                ),
+                fallback_hashes=raw.get(
+                    "trusted_paper_statement_hashes",
+                    raw.get("trusted_main_result_hashes", {}),
+                ),
+            ),
             agent_token_usage=dict(raw.get("agent_token_usage", {})),
             resume_from=str(raw.get("resume_from", "")),
         )
@@ -492,6 +634,40 @@ class SupervisorState:
     @open_rejections.setter
     def open_rejections(self, value: List[Dict[str, str]]) -> None:
         self.open_blockers = normalize_open_blockers(value)
+
+    @property
+    def trusted_paper_statement_hashes(self) -> Dict[str, str]:
+        """Backward-compatible projection to legacy label->fingerprint mapping."""
+        return {
+            label: str(entry.get("fingerprint", ""))
+            for label, entry in self.trusted_main_result_target_state.items()
+            if isinstance(entry, dict) and str(entry.get("fingerprint", "")).strip()
+        }
+
+    @trusted_paper_statement_hashes.setter
+    def trusted_paper_statement_hashes(self, value: Dict[str, str]) -> None:
+        self.trusted_main_result_target_state = _normalize_trusted_main_result_target_state(
+            None,
+            fallback_hashes=value,
+        )
+
+    @property
+    def trusted_main_result_hashes(self) -> Dict[str, str]:
+        """Backward-compatible alias for older callers/tests."""
+        return self.trusted_paper_statement_hashes
+
+    @trusted_main_result_hashes.setter
+    def trusted_main_result_hashes(self, value: Dict[str, str]) -> None:
+        self.trusted_paper_statement_hashes = value
+
+    @property
+    def trusted_main_result_label_state(self) -> Dict[str, Dict[str, Any]]:
+        """Backward-compatible alias for older callers/tests."""
+        return self.trusted_main_result_target_state
+
+    @trusted_main_result_label_state.setter
+    def trusted_main_result_label_state(self, value: Dict[str, Dict[str, Any]]) -> None:
+        self.trusted_main_result_target_state = _normalize_trusted_main_result_target_state(value)
 
 
 def state_path(config_or_state_dir: Any) -> Path:

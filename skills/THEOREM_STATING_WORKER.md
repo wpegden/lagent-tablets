@@ -21,6 +21,8 @@ The emitted prompt is authoritative. In particular:
 - Prefer existing Mathlib definitions over project wrappers.
 - Every real definition should be its own node with matching `.lean` and `.tex`.
 - Do not let theorem/lemma/corollary nodes double as hidden definitions.
+- Use `helper` for structural auxiliary statements that do not correspond to one cited paper statement.
+- Use `theorem`, `lemma`, or `corollary` only for paper-anchored statements, and record structured paper provenance for them.
 - `Tablet/Preamble.lean` contains imports only.
 
 ## Loogle First

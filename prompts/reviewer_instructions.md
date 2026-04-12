@@ -18,7 +18,8 @@ Decide what to do next. Write your decision as JSON to the raw file `{raw_output
   ],
   "difficulty_assignments": {{"node_name": "easy or hard"}},
   "elevate_to_hard": ["node_name_if_easy_mode_is_insufficient"],
-  "proof_edit_mode": "local | restructure | coarse_restructure"
+  "proof_edit_mode": "local | restructure | coarse_restructure",
+  "feedback": "optional short note if the task/setup seems impossible, inconsistent, or poorly supported"
 }}
 
 Guidelines:
@@ -29,8 +30,12 @@ Guidelines:
 - DONE: the entire project is complete.
 - `proof_edit_mode` defaults to `local`. Set it to `restructure` only when you are explicitly authorizing a broader refactor around the same hard active node inside its target-centered impact region without mutating the accepted coarse theorem-stating package.
 - Set `proof_edit_mode` to `coarse_restructure` only when the accepted coarse theorem-stating package itself must change. This is a higher-bar authorization than ordinary `restructure`.
+- `proof_edit_mode: "restructure"` or `"coarse_restructure"` only takes effect when you keep the same hard active node in focus for the next cycle. Otherwise the supervisor falls back to `local`.
 - When a hard-mode worker returns `STUCK` because nearby existing nodes must change, you may keep the same node active with `decision: "CONTINUE"` and `proof_edit_mode: "restructure"` instead of treating it as generic stuck recovery.
 - When a hard-mode worker returns `STUCK` because the accepted coarse package itself must change, you may keep the same node active with `decision: "CONTINUE"` and `proof_edit_mode: "coarse_restructure"`.
+- New paper-anchored `theorem`/`lemma`/`corollary` nodes introduced during proof_formalization can be legitimate when the local proof work exposes a missing statement. The same is true for new `definition` nodes that are intended to cover configured `main_result_targets`. If the worker creates either kind of node, require the full node spec, including structured provenance, and decide whether it is a justified local addition or evidence that the work really needs theorem_stating/coarse-restructure handling.
+- Keep the configured `main_result_targets` in view. Nodes that cover those targets are the human-reviewed paper package; ordinary proof work must not silently change their statement-level meaning without triggering the higher-level review gate.
+- If the prompt warns about unsupported nodes, treat that as advisory in proof_formalization rather than as a separate decision field. Mention it in `reason` or `next_prompt` when it materially affects the active proof slice or indicates theorem-stating debt, but do not invent unsupported-node resolution objects in this phase.
 - `paper_focus_ranges` is mandatory. Include the source-paper line ranges the next worker should have inlined for focused context. Use `[]` when no specific excerpt is needed.
 - Prefer short, high-signal ranges: theorem statements, notation blocks, or the exact proof paragraphs the worker should track next. Do not dump broad sections when a targeted excerpt will do.
 
@@ -42,7 +47,7 @@ Each node is classified as "easy" or "hard":
 - **easy**: A straightforward Lean proof from existing children. The worker can only edit the proof body -- no new imports, no new files. Use a faster/cheaper model.
 - **hard**: A challenging proof that may require creating helper lemmas, refactoring imports, or other structural changes. Uses a stronger model.
 
-Hard mode is still node-centered by default. Broader edits to nearby existing nodes require deliberate reviewer authorization via `proof_edit_mode: "restructure"`; they are not part of ordinary hard-mode freedom. Mutating the accepted coarse theorem-stating package requires the stronger `proof_edit_mode: "coarse_restructure"` authorization and should be used sparingly.
+Hard mode is still node-centered by default. Broader edits to nearby existing nodes require deliberate reviewer authorization via `proof_edit_mode: "restructure"`; they are not part of ordinary hard-mode freedom. Mutating the accepted coarse theorem-stating package requires the stronger `proof_edit_mode: "coarse_restructure"` authorization and should be used sparingly. In particular, a newly created paper-anchored node does not by itself justify changing accepted coarse-node statements, `.tex`, or coarse-to-coarse structure.
 
 You may assign or reassign difficulty via `difficulty_assignments`. You may elevate an easy node to hard via `elevate_to_hard` if you see the worker struggling (check the "attempts" count in the tablet status). The supervisor auto-elevates after 2 failed easy attempts.
 
@@ -54,7 +59,7 @@ disagree. You are the final arbiter:
 
 MANDATORY:
 1. Write the JSON to `{raw_output_path}`.
-2. Run `python3 {check_script} reviewer-decision {raw_output_path} --phase {phase}`.
+2. Run `python3 {check_script} reviewer-decision {raw_output_path} --phase {phase} --repo {repo_path}`.
 3. If that passes, write the completion marker `{done_path}` and stop.
 
 The supervisor will rerun the same checker and then write the canonical result file `{canonical_output_path}`.

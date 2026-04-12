@@ -75,10 +75,10 @@ class TestTabletNode(unittest.TestCase):
     def test_round_trip(self):
         node = TabletNode(
             name="compactness_of_K",
-            kind="paper_intermediate",
+            kind="ordinary",
             status="closed",
             title="Compactness of K",
-            paper_provenance="Lemma 2.1",
+            paper_provenance={"start_line": 21, "end_line": 24, "tex_label": "compactness"},
             lean_statement_hash="sha256:abc",
             closed_content_hash="lean789",
             closed_at_cycle=23,
@@ -90,10 +90,13 @@ class TestTabletNode(unittest.TestCase):
         d = node.to_dict()
         restored = TabletNode.from_dict("compactness_of_K", d)
         self.assertEqual(restored.name, "compactness_of_K")
-        self.assertEqual(restored.kind, "paper_intermediate")
+        self.assertEqual(restored.kind, "ordinary")
         self.assertEqual(restored.status, "closed")
         self.assertEqual(restored.title, "Compactness of K")
-        self.assertEqual(restored.paper_provenance, "Lemma 2.1")
+        self.assertEqual(
+            restored.paper_provenance,
+            {"start_line": 21, "end_line": 24, "tex_label": "compactness"},
+        )
         self.assertEqual(restored.closed_content_hash, "lean789")
         self.assertEqual(restored.closed_at_cycle, 23)
         self.assertEqual(restored.correspondence_content_hash, "corr123")
@@ -128,8 +131,8 @@ class TestTabletState(unittest.TestCase):
     def test_metrics(self):
         tablet = TabletState(nodes={
             "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
-            "thm_a": TabletNode(name="thm_a", kind="paper_main_result", status="closed"),
-            "thm_b": TabletNode(name="thm_b", kind="paper_main_result", status="open"),
+            "thm_a": TabletNode(name="thm_a", kind="ordinary", status="closed"),
+            "thm_b": TabletNode(name="thm_b", kind="ordinary", status="open"),
             "helper": TabletNode(name="helper", kind="helper_lemma", status="open"),
         })
         self.assertEqual(tablet.total_nodes, 3)  # excludes preamble
@@ -140,7 +143,12 @@ class TestTabletState(unittest.TestCase):
         tablet = TabletState(
             nodes={
                 "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
-                "thm_a": TabletNode(name="thm_a", kind="paper_main_result", status="open", paper_provenance="Thm 1"),
+                "thm_a": TabletNode(
+                    name="thm_a",
+                    kind="ordinary",
+                    status="open",
+                    paper_provenance={"start_line": 10, "end_line": 12, "tex_label": "thm1"},
+                ),
             },
             active_node="thm_a",
             seeded_at_cycle=5,
@@ -151,7 +159,10 @@ class TestTabletState(unittest.TestCase):
         self.assertEqual(restored.active_node, "thm_a")
         self.assertEqual(restored.seeded_at_cycle, 5)
         self.assertEqual(len(restored.nodes), 2)
-        self.assertEqual(restored.nodes["thm_a"].paper_provenance, "Thm 1")
+        self.assertEqual(
+            restored.nodes["thm_a"].paper_provenance,
+            {"start_line": 10, "end_line": 12, "tex_label": "thm1"},
+        )
 
     def test_save_and_load(self):
         tmpdir = Path(tempfile.mkdtemp())
@@ -193,7 +204,9 @@ class TestSupervisorState(unittest.TestCase):
             last_review={"decision": "CONTINUE", "reason": "making progress"},
             open_blockers=[{"node": "foo", "phase": "correspondence", "reason": "statement mismatch"}],
             review_log=[{"cycle": 41, "decision": "CONTINUE"}],
-            trusted_main_result_hashes={"main_thm": "fp-main"},
+            trusted_main_result_target_state={
+                "main_thm": {"nodes": ["main_thm"], "fingerprint": "fp-main"}
+            },
         )
         d = state.to_dict()
         restored = SupervisorState.from_dict(d)
@@ -207,7 +220,7 @@ class TestSupervisorState(unittest.TestCase):
         self.assertEqual(restored.last_review["decision"], "CONTINUE")
         self.assertEqual(restored.open_rejections[0]["node"], "foo")
         self.assertEqual(len(restored.review_log), 1)
-        self.assertEqual(restored.trusted_main_result_hashes, {"main_thm": "fp-main"})
+        self.assertEqual(restored.trusted_paper_statement_hashes, {"main_thm": "fp-main"})
 
     def test_save_and_load(self):
         tmpdir = Path(tempfile.mkdtemp())

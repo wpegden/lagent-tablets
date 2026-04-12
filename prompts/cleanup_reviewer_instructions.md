@@ -19,7 +19,8 @@ Write your decision as JSON to the raw file `{raw_output_path}`:
       "end_line": 462,
       "reason": "optional paper excerpt to keep visible"
     }}
-  ]
+  ],
+  "feedback": "optional short note if the task/setup seems impossible, inconsistent, or poorly supported"
 }}
 
 Guidelines:
@@ -30,7 +31,7 @@ Guidelines:
 
 MANDATORY:
 1. Write the JSON to `{raw_output_path}`.
-2. Run `python3 {check_script} reviewer-decision {raw_output_path} --phase {phase}`.
+2. Run `python3 {check_script} reviewer-decision {raw_output_path} --phase {phase} --repo {repo_path}`.
 3. If that passes, write the completion marker `{done_path}` and stop.
 
 The supervisor will rerun the same checker and then write the canonical result file `{canonical_output_path}`.

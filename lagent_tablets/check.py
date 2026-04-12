@@ -112,6 +112,7 @@ THEOREM_TARGET_EDIT_MODES: Tuple[str, ...] = ("repair", "restructure")
 CORRESPONDENCE_DECISIONS: Tuple[str, ...] = ("PASS", "FAIL")
 BATCH_SOUNDNESS_DECISIONS: Tuple[str, ...] = ("PASS", "FAIL")
 NODE_SOUNDNESS_DECISIONS: Tuple[str, ...] = ("SOUND", "UNSOUND", "STRUCTURAL")
+PAPER_LABEL_RE = re.compile(r"\\label\{([^{}]+)\}")
 
 
 def _keyword_pattern(keyword: str) -> str:
@@ -526,6 +527,127 @@ def _normalize_string_dict(value: Any, field: str, *, allowed_values: Optional[S
     return normalized, errors
 
 
+def _normalize_paper_provenance_dict(
+    value: Any,
+    field: str,
+) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
+    from lagent_tablets.state import has_structured_paper_provenance, normalize_paper_provenance
+
+    if value is None:
+        return {}, []
+    if not isinstance(value, dict):
+        return {}, [f"{field} must be an object"]
+    normalized: Dict[str, Dict[str, Any]] = {}
+    errors: List[str] = []
+    for raw_key, raw_val in value.items():
+        key = str(raw_key).strip()
+        if not key:
+            errors.append(f"{field} contains an empty node name")
+            continue
+        provenance = normalize_paper_provenance(raw_val)
+        if not has_structured_paper_provenance(provenance):
+            errors.append(
+                f"{field}.{key} must be an object with positive start_line/end_line "
+                "and optional tex_label"
+            )
+            continue
+        normalized[key] = provenance
+    return normalized, errors
+
+
+def _project_paper_path(repo: Path) -> Optional[Path]:
+    from lagent_tablets.config import load_config
+    from lagent_tablets.project_paths import project_config_path
+
+    try:
+        config_path = project_config_path(repo)
+        if config_path.exists():
+            config = load_config(config_path)
+            paper_path = config.workflow.paper_tex_path
+            if paper_path and paper_path.exists():
+                return paper_path
+    except Exception:
+        pass
+
+    direct = repo / "paper.tex"
+    if direct.exists():
+        return direct
+
+    paper_dir = repo / "paper"
+    if paper_dir.is_dir():
+        candidates = sorted(paper_dir.glob("*.tex"))
+        if len(candidates) == 1:
+            return candidates[0]
+    return None
+
+
+def _paper_labels_in_range(repo: Path, start_line: int, end_line: int) -> List[str]:
+    paper_path = _project_paper_path(repo)
+    if paper_path is None:
+        return []
+    lines = paper_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if not lines:
+        return []
+    start = max(1, min(start_line, len(lines)))
+    end = max(1, min(end_line, len(lines)))
+    if end < start:
+        start, end = end, start
+    labels: List[str] = []
+    seen: Set[str] = set()
+    for line in lines[start - 1:end]:
+        for label in PAPER_LABEL_RE.findall(line):
+            if label not in seen:
+                seen.add(label)
+                labels.append(label)
+    return labels
+
+
+def _validate_paper_provenance_for_node(
+    repo: Path,
+    *,
+    node_name: str,
+    env: str,
+    provenance: Optional[Dict[str, Any]],
+    field_name: str,
+) -> List[str]:
+    from lagent_tablets.state import has_structured_paper_provenance
+    from lagent_tablets.tablet import is_paper_statement_environment
+
+    errors: List[str] = []
+    provenance = provenance or {}
+
+    if is_paper_statement_environment(env):
+        if not has_structured_paper_provenance(provenance):
+            errors.append(
+                f"{field_name} entry {node_name} uses `{env}` and must include start_line/end_line"
+            )
+            return errors
+    elif not provenance:
+        return errors
+
+    if not has_structured_paper_provenance(provenance):
+        errors.append(
+            f"{field_name} entry {node_name} must include start_line/end_line when provenance is provided"
+        )
+        return errors
+
+    start_line = int(provenance["start_line"])
+    end_line = int(provenance["end_line"])
+    labels_in_range = _paper_labels_in_range(repo, start_line, end_line)
+    tex_label = str(provenance.get("tex_label", "") or "").strip()
+    if tex_label and tex_label not in labels_in_range:
+        errors.append(
+            f"{field_name} entry {node_name} cites tex_label `{tex_label}`, "
+            f"but that label does not appear in paper lines {start_line}-{end_line}"
+        )
+    if len(labels_in_range) == 1 and tex_label != labels_in_range[0]:
+        errors.append(
+            f"{field_name} entry {node_name} must include tex_label `{labels_in_range[0]}` "
+            f"for paper lines {start_line}-{end_line}"
+        )
+    return errors
+
+
 def _validate_phase_block(
     value: Any,
     field: str,
@@ -552,7 +674,8 @@ def validate_correspondence_result_data(data: Any) -> Dict[str, Any]:
     paper, paper_errors = _validate_phase_block(data.get("paper_faithfulness"), "paper_faithfulness")
     summary, summary_errors = _expect_string(data.get("summary", ""), "summary")
     overall, overall_errors = _expect_string(data.get("overall", ""), "overall")
-    errors.extend(corr_errors + paper_errors + summary_errors + overall_errors)
+    feedback, feedback_errors = _expect_string(data.get("feedback", ""), "feedback", allow_empty=True)
+    errors.extend(corr_errors + paper_errors + summary_errors + overall_errors + feedback_errors)
     if overall and overall not in ("APPROVE", "REJECT"):
         errors.append("overall must be one of ['APPROVE', 'REJECT']")
     expected_overall = "APPROVE" if correspondence.get("decision") == "PASS" and paper.get("decision") == "PASS" else "REJECT"
@@ -563,6 +686,7 @@ def validate_correspondence_result_data(data: Any) -> Dict[str, Any]:
         "paper_faithfulness": paper,
         "overall": overall,
         "summary": summary,
+        "feedback": feedback,
     }
     return {"ok": not errors, "errors": errors, "data": normalized if not errors else None}
 
@@ -578,7 +702,8 @@ def validate_batch_soundness_result_data(data: Any) -> Dict[str, Any]:
     issues, issue_errors = _normalize_issue_list(soundness.get("issues", []), "soundness.issues")
     summary, summary_errors = _expect_string(data.get("summary", ""), "summary")
     overall, overall_errors = _expect_string(data.get("overall", ""), "overall")
-    errors.extend(decision_errors + issue_errors + summary_errors + overall_errors)
+    feedback, feedback_errors = _expect_string(data.get("feedback", ""), "feedback", allow_empty=True)
+    errors.extend(decision_errors + issue_errors + summary_errors + overall_errors + feedback_errors)
     if decision and decision not in BATCH_SOUNDNESS_DECISIONS:
         errors.append(f"soundness.decision must be one of {list(BATCH_SOUNDNESS_DECISIONS)}")
     if decision == "PASS" and issues:
@@ -594,6 +719,7 @@ def validate_batch_soundness_result_data(data: Any) -> Dict[str, Any]:
         "soundness": {"decision": decision, "issues": issues},
         "overall": overall,
         "summary": summary,
+        "feedback": feedback,
     }
     return {"ok": not errors, "errors": errors, "data": normalized if not errors else None}
 
@@ -605,7 +731,8 @@ def validate_node_soundness_result_data(data: Any, *, node_name: str) -> Dict[st
     node, node_errors = _expect_string(data.get("node", ""), "node")
     summary, summary_errors = _expect_string(data.get("summary", ""), "summary")
     overall, overall_errors = _expect_string(data.get("overall", ""), "overall")
-    errors.extend(node_errors + summary_errors + overall_errors)
+    feedback, feedback_errors = _expect_string(data.get("feedback", ""), "feedback", allow_empty=True)
+    errors.extend(node_errors + summary_errors + overall_errors + feedback_errors)
     if node and node != node_name:
         errors.append(f"node must equal {node_name}")
     if not isinstance(data.get("soundness"), dict):
@@ -631,18 +758,22 @@ def validate_node_soundness_result_data(data: Any, *, node_name: str) -> Dict[st
         },
         "overall": overall,
         "summary": summary,
+        "feedback": feedback,
     }
     return {"ok": not errors, "errors": errors, "data": normalized if not errors else None}
 
 
 def validate_worker_handoff_data(data: Any, *, phase: str, repo: Optional[Path] = None) -> Dict[str, Any]:
+    from lagent_tablets.tablet import node_statement_environment
+
     errors: List[str] = []
     if not isinstance(data, dict):
         return {"ok": False, "errors": ["result must be a JSON object"], "data": None}
     summary, summary_errors = _expect_string(data.get("summary", ""), "summary")
     status, status_errors = _expect_string(data.get("status", ""), "status")
     new_nodes, new_nodes_errors = _expect_string_list(data.get("new_nodes", []), "new_nodes")
-    errors.extend(summary_errors + status_errors + new_nodes_errors)
+    feedback, feedback_errors = _expect_string(data.get("feedback", ""), "feedback", allow_empty=True)
+    errors.extend(summary_errors + status_errors + new_nodes_errors + feedback_errors)
     if status and status not in WORKER_STATUSES:
         errors.append(f"status must be one of {list(WORKER_STATUSES)}")
     if phase != "theorem_stating" and status == "CRISIS":
@@ -651,34 +782,35 @@ def validate_worker_handoff_data(data: Any, *, phase: str, repo: Optional[Path] 
         "summary": summary,
         "status": status,
         "new_nodes": new_nodes,
+        "feedback": feedback,
     }
+    if phase in {"theorem_stating", "proof_formalization"}:
+        paper_provenance_hints, provenance_errors = _normalize_paper_provenance_dict(
+            data.get("paper_provenance_hints", {}),
+            "paper_provenance_hints",
+        )
+        errors.extend(provenance_errors)
+        extra_provenance_nodes = sorted(set(paper_provenance_hints) - set(new_nodes))
+        if extra_provenance_nodes:
+            errors.append(
+                "paper_provenance_hints keys must be listed in new_nodes "
+                f"(only genuinely new nodes may carry provenance hints): {extra_provenance_nodes}"
+            )
+        normalized["paper_provenance_hints"] = paper_provenance_hints
     if phase == "theorem_stating":
         difficulty_hints, diff_errors = _normalize_string_dict(
             data.get("difficulty_hints", {}),
             "difficulty_hints",
             allowed_values=("easy", "hard"),
         )
-        kind_hints, kind_errors = _normalize_string_dict(
-            data.get("kind_hints", {}),
-            "kind_hints",
-            allowed_values=("paper_main_result", "paper_intermediate"),
-        )
         errors.extend(diff_errors)
-        errors.extend(kind_errors)
         extra_hint_nodes = sorted(set(difficulty_hints) - set(new_nodes))
         if extra_hint_nodes:
             errors.append(
                 "difficulty_hints keys must be listed in new_nodes "
                 f"(only genuinely new nodes may be hinted): {extra_hint_nodes}"
             )
-        extra_kind_nodes = sorted(set(kind_hints) - set(new_nodes))
-        if extra_kind_nodes:
-            errors.append(
-                "kind_hints keys must be listed in new_nodes "
-                f"(only genuinely new nodes may be classified): {extra_kind_nodes}"
-            )
         normalized["difficulty_hints"] = difficulty_hints
-        normalized["kind_hints"] = kind_hints
     if repo is not None:
         for name in new_nodes:
             lean_path = repo / "Tablet" / f"{name}.lean"
@@ -687,6 +819,18 @@ def validate_worker_handoff_data(data: Any, *, phase: str, repo: Optional[Path] 
                 errors.append(f"new_nodes entry {name} is missing {lean_path}")
             if not tex_path.exists():
                 errors.append(f"new_nodes entry {name} is missing {tex_path}")
+                continue
+            if phase in {"theorem_stating", "proof_formalization"}:
+                env = node_statement_environment(repo, name)
+                errors.extend(
+                    _validate_paper_provenance_for_node(
+                        repo,
+                        node_name=name,
+                        env=env,
+                        provenance=normalized.get("paper_provenance_hints", {}).get(name),
+                        field_name="paper_provenance_hints",
+                    )
+                )
     return {"ok": not errors, "errors": errors, "data": normalized if not errors else None}
 
 
@@ -941,9 +1085,11 @@ def check_proof_hard_scope(
     changes = _detect_snapshot_changes(snapshot_before, after)
     supervisor_generated = {"INDEX.md", "README.md", "header.tex", "Tablet.lean"}
     allowed_modified = {"Preamble.lean"} | supervisor_generated
+    allowed_created_nodes: Optional[Set[str]] = None
     if proof_edit_mode in {"restructure", "coarse_restructure"}:
         allowed_nodes = set(str(name) for name in (authorized_nodes or []))
         allowed_nodes |= compute_target_impact_region(repo, active_node)
+        allowed_created_nodes = set(allowed_nodes)
         for name in allowed_nodes:
             allowed_modified.add(f"{name}.lean")
             allowed_modified.add(f"{name}.tex")
@@ -966,6 +1112,21 @@ def check_proof_hard_scope(
             errors.append(
                 f"Unexpected files modified: {unexpected_modified}. "
                 f"Only {active_node}, Preamble.lean, and supervisor-generated support files may be modified."
+            )
+
+    if proof_edit_mode in {"restructure", "coarse_restructure"} and allowed_created_nodes is not None:
+        created_node_names = sorted(
+            {
+                Path(fname).stem
+                for fname in changes["created"]
+                if fname.endswith(".lean") or fname.endswith(".tex")
+            }
+        )
+        out_of_scope_created = [name for name in created_node_names if name not in allowed_created_nodes]
+        if out_of_scope_created:
+            errors.append(
+                "New nodes in proof restructure mode must lie inside the active node's authorized impact region. "
+                f"Out-of-scope created nodes: {out_of_scope_created}"
             )
 
     coarse_result = check_coarse_package_guard(
@@ -996,9 +1157,15 @@ def check_proof_worker_delta(
 
     This is the artifact-creating deterministic gate shared by workers and the
     supervisor for proof_formalization. It validates the active node and any
-    newly created helper nodes, then summarizes created/closed progress.
+    newly created nodes, then summarizes created/closed progress.
     """
-    from lagent_tablets.tablet import has_sorry, node_lean_path, node_tex_path
+    from lagent_tablets.tablet import (
+        has_sorry,
+        is_paper_statement_environment,
+        node_lean_path,
+        node_statement_environment,
+        node_tex_path,
+    )
 
     changes = _detect_snapshot_changes(snapshot_before, _snapshot_tablet_dir(repo))
     active_lean = f"{active_node}.lean"
@@ -1426,12 +1593,19 @@ def check_cleanup_preserving(
     }
 
 
-def validate_reviewer_decision_data(data: Any, *, phase: str, invalid_attempt: bool = False) -> Dict[str, Any]:
+def validate_reviewer_decision_data(
+    data: Any,
+    *,
+    phase: str,
+    invalid_attempt: bool = False,
+    repo: Optional[Path] = None,
+) -> Dict[str, Any]:
     from lagent_tablets.state import (
         normalize_open_blockers,
-        normalize_orphan_resolutions,
+        normalize_support_resolutions,
         normalize_paper_focus_ranges,
     )
+    from lagent_tablets.tablet import node_statement_environment
 
     errors: List[str] = []
     if not isinstance(data, dict):
@@ -1446,7 +1620,8 @@ def validate_reviewer_decision_data(data: Any, *, phase: str, invalid_attempt: b
         "reset_to_checkpoint",
         allow_empty=True,
     )
-    errors.extend(decision_errors + reason_errors + next_prompt_errors + next_node_errors + reset_errors)
+    feedback, feedback_errors = _expect_string(data.get("feedback", ""), "feedback", allow_empty=True)
+    errors.extend(decision_errors + reason_errors + next_prompt_errors + next_node_errors + reset_errors + feedback_errors)
 
     if phase == "proof_formalization":
         allowed_decisions = PROOF_REVIEWER_DECISIONS
@@ -1466,6 +1641,7 @@ def validate_reviewer_decision_data(data: Any, *, phase: str, invalid_attempt: b
         "next_prompt": next_prompt,
         "next_active_node": next_active_node,
         "reset_to_checkpoint": reset_to_checkpoint,
+        "feedback": feedback,
     }
 
     paper_focus_ranges = normalize_paper_focus_ranges(data.get("paper_focus_ranges", []))
@@ -1500,13 +1676,12 @@ def validate_reviewer_decision_data(data: Any, *, phase: str, invalid_attempt: b
         normalized["proof_edit_mode"] = "local"
     else:
         issues, issues_errors = _expect_string_list(data.get("issues", []), "issues")
-        kind_assignments, kind_errors = _normalize_string_dict(
-            data.get("kind_assignments", {}),
-            "kind_assignments",
-            allowed_values=("paper_main_result", "paper_intermediate"),
+        paper_provenance_assignments, provenance_errors = _normalize_paper_provenance_dict(
+            data.get("paper_provenance_assignments", {}),
+            "paper_provenance_assignments",
         )
         errors.extend(issues_errors)
-        errors.extend(kind_errors)
+        errors.extend(provenance_errors)
         target_edit_mode, target_edit_mode_errors = _expect_string(
             data.get("target_edit_mode", "repair"),
             "target_edit_mode",
@@ -1514,19 +1689,39 @@ def validate_reviewer_decision_data(data: Any, *, phase: str, invalid_attempt: b
         errors.extend(target_edit_mode_errors)
         if target_edit_mode and target_edit_mode not in THEOREM_TARGET_EDIT_MODES:
             errors.append(f"target_edit_mode must be one of {list(THEOREM_TARGET_EDIT_MODES)}")
-        orphan_resolutions = normalize_orphan_resolutions(data.get("orphan_resolutions", []))
-        if data.get("orphan_resolutions", []) != [] and not orphan_resolutions:
-            errors.append("orphan_resolutions must be a list of valid orphan-resolution objects")
+        raw_support_resolutions = data.get("support_resolutions", data.get("orphan_resolutions", []))
+        support_resolutions = normalize_support_resolutions(raw_support_resolutions)
+        if raw_support_resolutions != [] and not support_resolutions:
+            errors.append("support_resolutions must be a list of valid support-resolution objects")
         raw_open_blockers = data.get("open_blockers", data.get("open_rejections", []))
         open_blockers = normalize_open_blockers(raw_open_blockers)
         if raw_open_blockers != [] and not open_blockers:
             errors.append("open_blockers must be a list of valid blocker objects")
         normalized["issues"] = issues
-        normalized["kind_assignments"] = kind_assignments
+        normalized["paper_provenance_assignments"] = paper_provenance_assignments
         normalized["target_edit_mode"] = target_edit_mode or "repair"
-        normalized["orphan_resolutions"] = orphan_resolutions
+        normalized["support_resolutions"] = support_resolutions
+        normalized["orphan_resolutions"] = list(support_resolutions)
         normalized["open_blockers"] = open_blockers
         normalized["open_rejections"] = open_blockers
+        if repo is not None:
+            for name, provenance in paper_provenance_assignments.items():
+                tex_path = repo / "Tablet" / f"{name}.tex"
+                if not tex_path.exists():
+                    errors.append(
+                        f"paper_provenance_assignments entry {name} is missing {tex_path}"
+                    )
+                    continue
+                env = node_statement_environment(repo, name)
+                errors.extend(
+                    _validate_paper_provenance_for_node(
+                        repo,
+                        node_name=name,
+                        env=env,
+                        provenance=provenance,
+                        field_name="paper_provenance_assignments",
+                    )
+                )
 
     if reset_to_checkpoint and phase != "theorem_stating":
         errors.append("reset_to_checkpoint is only allowed in theorem_stating")
@@ -1561,7 +1756,12 @@ def validate_json_artifact(
     if kind == "reviewer-decision":
         if phase is None:
             return {"ok": False, "errors": ["phase is required for reviewer-decision"], "data": None}
-        return validate_reviewer_decision_data(data, phase=phase, invalid_attempt=invalid_attempt)
+        return validate_reviewer_decision_data(
+            data,
+            phase=phase,
+            invalid_attempt=invalid_attempt,
+            repo=repo,
+        )
     if kind == "correspondence-result":
         return validate_correspondence_result_data(data)
     if kind == "soundness-result":
@@ -1810,18 +2010,18 @@ def check_node(
         else:
             decl_kind = declaration_kind(content, name)
             tex_env = tex_statement_environment(tex_content)
-            if decl_kind == "definition" and tex_env and tex_env != "definition":
-                declaration_role_warning = (
-                    f"Lean declaration is a definition but .tex uses {tex_env}; "
-                    "paper-facing concepts should be modeled as definition nodes."
+            from lagent_tablets.tablet import is_proof_bearing_statement_environment
+
+            if decl_kind == "definition" and is_proof_bearing_statement_environment(tex_env):
+                errors.append(
+                    f"Lean declaration is definition-like but .tex uses proof-bearing env `{tex_env}`; "
+                    "proof-bearing nodes must use theorem-like Lean declarations."
                 )
             elif decl_kind == "theorem_like" and tex_env == "definition":
-                declaration_role_warning = (
+                errors.append(
                     "The .tex statement uses definition but the Lean declaration is theorem-like; "
-                    "do not use theorem/lemma nodes as disguised definitions."
+                    "do not use theorem/lemma/corollary/helper nodes as disguised definitions."
                 )
-            if declaration_role_warning:
-                warnings.append(declaration_role_warning)
 
     # Forbidden keywords
     forbidden_hits = scan_forbidden(content, forbidden_keywords)
@@ -2162,6 +2362,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     reviewer_parser = subparsers.add_parser("reviewer-decision", help="Validate a reviewer decision raw JSON file")
     reviewer_parser.add_argument("path")
     reviewer_parser.add_argument("--phase", required=True, choices=["proof_formalization", "proof_complete_style_cleanup", "theorem_stating"])
+    reviewer_parser.add_argument("--repo", default=".")
 
     corr_parser = subparsers.add_parser("correspondence-result", help="Validate a correspondence raw JSON file")
     corr_parser.add_argument("path")
@@ -2419,7 +2620,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.command == "reviewer-decision":
         path = Path(args.path)
         return _print_json_validation_result(
-            validate_json_artifact("reviewer-decision", path, phase=args.phase),
+            validate_json_artifact("reviewer-decision", path, phase=args.phase, repo=Path(args.repo).resolve()),
             path=path,
         )
 

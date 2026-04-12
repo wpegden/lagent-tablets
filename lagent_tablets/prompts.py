@@ -14,20 +14,30 @@ from typing import Any, Dict, List, Optional
 from lagent_tablets.artifacts import prompt_artifact_paths
 from lagent_tablets.config import Config, Policy
 from lagent_tablets.state import (
+    format_paper_provenance,
+    normalize_paper_provenance,
     normalize_paper_focus_ranges,
     SupervisorState,
     TabletNode,
     TabletState,
     normalize_open_blockers,
-    normalize_orphan_resolutions,
+    normalize_support_resolutions,
 )
 from lagent_tablets.project_paths import project_scratch_dir
+from lagent_tablets.project_paths import project_feedback_log_path
 from lagent_tablets.project_paths import project_runtime_skills_dir
 from lagent_tablets.tablet import (
     PREAMBLE_NAME,
     extract_tex_statement_items,
     extract_tablet_imports,
+    format_main_result_target,
+    find_unsupported_nodes,
+    is_paper_statement_environment,
+    main_result_target_coverage,
+    main_result_target_key,
+    normalize_main_result_target,
     node_lean_path,
+    node_statement_environment,
     node_tex_path,
 )
 
@@ -37,6 +47,19 @@ from lagent_tablets.tablet import (
 # ---------------------------------------------------------------------------
 
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
+
+
+def _feedback_log_path(config: Config) -> Path:
+    return project_feedback_log_path(config.state_dir)
+
+
+def _agent_feedback_note(config: Config) -> str:
+    feedback_path = _feedback_log_path(config)
+    return (
+        "--- FEEDBACK ---\n"
+        f"If the task/setup seems impossible, inconsistent, or poorly supported, include a short `feedback` string in your JSON output. "
+        f"The supervisor will append it to the private feedback log `{feedback_path}`, which agents cannot read. This will be used to debug future versions of this system. Then continue with the best work you can.\n"
+    )
 
 
 def _human_input_section(state) -> str:
@@ -67,6 +90,33 @@ def _load_template(name: str) -> str:
     if path.exists():
         return path.read_text(encoding="utf-8")
     return ""
+
+
+def _node_spec_text() -> str:
+    return _load_template("node_spec.md")
+
+
+def _configured_main_result_targets(config: Config) -> List[Dict[str, Any]]:
+    workflow = getattr(config, "workflow", None)
+    raw = getattr(workflow, "main_result_targets", None) if workflow is not None else None
+    if raw in (None, []):
+        raw = getattr(workflow, "main_result_labels", []) if workflow is not None else []
+    if not isinstance(raw, list):
+        return []
+    targets: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_target in raw:
+        target = normalize_main_result_target(raw_target)
+        key = main_result_target_key(target)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        targets.append(target)
+    return targets
+
+
+def _node_env(repo_path: Path, node_name: str) -> str:
+    return node_statement_environment(repo_path, node_name)
 
 
 def _skill_path(repo_path: Path, filename: str) -> Path:
@@ -192,13 +242,14 @@ def _tablet_status_text(tablet: TabletState, repo_path: Path) -> str:
     m = tablet.metrics()
     lines.append(f"Tablet: {m['closed_nodes']}/{m['total_nodes']} nodes closed")
     lines.append("")
-    lines.append("| Name | Kind | Status | Difficulty | Title | Imports |")
-    lines.append("|------|------|--------|------------|-------|---------|")
+    lines.append("| Name | Env | Status | Difficulty | Paper ref | Title | Imports |")
+    lines.append("|------|-----|--------|------------|-----------|-------|---------|")
 
     for name in sorted(tablet.nodes.keys()):
         node = tablet.nodes[name]
         if name == PREAMBLE_NAME:
             continue
+        env = _node_env(repo_path, name) or "-"
         lean_path = node_lean_path(repo_path, name)
         imports_str = ""
         if lean_path.exists():
@@ -208,7 +259,10 @@ def _tablet_status_text(tablet: TabletState, repo_path: Path) -> str:
         diff_marker = node.difficulty
         if node.easy_attempts > 0:
             diff_marker += f" ({node.easy_attempts} attempts)"
-        lines.append(f"| {name} | {node.kind} | {status_marker} | {diff_marker} | {node.title} | {imports_str} |")
+        lines.append(
+            f"| {name} | {env} | {status_marker} | {diff_marker} | "
+            f"{format_paper_provenance(node.paper_provenance) or '-'} | {node.title} | {imports_str} |"
+        )
 
     return "\n".join(lines)
 
@@ -284,6 +338,69 @@ def _paper_focus_excerpt_text(
     return "".join(parts)
 
 
+def _paper_provenance_excerpt_text(
+    config: Config,
+    tablet: TabletState,
+    node_names: List[str],
+    *,
+    max_chars: int = 12000,
+) -> str:
+    """Render cited paper excerpts for nodes with structured paper provenance."""
+    paper_path = config.workflow.paper_tex_path
+    if not paper_path or not paper_path.exists():
+        return ""
+
+    paper_lines = paper_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if not paper_lines:
+        return ""
+
+    intro = (
+        "--- PAPER PROVENANCE EXCERPTS ---\n"
+        "For each node below with cited paper provenance, verify the `.tex` statement against the cited paper passage.\n"
+        f"Treat `{paper_path}` as authoritative if anything here is truncated.\n\n"
+    )
+    parts = [intro]
+    used = len(intro)
+
+    for name in sorted(node_names):
+        node = tablet.nodes.get(name)
+        if not node:
+            continue
+        env = _node_env(config.repo_path, name)
+        if env == "helper":
+            continue
+        provenance = normalize_paper_provenance(node.paper_provenance)
+        if "start_line" not in provenance or "end_line" not in provenance:
+            continue
+        start = max(1, min(int(provenance["start_line"]), len(paper_lines)))
+        end = max(1, min(int(provenance["end_line"]), len(paper_lines)))
+        if end < start:
+            start, end = end, start
+
+        header = f"--- {name} ({env}; {format_paper_provenance(provenance)}) ---\n"
+        excerpt = "\n".join(paper_lines[start - 1:end]).strip()
+        if not excerpt:
+            continue
+        block = f"{header}{excerpt}\n\n"
+        remaining = max_chars - used
+        if remaining <= 0:
+            break
+        if len(block) <= remaining:
+            parts.append(block)
+            used += len(block)
+            continue
+        trimmed_body_budget = max(0, remaining - len(header) - 3)
+        if trimmed_body_budget <= 0:
+            break
+        parts.append(f"{header}{_trim(excerpt, trimmed_body_budget)}\n\n")
+        used = max_chars
+        break
+
+    if len(parts) == 1:
+        return ""
+    return "".join(parts)
+
+
 def _tablet_file_reference_text(
     tablet: TabletState,
     repo_path: Path,
@@ -343,21 +460,21 @@ def _open_blockers_text(
     return "\n".join(lines)
 
 
-def _orphan_resolutions_text(
-    orphan_resolutions: Any,
+def _support_resolutions_text(
+    support_resolutions: Any,
     *,
-    header: str = "--- ORPHAN NODE ACTIONS ---",
+    header: str = "--- TARGET-SUPPORT ACTIONS ---",
     include_completion_note: bool = False,
 ) -> str:
-    """Render reviewer decisions about current orphan-node candidates."""
-    resolutions = normalize_orphan_resolutions(orphan_resolutions)
+    """Render reviewer decisions about nodes outside the target-support DAG."""
+    resolutions = normalize_support_resolutions(support_resolutions)
     if not resolutions:
         return ""
 
     lines = [header]
     if include_completion_note:
         lines.append(
-            "Resolve these orphan-node candidates before treating the tablet structure as complete."
+            "Resolve these unsupported nodes before treating the target-support DAG as complete."
         )
     for entry in resolutions:
         parents = entry.get("suggested_parents", [])
@@ -368,6 +485,33 @@ def _orphan_resolutions_text(
             lines.append(
                 f"- [keep_and_add_dependency] {entry['node']}: {entry['reason']}{parent_text}"
             )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _main_result_targets_text(config: Config, tablet: TabletState) -> str:
+    targets = _configured_main_result_targets(config)
+    if not targets:
+        return ""
+    coverage = main_result_target_coverage(tablet, config.repo_path, targets)
+    lines = ["--- CONFIGURED MAIN-RESULT TARGETS ---"]
+    lines.append(
+        "These configured paper targets define the paper items that matter for human review. "
+        "All other nodes should exist only insofar as they support at least one of these targets."
+    )
+    for target in targets:
+        key = main_result_target_key(target)
+        entry = coverage.get(key, {"nodes": [], "helper_nodes": []})
+        nodes = [str(name) for name in entry.get("nodes", []) if str(name).strip()]
+        helper_nodes = [str(name) for name in entry.get("helper_nodes", []) if str(name).strip()]
+        parts: List[str] = []
+        if nodes:
+            parts.append(f"covered by {', '.join(nodes)}")
+        else:
+            parts.append("not yet covered by any non-helper node")
+        if helper_nodes:
+            parts.append(f"helper-only matches: {', '.join(helper_nodes)}")
+        lines.append(f"- {format_main_result_target(target)}: {'; '.join(parts)}")
     lines.append("")
     return "\n".join(lines)
 
@@ -385,12 +529,13 @@ def _active_node_context(
         return f"Active node '{node_name}' not found in tablet."
 
     lines = [f"=== Active Node: {node_name} ==="]
-    lines.append(f"Kind: {node.kind}")
+    env = _node_env(repo_path, node_name)
+    lines.append(f"Env: {env or '(unknown)'}")
     lines.append(f"Status: {node.status}")
     if node.title:
         lines.append(f"Title: {node.title}")
     if node.paper_provenance:
-        lines.append(f"Paper reference: {node.paper_provenance}")
+        lines.append(f"Paper reference: {format_paper_provenance(node.paper_provenance)}")
     lines.append("")
 
     # Current Lean file (the worker needs this to know what to prove)
@@ -467,7 +612,7 @@ def _previous_cycle_feedback(
             lines.append(_trim(build_output, 10000))
             lines.append("```")
         lines.append("")
-        lines.append("Fix the issue and try again. Run check_node.sh before handing off.")
+        lines.append("Fix the issue and try again. Rerun the deterministic self-checks before handing off.")
 
     elif outcome == "REJECTED":
         lines.append(f"PREVIOUS CYCLE: REJECTED by verification model -- {detail}")
@@ -810,14 +955,21 @@ def build_worker_prompt(
         )
     else:
         sections.append("YOUR ROLE: **Worker** (proof_formalization phase). You are eliminating `sorry` from one node at a time. You do not decide which node to work on -- the reviewer assigns your node.\n")
-    goal_text = _read_file(config.goal_file)
-    if goal_text.strip():
-        sections.append(f"GOAL:\n{goal_text}\n")
+    if cleanup_mode:
+        sections.append("GOAL:\nPerform semantics-preserving polish on the already accepted tablet.\n")
+    else:
+        goal_text = _read_file(config.goal_file)
+        if goal_text.strip():
+            sections.append(f"GOAL:\n{goal_text}\n")
+    node_spec = _node_spec_text()
+    if node_spec.strip():
+        sections.append(node_spec)
 
     # Human feedback (persistent across cycles)
     hi = _human_input_section(state)
     if hi:
         sections.append(hi)
+    sections.append(_agent_feedback_note(config))
 
     # 2. Feedback from previous cycle
     feedback = _previous_cycle_feedback(state, previous_outcome)
@@ -834,6 +986,9 @@ def build_worker_prompt(
     paper_ref = _paper_reference_text(config)
     if paper_ref:
         sections.append(paper_ref)
+    main_result_targets = _main_result_targets_text(config, tablet)
+    if main_result_targets:
+        sections.append(main_result_targets)
     paper_focus = _paper_focus_excerpt_text(
         config,
         _theorem_stating_safe_paper_focus_ranges(state),
@@ -923,14 +1078,23 @@ def build_theorem_stating_prompt(
 
     # 1. Basic model + role
     sections.append(_load_template("basic_model.md"))
-    sections.append("YOUR ROLE: **Worker** (theorem_stating phase). You are creating the tablet structure -- declaring nodes with Lean statements and rigorous NL proofs. You are NOT proving theorems in Lean yet; `sorry` is expected.\n")
+    sections.append(
+        "YOUR ROLE: **Worker** (theorem_stating phase). You are building the target-support DAG: "
+        "creating proof-bearing statement nodes and definition nodes, with rigorous NL proofs "
+        "for the proof-bearing nodes. You are not expected to complete Lean proofs in this phase; "
+        "`sorry` is expected in proof-bearing declarations.\n"
+    )
     goal_text = _read_file(config.goal_file)
     if goal_text.strip():
         sections.append(f"GOAL:\n{goal_text}\n")
+    node_spec = _node_spec_text()
+    if node_spec.strip():
+        sections.append(node_spec)
 
     hi = _human_input_section(state)
     if hi:
         sections.append(hi)
+    sections.append(_agent_feedback_note(config))
 
     # 2. Paper content
     paper_ref = _paper_reference_text(config)
@@ -959,15 +1123,18 @@ def build_theorem_stating_prompt(
     )
     if rejections_text:
         sections.append(rejections_text)
-    orphan_resolutions = None
+    support_resolutions = None
     if state.last_review:
-        orphan_resolutions = state.last_review.get("orphan_resolutions", [])
-    orphan_text = _orphan_resolutions_text(
-        orphan_resolutions,
+        support_resolutions = state.last_review.get(
+            "support_resolutions",
+            state.last_review.get("orphan_resolutions", []),
+        )
+    support_text = _support_resolutions_text(
+        support_resolutions,
         include_completion_note=True,
     )
-    if orphan_text:
-        sections.append(orphan_text)
+    if support_text:
+        sections.append(support_text)
     target_text = _theorem_soundness_target_text(state)
     if target_text:
         sections.append(target_text)
@@ -1038,7 +1205,8 @@ def build_theorem_stating_reviewer_prompt(
     worker_handoff: Optional[Dict[str, Any]] = None,
     worker_output: str = "",
     nl_verification: Optional[List[Dict[str, Any]]] = None,
-    orphan_candidates: Optional[List[str]] = None,
+    main_result_issues: Optional[List[Dict[str, Any]]] = None,
+    unsupported_nodes: Optional[List[str]] = None,
     validation_summary: Optional[Dict[str, Any]] = None,
     available_reset_checkpoints: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
@@ -1051,15 +1219,22 @@ def build_theorem_stating_reviewer_prompt(
     goal_text = _read_file(config.goal_file)
     if goal_text.strip():
         sections.append(f"GOAL:\n{goal_text}\n")
+    node_spec = _node_spec_text()
+    if node_spec.strip():
+        sections.append(node_spec)
 
     hi = _human_input_section(state)
     if hi:
         sections.append(hi)
+    sections.append(_agent_feedback_note(config))
 
     # Paper
     paper_ref = _paper_reference_text(config)
     if paper_ref:
         sections.append(paper_ref)
+    main_result_targets = _main_result_targets_text(config, tablet)
+    if main_result_targets:
+        sections.append(main_result_targets)
 
     # Current tablet
     if tablet.nodes:
@@ -1183,15 +1358,24 @@ def build_theorem_stating_reviewer_prompt(
     if previous_rejections:
         sections.append(previous_rejections)
 
-    if orphan_candidates:
-        sections.append("--- CURRENT ORPHAN CANDIDATES ---")
+    if main_result_issues:
+        sections.append("--- CURRENT MAIN-RESULT TARGET ISSUES ---")
         sections.append(
-            "These nodes are not paper_main_result nodes and are not currently imported by any other node."
+            "These configured paper targets are still missing, or are only attached to helper nodes."
+        )
+        for entry in main_result_issues:
+            sections.append(f"- {entry.get('reason', '')}")
+        sections.append("")
+
+    if unsupported_nodes:
+        sections.append("--- CURRENT UNSUPPORTED NODES ---")
+        sections.append(
+            "These nodes are outside the dependency closure of the currently covered configured main-result targets."
         )
         sections.append(
-            "For each one, decide whether the node should be removed or whether the worker missed a real downstream dependency/citation."
+            "For each one, decide whether the node should be removed or whether the worker missed a real dependency chain showing that it supports a configured target."
         )
-        for name in orphan_candidates:
+        for name in unsupported_nodes:
             sections.append(f"- {name}")
         sections.append("")
 
@@ -1209,6 +1393,7 @@ def build_theorem_stating_reviewer_prompt(
     instructions = _load_template("theorem_stating_reviewer_instructions.md").format(
         skill_path=skill_path,
         phase="theorem_stating",
+        repo_path=config.repo_path,
         **_artifact_prompt_values(config, "reviewer_decision.json"),
     )
     sections.append(instructions)
@@ -1246,13 +1431,20 @@ def build_reviewer_prompt(
         )
     else:
         sections.append("YOUR ROLE: **Reviewer** (proof_formalization phase). You evaluate the worker's proof attempts, choose which node to assign next, and provide specific mathematical guidance. You are the final arbiter on NL verification disputes.\n")
-    goal_text = _read_file(config.goal_file)
-    if goal_text.strip():
-        sections.append(f"GOAL:\n{goal_text}\n")
+    if cleanup_mode:
+        sections.append("GOAL:\nDecide whether further semantics-preserving polish is worthwhile, or stop successfully.\n")
+    else:
+        goal_text = _read_file(config.goal_file)
+        if goal_text.strip():
+            sections.append(f"GOAL:\n{goal_text}\n")
+    node_spec = _node_spec_text()
+    if node_spec.strip():
+        sections.append(node_spec)
 
     hi = _human_input_section(state)
     if hi:
         sections.append(hi)
+    sections.append(_agent_feedback_note(config))
 
     # Paper
     paper_ref = _paper_reference_text(config)
@@ -1356,11 +1548,17 @@ def build_reviewer_prompt(
             sections.append(json.dumps(nl_verification, indent=2))
         sections.append("")
 
-    # Orphan nodes
-    from lagent_tablets.tablet import find_orphan_nodes
-    orphans = find_orphan_nodes(tablet, config.repo_path)
-    if orphans:
-        sections.append(f"WARNING: Orphan nodes (not imported by anything): {orphans}")
+    # Unsupported nodes
+    unsupported_nodes = find_unsupported_nodes(
+        tablet,
+        config.repo_path,
+        _configured_main_result_targets(config),
+    )
+    if unsupported_nodes:
+        sections.append(
+            "ADVISORY: Unsupported nodes exist outside the dependency closure of the configured main-result targets: "
+            f"{unsupported_nodes}. In proof_formalization this is not a separate decision field; mention it in your guidance only if it materially affects the active proof slice or indicates theorem-stating debt."
+        )
         sections.append("")
 
     # Recent review history
@@ -1379,6 +1577,7 @@ def build_reviewer_prompt(
     instructions = _load_template(reviewer_template).format(
         skill_path=skill_path,
         phase="proof_complete_style_cleanup" if cleanup_mode else "proof_formalization",
+        repo_path=config.repo_path,
         **_artifact_prompt_values(config, "reviewer_decision.json"),
     )
     sections.append(instructions)
@@ -1410,8 +1609,11 @@ def _node_check_list(
             lean_path = node_lean_path(config.repo_path, name)
             tex_content = _read_file(tex_path, "(no .tex file)")
             lean_content = _read_file(lean_path, "(no .lean file)")
-
-            sections.append(f"--- Node: {name} (kind: {node.kind}) ---")
+            env = _node_env(config.repo_path, name) or "unknown"
+            provenance_text = format_paper_provenance(node.paper_provenance) or "none"
+            sections.append(
+                f"--- Node: {name} (env: {env}, paper ref: {provenance_text}) ---"
+            )
             sections.append(f"NL content (.tex):\n{tex_content}")
             sections.append(f"Lean file:\n{lean_content}")
             sections.append("")
@@ -1462,7 +1664,28 @@ def build_correspondence_prompt(
     sections.append("YOUR ROLE: **Correspondence Verification Agent**. You check whether each node's Lean statement genuinely captures the same claim as its NL statement. You report your findings; the reviewer makes the final decision.\n")
     if human_input and human_input.strip():
         sections.append(f"--- HUMAN FEEDBACK ---\n{human_input}\n")
+    sections.append(_agent_feedback_note(config))
     sections.append(_load_template("correspondence_role.md"))
+    sections.append(
+        "For `theorem`, `lemma`, and `corollary` nodes, verify the cited paper provenance as well as Lean/NL correspondence. "
+        "Each such node should correspond to a paper statement in the indicated line range. "
+        "When the corresponding paper statement carries a TeX label, the node should cite that same label as well.\n"
+    )
+    sections.append(
+        "If a `definition` node includes structured paper provenance, verify that cited paper location as well. "
+        "The node should correspond to the indicated paper definition, and when that definition carries a TeX label, "
+        "the node should cite the same label.\n"
+    )
+    sections.append(
+        "A configured target paper item may be covered collectively by multiple non-`helper` nodes. "
+        "Do not reject a node just because it formalizes only one branch or clause of a cited target item, "
+        "provided the node matches a genuine part of that item and the covering nodes together fully capture it.\n"
+    )
+    sections.append(
+        "`helper` nodes do not need to cite a single paper statement, but they may optionally record a relevant paper location. "
+        "In all cases they must still be paper-faithful: their decomposition should reflect the paper's real argument rather "
+        "than introducing churn or unrelated reformulations.\n"
+    )
 
     # List nodes to check — agent reads files from disk
     if node_names:
@@ -1478,8 +1701,17 @@ def build_correspondence_prompt(
             if lean_path.exists():
                 imports = extract_tablet_imports(lean_path.read_text(encoding="utf-8"))
             imports_str = ", ".join(imports) if imports else "none"
-            sections.append(f"- **{name}** (kind: {node.kind}, difficulty: {node.difficulty}) — imports: {imports_str}")
+            env = _node_env(config.repo_path, name) or "unknown"
+            provenance_text = format_paper_provenance(node.paper_provenance) or "none"
+            sections.append(
+                f"- **{name}** (env: {env}, difficulty: {node.difficulty}, "
+                f"paper ref: {provenance_text}) — imports: {imports_str}"
+            )
         sections.append("")
+
+        provenance_excerpts = _paper_provenance_excerpt_text(config, tablet, node_names)
+        if provenance_excerpts:
+            sections.append(provenance_excerpts)
 
         if PREAMBLE_NAME in node_names:
             preamble_tex = _read_file(config.repo_path / "Tablet" / "Preamble.tex")
@@ -1578,16 +1810,17 @@ def build_nl_proof_prompt(
 ) -> str:
     """Build the NL proof soundness verification prompt.
 
-    Checks: does each node's NL proof rigorously follow from its
+    Checks: does each proof-bearing node's NL proof rigorously follow from its
     children's NL statements? This is a purely mathematical check
     with no Lean involved.
     """
     sections = []
 
     sections.append(_load_template("basic_model.md"))
-    sections.append("YOUR ROLE: **NL Proof Soundness Agent**. You check whether each node's natural-language proof rigorously establishes its result from its children's NL statements. This is a purely mathematical check -- no Lean code is involved. You report your findings; the reviewer makes the final decision.\n")
+    sections.append("YOUR ROLE: **NL Proof Soundness Agent**. You check whether each proof-bearing node's natural-language proof rigorously establishes its result from its children's NL statements. This is a purely mathematical check -- no Lean code is involved. You report your findings; the reviewer makes the final decision.\n")
     if human_input and human_input.strip():
         sections.append(f"--- HUMAN FEEDBACK ---\n{human_input}\n")
+    sections.append(_agent_feedback_note(config))
     sections.append(_load_template("nl_proof_role.md"))
 
     # For NL proof checking, only show .tex content (no Lean needed)
@@ -1599,7 +1832,11 @@ def build_nl_proof_prompt(
                 continue
             tex_path = node_tex_path(config.repo_path, name)
             tex_content = _read_file(tex_path, "(no .tex file)")
-            sections.append(f"--- Node: {name} (kind: {node.kind}) ---")
+            env = _node_env(config.repo_path, name) or "unknown"
+            provenance_text = format_paper_provenance(node.paper_provenance) or "none"
+            sections.append(
+                f"--- Node: {name} (env: {env}, paper ref: {provenance_text}) ---"
+            )
             sections.append(f"NL content (.tex):\n{tex_content}")
             sections.append("")
 
@@ -1662,6 +1899,7 @@ def build_node_soundness_prompt(
     )
     if human_input and human_input.strip():
         sections.append(f"--- HUMAN FEEDBACK ---\n{human_input}\n")
+    sections.append(_agent_feedback_note(config))
     sections.append(_load_template("nl_proof_single_node_role.md"))
 
     node = tablet.nodes.get(node_name)
@@ -1671,7 +1909,11 @@ def build_node_soundness_prompt(
 
     # The node being checked
     tex_content = _read_file(node_tex_path(config.repo_path, node_name), "(no .tex file)")
-    sections.append(f"=== NODE TO CHECK: {node_name} (kind: {node.kind}) ===\n")
+    env = _node_env(config.repo_path, node_name) or "unknown"
+    provenance_text = format_paper_provenance(node.paper_provenance) or "none"
+    sections.append(
+        f"=== NODE TO CHECK: {node_name} (env: {env}, paper ref: {provenance_text}) ===\n"
+    )
     sections.append(f"NL content (.tex):\n{tex_content}\n")
 
     # Its children (the NL statements it may cite)
@@ -1719,7 +1961,8 @@ Evaluate this node's NL proof. Write your assessment as JSON to `{artifact_value
     "explanation": "detailed assessment"
   }},
   "overall": "APPROVE" or "REJECT",
-  "summary": "brief assessment"
+  "summary": "brief assessment",
+  "feedback": "optional short note if the task/setup seems impossible, inconsistent, or poorly supported"
 }}
 
 Verdicts:

@@ -34,8 +34,9 @@ You MUST iterate until the checker reports all deterministic node checks pass be
 WHEN DONE -- write the raw handoff JSON to `{raw_output_path}`:
 {{
   "summary": "brief description of what you did",
-  "status": "NOT_STUCK | STUCK | DONE",
-  "new_nodes": []
+  "status": "NOT_STUCK | STUCK | DONE | NEED_INPUT",
+  "new_nodes": [],
+  "feedback": "optional short note if the task/setup seems impossible, inconsistent, or poorly supported"
 }}
 Then run:
   python3 {check_script} worker-handoff {raw_output_path} --phase proof_formalization --repo {repo_path}

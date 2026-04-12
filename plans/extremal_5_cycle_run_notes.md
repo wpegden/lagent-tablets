@@ -57,3 +57,32 @@
   - all relevant runtime permission repair call sites now include package builds
   - regressions added in `tests/test_cycle.py` and `tests/test_cli.py`
 - this start does not count as a clean validation cycle run because the supervisor hit a structural post-worker permission bug before correspondence
+
+### Current clean validation run: cycle 1 still in healthy worker repair
+
+- fresh setup completed cleanly from `scripts/setup_repo.sh --reset`
+- supervisor started normally and is still in `theorem_stating` cycle 1
+- isolation is holding:
+  - worker reads project-local runtime prompts/skills under `.agent-supervisor/runtime`
+  - no sibling project reads observed
+  - no source checkout reads observed
+- the worker created a first broad theorem-stating slice of paired node files and is iterating locally
+- the worker initially misdiagnosed two bad import paths as missing Mathlib artifacts:
+  - `Mathlib.Algebra.BigOperators.Basic`
+  - `Mathlib.Order.CompleteLattice`
+- host inspection showed those module paths do not exist in this mathlib version; this was content error, not sandbox failure
+- after correcting imports, the worker got foundational modules building again:
+  - `Tablet.Preamble`
+  - `Tablet.down_sets`
+  - `Tablet.vector_weight`
+  - `Tablet.matrix_model`
+  - `Tablet.affine_rank`
+  - `Tablet.list_vectors`
+  - `Tablet.extremal_numbers`
+- the worker is still in its local repair loop after `check.py tablet` and has not yet handed off
+- no structural issue has appeared in this run so far:
+  - no supervisor crash
+  - no permission regression
+  - no sandbox leak
+  - no staging/checkpoint bug
+- this run remains active and is being allowed to continue because the remaining failures are ordinary theorem-stating content issues

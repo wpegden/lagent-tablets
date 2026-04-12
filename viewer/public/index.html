@@ -455,10 +455,12 @@ function renderDAG() {
 
     // Label: title or name, truncated
     const theoremLike = ['theorem', 'corollary', 'proposition'].includes(node.texEnv);
+    const helperLike = node.texEnv === 'helper';
     const definitionLike = node.texEnv === 'definition' || (node.leanContent || '').match(/^(noncomputable\s+)?def\s/m);
     const kindPrefix = node.kind === 'preamble' ? '' :
       definitionLike ? 'D: ' :
-      (node.kind === 'paper_main_result' || theoremLike) ? 'T: ' : 'L: ';
+      helperLike ? 'H: ' :
+      theoremLike ? 'T: ' : 'L: ';
     const label = (kindPrefix + (node.title || name)).substring(0, 26);
     const text = document.createElementNS(ns, 'text');
     text.setAttribute('x', 90); text.setAttribute('y', diff ? 28 : 24);

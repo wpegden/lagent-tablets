@@ -19,9 +19,9 @@ A DAG of **nodes**, each a `.lean` + `.tex` pair in `Tablet/`. Children of node 
 
 **Invariants** (enforced by verification agents):
 - Every node has a Lean statement and a corresponding NL statement (.tex)
-- Every theorem/lemma node has either a complete Lean proof (no sorry) OR a rigorous NL proof in its .tex from the NL statements of its children
+- Every proof-bearing node (`helper`, `lemma`, `theorem`, `corollary`) has either a complete Lean proof (no sorry) OR a rigorous NL proof in its .tex from the NL statements of its children
 - `Preamble.lean` contains only imports, no definitions
-- All definitions must be concrete (no sorry, opaque, axiom)
+- Definitions must have actual bodies (no sorry, opaque, axiom placeholders)
 
 ### Node Difficulty: Easy vs Hard
 Each node is classified as **easy** or **hard**:

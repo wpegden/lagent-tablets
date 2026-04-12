@@ -20,8 +20,8 @@ The system runs in cycles:
 
 ### Nodes
 Each node in `Tablet/` has:
-- `{name}.lean` — Lean 4 declaration (theorem, lemma, or definition)
-- `{name}.tex` — Natural language statement + rigorous NL proof
+- `{name}.lean` — Lean 4 declaration (a proof-bearing theorem-like declaration or a definition)
+- `{name}.tex` — Natural language statement, and for proof-bearing nodes a rigorous NL proof
 
 ### Imports = DAG edges
 If `A.lean` has `import Tablet.B`, then A depends on B. B's NL statement can be cited in A's NL proof.
@@ -29,11 +29,11 @@ If `A.lean` has `import Tablet.B`, then A depends on B. B's NL statement can be 
 ### Invariants (enforced by verification)
 - Every node has both a Lean statement and an NL statement
 - Lean and NL statements must correspond (checked by correspondence agents)
-- Every theorem/lemma has either:
+- Every proof-bearing node (`helper`, `lemma`, `theorem`, `corollary`) has either:
   - A complete Lean proof (no `sorry`), OR
   - A rigorous NL proof from its children's NL statements (checked by soundness agents)
 - `Preamble.lean` contains ONLY imports — no definitions
-- All definitions must be concrete (no `sorry`, `opaque`, `axiom`)
+- Definitions must have actual bodies (no `sorry`, `opaque`, `axiom` placeholders)
 - No bare `import Mathlib` — only specific submodule imports
 - Project definitions should not duplicate Mathlib concepts
 
@@ -180,7 +180,7 @@ Cycle N:
     - If theorem_stating is holding on a current soundness target in `repair` mode, only `Tablet/{target}.tex` is writable
     - If correspondence/paper-faithfulness blockers are open, there is no active soundness target for that cycle; the worker is addressing the correspondence frontier instead
      - Broader paper-faithful DAG changes require reviewer-authorized `restructure` mode
-  2. Register new nodes in tablet, apply difficulty hints and explicit theorem-stating kind hints (`paper_main_result` vs `paper_intermediate`)
+  2. Register new nodes in tablet, apply difficulty hints, and record structured paper provenance for paper-anchored `theorem`/`lemma`/`corollary` nodes
   3. Correspondence + Faithfulness check (3 agents, gate)
      - If REJECT → skip soundness, go to reviewer
      - If APPROVE → proceed to soundness

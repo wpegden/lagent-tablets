@@ -60,6 +60,8 @@ class WorkflowConfig:
     forbidden_keyword_allowlist: List[str]
     human_input_path: Path
     input_request_path: Path
+    main_result_targets: List[Dict[str, Any]] = field(default_factory=list)
+    main_result_labels: List[str] = field(default_factory=list)
     phase_overrides: Dict[str, PhaseOverride] = field(default_factory=dict)
 
 
@@ -425,6 +427,27 @@ def load_config(path: Path) -> Config:
         paper_tex_path: Optional[Path] = (repo_path / paper_tex).resolve()
     else:
         paper_tex_path = None
+    main_result_targets_raw = wf_raw.get("main_result_targets", [])
+    main_result_labels_raw = wf_raw.get("main_result_labels", [])
+    if main_result_targets_raw not in (None, []) and not isinstance(main_result_targets_raw, list):
+        raise ConfigError("config.workflow.main_result_targets must be a list")
+    if main_result_labels_raw not in (None, []) and not isinstance(main_result_labels_raw, list):
+        raise ConfigError("config.workflow.main_result_labels must be a list of strings")
+    from lagent_tablets.tablet import resolve_main_result_targets
+
+    main_result_targets = resolve_main_result_targets(
+        paper_path=paper_tex_path,
+        raw_targets=main_result_targets_raw,
+        raw_labels=main_result_labels_raw,
+    )
+    main_result_labels: List[str] = []
+    seen_main_result_labels: Set[str] = set()
+    for target in main_result_targets:
+        label = str(target.get("tex_label", "") or "").strip()
+        if not label or label in seen_main_result_labels:
+            continue
+        seen_main_result_labels.add(label)
+        main_result_labels.append(label)
     # Phase overrides
     phase_overrides_raw = wf_raw.get("phase_overrides", {})
     phase_overrides: Dict[str, PhaseOverride] = {}
@@ -443,6 +466,8 @@ def load_config(path: Path) -> Config:
         forbidden_keyword_allowlist=list(wf_raw.get("forbidden_keyword_allowlist", [])),
         human_input_path=(repo_path / str(wf_raw.get("human_input_path", "HUMAN_INPUT.md"))).resolve(),
         input_request_path=(repo_path / str(wf_raw.get("input_request_path", "INPUT_REQUEST.md"))).resolve(),
+        main_result_targets=main_result_targets,
+        main_result_labels=main_result_labels,
         phase_overrides=phase_overrides,
     )
 

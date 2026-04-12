@@ -47,3 +47,74 @@ Track every source change made during the bwrap isolation effort.
   - `lagent_tablets/cli.py`
   - `tests/test_cycle.py`
   - `tests/test_cli.py`
+- Added the node environment / provenance redesign plan:
+  - `plans/node_env_provenance_redesign_plan.md`
+- Replaced theorem-stating `paper_main_result` / `paper_intermediate` hinting with structured paper provenance:
+  - `lagent_tablets/state.py`
+  - `lagent_tablets/check.py`
+  - `lagent_tablets/cycle.py`
+  - `lagent_tablets/cli.py`
+- Added ordinary-node `helper` environment and env-driven orphan protection:
+  - `lagent_tablets/tablet.py`
+  - `lagent_tablets/viewer_state.py`
+  - `viewer/public/index.html`
+- Added shared node-spec guidance and propagated it into theorem/proof worker and reviewer prompts:
+  - `prompts/node_spec.md`
+  - `lagent_tablets/prompts.py`
+  - `prompts/theorem_stating_instructions.md`
+  - `prompts/theorem_stating_target_restructure_instructions.md`
+  - `prompts/theorem_stating_reviewer_instructions.md`
+  - `prompts/worker_instructions.md`
+  - `prompts/reviewer_instructions.md`
+  - `prompts/cleanup_reviewer_instructions.md`
+  - `skills/THEOREM_STATING_WORKER.md`
+  - `skills/PROOF_FORMALIZATION_WORKER.md`
+- Added paper-provenance-aware reviewer/worker artifact validation and paper-label checks:
+  - `lagent_tablets/check.py`
+  - `lagent_tablets/prompts.py`
+- Updated tests for the env/provenance model:
+  - `tests/test_state.py`
+  - `tests/test_tablet.py`
+  - `tests/test_check.py`
+  - `tests/test_cli.py`
+  - `tests/test_cycle.py`
+- Allowed optional paper provenance on `helper` nodes and aligned ordinary-node summaries with the new semantics:
+  - `lagent_tablets/check.py`
+  - `lagent_tablets/tablet.py`
+  - `lagent_tablets/prompts.py`
+  - `prompts/node_spec.md`
+- Relaxed proof-formalization so new paper-anchored theorem/lemma/corollary nodes are unusual but permitted when they satisfy the full node spec and do not violate coarse-package protections:
+  - `lagent_tablets/check.py`
+  - `lagent_tablets/cycle.py`
+  - `prompts/worker_instructions.md`
+  - `prompts/worker_restructure_instructions.md`
+  - `prompts/worker_coarse_restructure_instructions.md`
+  - `prompts/reviewer_instructions.md`
+  - `skills/PROOF_FORMALIZATION_WORKER.md`
+  - `skills/PROOF_FORMALIZATION_REVIEWER.md`
+- Added focused regression coverage for helper provenance, proof-phase paper-statement creation, and non-coarse registration under the coarse-package guard:
+  - `tests/test_check.py`
+  - `tests/test_cycle.py`
+  - `tests/test_prompts.py`
+- Replaced the recent env-based human gate and env-based orphan protection with configured main-result targets plus support-closure semantics:
+  - `lagent_tablets/config.py`
+  - `scripts/setup_repo.sh`
+  - `lagent_tablets/tablet.py`
+  - `lagent_tablets/state.py`
+  - `lagent_tablets/cli.py`
+  - `lagent_tablets/cycle.py`
+  - `lagent_tablets/prompts.py`
+  - `lagent_tablets/check.py`
+  - `lagent_tablets/history_replay.py`
+  - `prompts/node_spec.md`
+  - `prompts/theorem_stating_instructions.md`
+  - `prompts/theorem_stating_reviewer_instructions.md`
+  - `prompts/reviewer_instructions.md`
+  - `prompts/worker_instructions.md`
+  - `plans/main_result_label_targets_plan.md`
+- Updated the regression suite to pin target-label coverage, helper exclusion, support-closure pruning, and label-keyed human review:
+  - `tests/test_state.py`
+  - `tests/test_tablet.py`
+  - `tests/test_cli.py`
+  - `tests/test_prompts.py`
+  - `tests/test_cycle.py`

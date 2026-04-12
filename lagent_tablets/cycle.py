@@ -41,11 +41,12 @@ from lagent_tablets.state import (
     SupervisorState,
     TabletNode,
     TabletState,
+    append_jsonl,
     load_json,
     load_state,
     load_tablet,
     normalize_open_blockers,
-    normalize_orphan_resolutions,
+    normalize_support_resolutions,
     save_json,
     save_state,
     save_tablet,
@@ -53,6 +54,7 @@ from lagent_tablets.state import (
     tablet_path,
     timestamp_now,
 )
+from lagent_tablets.project_paths import project_feedback_log_path
 from lagent_tablets.tablet import (
     PREAMBLE_NAME,
     coarse_node_names,
@@ -61,13 +63,16 @@ from lagent_tablets.tablet import (
     declaration_hash,
     extract_imports,
     extract_tablet_imports,
-    find_orphan_nodes,
+    format_main_result_target,
+    find_unsupported_nodes,
+    main_result_target_issues,
     has_sorry,
     is_valid_node_name,
     find_name_conflicts,
     mark_node_closed,
     mark_node_open,
     node_lean_path,
+    node_statement_environment,
     node_tex_path,
     regenerate_support_files,
     register_new_node,
@@ -111,6 +116,27 @@ from lagent_tablets.viewer_state import (
     write_live_viewer_state,
 )
 from lagent_tablets.git_ops import list_valid_reset_checkpoints, reset_to_checkpoint_ref
+
+
+def _configured_main_result_targets(config: Config) -> List[Dict[str, Any]]:
+    workflow = getattr(config, "workflow", None)
+    raw = getattr(workflow, "main_result_targets", None) if workflow is not None else None
+    if raw in (None, []):
+        raw = getattr(workflow, "main_result_labels", []) if workflow is not None else []
+    if not isinstance(raw, list):
+        return []
+    from lagent_tablets.tablet import main_result_target_key, normalize_main_result_target
+
+    targets: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for raw_target in raw:
+        target = normalize_main_result_target(raw_target)
+        key = main_result_target_key(target)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        targets.append(target)
+    return targets
 
 
 def _accumulate_usage(state: SupervisorState, role: str, usage: Optional[Dict[str, Any]]) -> None:
@@ -717,16 +743,12 @@ def _prepare_theorem_stating_worker_state(
         return notes
 
     state.theorem_correspondence_blocked = False
-    soundness_candidates = _eligible_soundness_nodes(config, tablet)
-    soundness_candidates = nl_cache.filter_uncached(config.repo_path, soundness_candidates, "soundness")
-    active_soundness_agents = _effective_soundness_agents(config, policy)
-    state.theorem_soundness_target = _select_theorem_soundness_target(
+    state.theorem_soundness_target = _pending_theorem_soundness_target(
         config,
+        policy,
         tablet,
-        soundness_candidates,
-        soundness_agents=active_soundness_agents,
-        disagree_bias=policy.verification.soundness_disagree_bias,
-        preferred=state.theorem_soundness_target,
+        state,
+        nl_cache=nl_cache,
     )
     if not state.theorem_soundness_target or state.theorem_soundness_target != previous_soundness_target:
         state.theorem_target_edit_mode = "repair"
@@ -787,74 +809,142 @@ def _enforce_theorem_stating_open_rejections(
         )
 
 
-def _summarize_orphan_candidates(orphan_candidates: List[str], *, limit: int = 3) -> str:
-    """Short summary of current theorem-stating orphan-node candidates."""
-    if not orphan_candidates:
+def _summarize_main_result_issues(main_result_issues: List[Dict[str, Any]], *, limit: int = 3) -> str:
+    """Short summary of current configured target-coverage issues."""
+    if not main_result_issues:
         return ""
-    parts = orphan_candidates[:limit]
-    if len(orphan_candidates) > limit:
-        parts.append(f"+{len(orphan_candidates) - limit} more")
+    parts = []
+    for entry in main_result_issues[:limit]:
+        label = format_main_result_target(entry.get("target", {}))
+        kind = str(entry.get("kind", "issue"))
+        parts.append(f"{label} ({kind})")
+    if len(main_result_issues) > limit:
+        parts.append(f"+{len(main_result_issues) - limit} more")
     return ", ".join(parts)
 
 
-def _default_orphan_next_prompt(
-    orphan_resolutions: List[Dict[str, Any]],
-    unresolved_candidates: List[str],
+def _default_main_result_targets_next_prompt(
+    main_result_issues: List[Dict[str, Any]],
 ) -> str:
-    """Fallback worker guidance for current orphan-node candidates."""
+    """Fallback worker guidance for current configured target-coverage issues."""
     lines = [
-        "Resolve the current orphan-node candidates before treating the tablet structure as complete.",
+        "Resolve the configured main-result target coverage issues before treating the tablet structure as complete.",
     ]
-    for entry in orphan_resolutions:
+    for entry in main_result_issues:
+        target_text = format_main_result_target(entry.get("target", {}))
+        kind = str(entry.get("kind", "")).strip()
+        nodes = [str(name) for name in entry.get("nodes", []) if str(name).strip()]
+        if kind == "missing":
+            lines.append(
+                f"- Add one or more non-helper nodes that cover configured main-result target `{target_text}`."
+            )
+        elif kind == "helper_forbidden":
+            if nodes:
+                lines.append(
+                    f"- Reclassify or replace helper node(s) {', '.join(f'`{name}`' for name in nodes)} so target `{target_text}` is covered by non-helper node(s)."
+                )
+            else:
+                lines.append(
+                    f"- Remove helper-only coverage for configured main-result target `{target_text}` and cover it with non-helper node(s)."
+                )
+    return "\n".join(lines)
+
+
+def _enforce_theorem_stating_main_result_targets(
+    decision: Dict[str, Any],
+    main_result_issues: List[Dict[str, Any]],
+) -> None:
+    """Block theorem-stating phase advance while target-label issues remain."""
+    decision["main_result_issues"] = main_result_issues
+    if main_result_issues and not str(decision.get("next_prompt", "")).strip():
+        decision["next_prompt"] = _default_main_result_targets_next_prompt(main_result_issues)
+    if decision.get("decision") == "ADVANCE_PHASE" and main_result_issues:
+        summary = _summarize_main_result_issues(main_result_issues)
+        decision["decision"] = "CONTINUE"
+        decision["reason"] = (
+            "Configured main-result targets are still incomplete"
+            + (f": {summary}" if summary else ".")
+        )
+
+
+def _summarize_unsupported_nodes(unsupported_nodes: List[str], *, limit: int = 3) -> str:
+    """Short summary of unsupported theorem-stating nodes."""
+    if not unsupported_nodes:
+        return ""
+    parts = unsupported_nodes[:limit]
+    if len(unsupported_nodes) > limit:
+        parts.append(f"+{len(unsupported_nodes) - limit} more")
+    return ", ".join(parts)
+
+
+def _default_support_next_prompt(
+    support_resolutions: List[Dict[str, Any]],
+    unresolved_nodes: List[str],
+) -> str:
+    """Fallback worker guidance for nodes outside the configured target support DAG."""
+    lines = [
+        "Trim the tablet back to the support DAG for the configured main-result targets.",
+    ]
+    for entry in support_resolutions:
         node = entry["node"]
         if entry["action"] == "remove":
             lines.append(
-                f"- Remove orphan node `{node}` unless you add a real downstream dependency and citation that justifies keeping it."
+                f"- Remove unsupported node `{node}` unless you add a real dependency chain showing that it supports at least one configured main-result target."
             )
         else:
             parents = entry.get("suggested_parents", [])
             if parents:
                 lines.append(
-                    f"- Keep orphan node `{node}` only by adding a real downstream dependency/citation from: {', '.join(parents)}."
+                    f"- Keep unsupported node `{node}` only by connecting it into the target-support DAG through: {', '.join(parents)}."
                 )
             else:
                 lines.append(
-                    f"- Keep orphan node `{node}` only if you add the missing real downstream dependency/citation showing where it is needed."
+                    f"- Keep unsupported node `{node}` only if you add the missing real dependency chain showing which configured target it supports."
                 )
-    for node in unresolved_candidates:
+    for node in unresolved_nodes:
         lines.append(
-            f"- Reviewer must decide whether orphan node `{node}` should be removed or kept via a missing downstream dependency/citation."
+            f"- Reviewer must decide whether unsupported node `{node}` should be removed or connected into the target-support DAG."
         )
     return "\n".join(lines)
+
+
+def _enforce_theorem_stating_support_closure(
+    decision: Dict[str, Any],
+    unsupported_nodes: List[str],
+) -> None:
+    """Persist reviewer arbitration for unsupported nodes and block phase advance."""
+    unsupported_nodes = sorted(dict.fromkeys(unsupported_nodes))
+    raw_resolutions = decision.get("support_resolutions", decision.get("orphan_resolutions", []))
+    resolutions = normalize_support_resolutions(
+        raw_resolutions,
+        allowed_nodes=set(unsupported_nodes),
+    )
+    decision["support_resolutions"] = resolutions
+    decision["orphan_resolutions"] = list(resolutions)
+
+    if not unsupported_nodes:
+        return
+
+    resolved_nodes = {entry["node"] for entry in resolutions}
+    unresolved = [name for name in unsupported_nodes if name not in resolved_nodes]
+    if not str(decision.get("next_prompt", "")).strip():
+        decision["next_prompt"] = _default_support_next_prompt(resolutions, unresolved)
+
+    if decision.get("decision") == "ADVANCE_PHASE":
+        summary = _summarize_unsupported_nodes(unsupported_nodes)
+        decision["decision"] = "CONTINUE"
+        decision["reason"] = (
+            "Unsupported nodes remain outside the configured target-support DAG"
+            + (f": {summary}" if summary else ".")
+        )
 
 
 def _enforce_theorem_stating_orphan_candidates(
     decision: Dict[str, Any],
     orphan_candidates: List[str],
 ) -> None:
-    """Persist reviewer arbitration for orphan candidates and block phase advance."""
-    orphan_candidates = sorted(dict.fromkeys(orphan_candidates))
-    resolutions = normalize_orphan_resolutions(
-        decision.get("orphan_resolutions", []),
-        allowed_nodes=set(orphan_candidates),
-    )
-    decision["orphan_resolutions"] = resolutions
-
-    if not orphan_candidates:
-        return
-
-    resolved_nodes = {entry["node"] for entry in resolutions}
-    unresolved = [name for name in orphan_candidates if name not in resolved_nodes]
-    if not str(decision.get("next_prompt", "")).strip():
-        decision["next_prompt"] = _default_orphan_next_prompt(resolutions, unresolved)
-
-    if decision.get("decision") == "ADVANCE_PHASE":
-        summary = _summarize_orphan_candidates(orphan_candidates)
-        decision["decision"] = "CONTINUE"
-        decision["reason"] = (
-            "Orphan node candidates remain"
-            + (f": {summary}" if summary else ".")
-        )
+    """Backward-compatible alias for older callers/tests."""
+    _enforce_theorem_stating_support_closure(decision, orphan_candidates)
 
 
 def _artifact_paths(config: Config, canonical_name: str) -> Dict[str, Path]:
@@ -883,6 +973,7 @@ def _save_live_viewer_state(
         activity=activity,
         in_flight_cycle=in_flight_cycle if in_flight_cycle is not None else state.cycle,
         source=source,
+        fast=True,
     )
 
 
@@ -916,6 +1007,43 @@ def _clear_artifact_files(config: Config, canonical_name: str) -> Dict[str, Path
     return paths
 
 
+def _record_agent_feedback(
+    config: Config,
+    *,
+    cycle: int,
+    phase: str,
+    role: str,
+    artifact: str,
+    feedback: str,
+) -> None:
+    text = str(feedback or "").strip()
+    if not text:
+        return
+    append_jsonl(
+        project_feedback_log_path(config.state_dir),
+        {
+            "timestamp": timestamp_now(),
+            "cycle": cycle,
+            "phase": phase,
+            "role": role,
+            "artifact": artifact,
+            "feedback": text,
+        },
+        mode=0o600,
+    )
+
+
+def _shared_surface_error_detail(errors: Sequence[str]) -> str:
+    if not errors:
+        return "Supervisor-readable surfaces are invalid."
+    shown = [str(err).strip() for err in errors if str(err).strip()]
+    if not shown:
+        return "Supervisor-readable surfaces are invalid."
+    if len(shown) > 3:
+        return "Supervisor-readable surfaces are invalid: " + "; ".join(shown[:3]) + "; ..."
+    return "Supervisor-readable surfaces are invalid: " + "; ".join(shown)
+
+
 def _accept_validated_artifact(
     config: Config,
     canonical_name: str,
@@ -926,6 +1054,19 @@ def _accept_validated_artifact(
     repo_for_validation: Optional[Path] = None,
     invalid_attempt: bool = False,
 ) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    from lagent_tablets.health import prepare_supervisor_read_surfaces
+
+    surface_errors = prepare_supervisor_read_surfaces(
+        config.repo_path,
+        config.state_dir,
+        burst_user=getattr(config.tmux, "burst_user", None),
+        include_tablet=False,
+        include_staging=True,
+        include_package_builds=False,
+    )
+    if surface_errors:
+        return None, _shared_surface_error_detail(surface_errors)
+
     paths = _artifact_paths(config, canonical_name)
     validation = validate_json_artifact(
         kind,
@@ -939,6 +1080,7 @@ def _accept_validated_artifact(
         return None, "; ".join(validation["errors"])
     data = validation["data"]
     assert isinstance(data, dict)
+    feedback_text = str(data.pop("feedback", "") or "")
     if kind == "soundness-result" and node_name:
         try:
             from lagent_tablets.nl_cache import NLCache
@@ -952,6 +1094,15 @@ def _accept_validated_artifact(
             meta["soundness_fingerprint"] = fp
             data["_supervisor_meta"] = meta
     save_json(paths["canonical"], data)
+    current_state = load_state(state_path(config.state_dir))
+    _record_agent_feedback(
+        config,
+        cycle=int(getattr(current_state, "cycle", 0) or 0),
+        phase=str(phase or getattr(current_state, "phase", "") or ""),
+        role=artifact_stem(canonical_name),
+        artifact=canonical_name,
+        feedback=feedback_text,
+    )
     return data, None
 
 
@@ -1119,19 +1270,10 @@ def _setup_theorem_stating_permissions(
             pass
 
 
-def _theorem_stating_node_kind(
-    name: str,
-    kind_hints: Dict[str, str],
-) -> str:
-    """Return the structural role for a theorem-stating node.
-
-    New theorem-stating nodes default to paper_intermediate unless the worker
-    explicitly classifies them as a paper_main_result.
-    """
-    kind = str(kind_hints.get(name, "paper_intermediate") or "paper_intermediate").strip()
-    if kind in {"paper_main_result", "paper_intermediate"}:
-        return kind
-    return "paper_intermediate"
+def _theorem_stating_node_kind(name: str) -> str:
+    """Return the stored kind for theorem-stating-created ordinary nodes."""
+    _ = name
+    return "ordinary"
 
 
 def validate_worker_cycle_v2(
@@ -1882,6 +2024,32 @@ def _select_theorem_soundness_target(
         ) != "APPROVE":
             return name
     return ""
+
+
+def _pending_theorem_soundness_target(
+    config: Config,
+    policy: Policy,
+    tablet: TabletState,
+    state: SupervisorState,
+    *,
+    nl_cache: Any,
+) -> str:
+    """Return the current unresolved theorem-stating soundness target, if any."""
+    soundness_candidates = _eligible_soundness_nodes(config, tablet)
+    soundness_candidates = nl_cache.filter_uncached(
+        config.repo_path,
+        soundness_candidates,
+        "soundness",
+    )
+    active_soundness_agents = _effective_soundness_agents(config, policy)
+    return _select_theorem_soundness_target(
+        config,
+        tablet,
+        soundness_candidates,
+        soundness_agents=active_soundness_agents,
+        disagree_bias=policy.verification.soundness_disagree_bias,
+        preferred=state.theorem_soundness_target,
+    )
 
 
 def _run_per_node_soundness(
@@ -3254,6 +3422,94 @@ def _run_nl_verification(
     return results
 
 
+def _run_theorem_stating_verification(
+    config: Config,
+    policy: Policy,
+    tablet: TabletState,
+    state: SupervisorState,
+    *,
+    cycle: int,
+    log_dir: Path,
+    nl_cache: Any,
+    human_input: str = "",
+) -> List[Dict[str, Any]]:
+    """Run theorem-stating verification in the intended semantic order.
+
+    Theorem-stating always does correspondence first. If and only if the
+    correspondence gate clears, select the current soundness target and run
+    soundness on that one node before building the reviewer prompt.
+    """
+    repo = config.repo_path
+    all_check_nodes = [n for n in tablet.nodes if tablet.nodes[n].kind != "preamble"]
+    forced_corr_nodes = _theorem_stating_persisted_correspondence_nodes(tablet, state)
+    corr_check_nodes = _theorem_stating_correspondence_frontier(
+        tablet,
+        repo,
+        forced_nodes=forced_corr_nodes,
+    )
+    persisted_corr_blocked = _theorem_stating_has_correspondence_blockers(state)
+    print(f"  Running NL verification for {len(all_check_nodes)} nodes...")
+    if state.theorem_soundness_target:
+        print(f"  Current theorem-stating soundness target: {state.theorem_soundness_target}")
+    print(f"  Statement-level correspondence frontier: {len(corr_check_nodes)} nodes")
+
+    correspondence_state = _suspend_theorem_soundness_target(state) if corr_check_nodes else state
+    results = _run_nl_verification(
+        config,
+        policy,
+        tablet,
+        all_check_nodes,
+        state=correspondence_state,
+        cycle=cycle,
+        correspondence_node_names=corr_check_nodes,
+        soundness_node_names=[],
+        log_dir=log_dir,
+        nl_cache=nl_cache,
+        human_input=human_input,
+        persisted_correspondence_blocked=persisted_corr_blocked,
+        force_correspondence_node_names=forced_corr_nodes,
+    )
+    if _correspondence_gate_open(results):
+        return results
+
+    prior_target = state.theorem_soundness_target
+    selected_target = _pending_theorem_soundness_target(
+        config,
+        policy,
+        tablet,
+        state,
+        nl_cache=nl_cache,
+    )
+    if not selected_target:
+        state.theorem_correspondence_blocked = False
+        state.theorem_soundness_target = ""
+        state.theorem_target_edit_mode = "repair"
+        return results
+
+    state.theorem_correspondence_blocked = False
+    state.theorem_soundness_target = selected_target
+    if selected_target != prior_target:
+        state.theorem_target_edit_mode = "repair"
+    print(f"  Selected theorem-stating soundness target: {selected_target}")
+
+    soundness_results = _run_nl_verification(
+        config,
+        policy,
+        tablet,
+        [selected_target],
+        state=state,
+        cycle=cycle,
+        correspondence_node_names=[],
+        soundness_node_names=[selected_target],
+        log_dir=log_dir,
+        nl_cache=nl_cache,
+        human_input=human_input,
+        soundness_target_node=selected_target,
+    )
+    results.extend(soundness_results)
+    return results
+
+
 def run_theorem_stating_cycle(
     config: Config,
     state: SupervisorState,
@@ -3268,7 +3524,7 @@ def run_theorem_stating_cycle(
     The reviewer checks whether the tablet is ready for proof_formalization.
     """
     from lagent_tablets.prompts import build_theorem_stating_prompt, build_theorem_stating_reviewer_prompt
-    from lagent_tablets.health import fix_lake_permissions
+    from lagent_tablets.health import prepare_supervisor_read_surfaces
     from lagent_tablets.nl_cache import NLCache
 
     resume_from = state.resume_from or ""
@@ -3288,6 +3544,67 @@ def run_theorem_stating_cycle(
     cycle_start = time.monotonic()
     log_dir = config.state_dir / "logs" / f"cycle-{cycle:04d}"
     worker_handoff: Optional[Dict[str, Any]] = None
+
+    def _register_theorem_attempt_nodes(
+        new_nodes: Sequence[str],
+        *,
+        difficulty_hints: Optional[Dict[str, str]] = None,
+        paper_provenance_hints: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> None:
+        difficulty_hints = difficulty_hints or {}
+        paper_provenance_hints = paper_provenance_hints or {}
+        for name in new_nodes:
+            lean_path = node_lean_path(repo, name)
+            if not lean_path.exists() or name in tablet.nodes:
+                continue
+            register_new_node(
+                tablet,
+                repo,
+                name=name,
+                kind=_theorem_stating_node_kind(name),
+                paper_provenance=paper_provenance_hints.get(name, {}),
+                cycle=cycle,
+            )
+            if name in difficulty_hints:
+                tablet.nodes[name].difficulty = difficulty_hints[name]
+
+        if PREAMBLE_NAME not in tablet.nodes:
+            preamble_path = repo / "Tablet" / "Preamble.lean"
+            if preamble_path.exists():
+                tablet.nodes[PREAMBLE_NAME] = TabletNode(
+                    name=PREAMBLE_NAME,
+                    kind="preamble",
+                    status="closed",
+                    title="Imports",
+                    closed_at_cycle=cycle,
+                )
+
+    def _theorem_invalid(
+        detail: str,
+        *,
+        build_output: str = "",
+        skip_viewer_state: bool = False,
+    ) -> CycleOutcome:
+        state.resume_from = ""
+        _record_theorem_invalid_attempt(state, cycle=cycle, attempt=attempt, detail=detail)
+        _save_runtime_tablet(config, tablet, cycle=cycle)
+        save_state(state_path(config), state)
+        if not skip_viewer_state:
+            _save_live_viewer_state(config, tablet, state, source="invalid", in_flight_cycle=cycle)
+        return CycleOutcome(outcome="INVALID", detail=detail, build_output=build_output)
+
+    entry_surface_errors = prepare_supervisor_read_surfaces(
+        repo,
+        config.state_dir,
+        burst_user=getattr(config.tmux, "burst_user", None),
+        include_tablet=True,
+        include_staging=True,
+        include_package_builds=True,
+    )
+    if entry_surface_errors:
+        detail = _shared_surface_error_detail(entry_surface_errors)
+        print(f"  INVALID: {detail}")
+        return _theorem_invalid(detail, skip_viewer_state=True)
 
     prep_notes = _prepare_theorem_stating_worker_state(
         config,
@@ -3317,52 +3634,23 @@ def run_theorem_stating_cycle(
         if not resume_from else {}
     )
 
-    def _register_theorem_attempt_nodes(
-        new_nodes: Sequence[str],
-        *,
-        difficulty_hints: Optional[Dict[str, str]] = None,
-        kind_hints: Optional[Dict[str, str]] = None,
-    ) -> None:
-        difficulty_hints = difficulty_hints or {}
-        kind_hints = kind_hints or {}
-        for name in new_nodes:
-            lean_path = node_lean_path(repo, name)
-            if not lean_path.exists() or name in tablet.nodes:
-                continue
-            kind = _theorem_stating_node_kind(name, kind_hints)
-            register_new_node(tablet, repo, name=name, kind=kind, cycle=cycle)
-            if name in difficulty_hints:
-                tablet.nodes[name].difficulty = difficulty_hints[name]
-
-        if PREAMBLE_NAME not in tablet.nodes:
-            preamble_path = repo / "Tablet" / "Preamble.lean"
-            if preamble_path.exists():
-                tablet.nodes[PREAMBLE_NAME] = TabletNode(
-                    name=PREAMBLE_NAME,
-                    kind="preamble",
-                    status="closed",
-                    title="Imports",
-                    closed_at_cycle=cycle,
-                )
-
-    def _theorem_invalid(detail: str, *, build_output: str = "") -> CycleOutcome:
-        state.resume_from = ""
-        _record_theorem_invalid_attempt(state, cycle=cycle, attempt=attempt, detail=detail)
-        _save_runtime_tablet(config, tablet, cycle=cycle)
-        save_state(state_path(config), state)
-        _save_live_viewer_state(config, tablet, state, source="invalid", in_flight_cycle=cycle)
-        return CycleOutcome(outcome="INVALID", detail=detail, build_output=build_output)
-
     preflight_error = _theorem_stating_preflight_error(state)
     if preflight_error:
         print(f"  INVALID: {preflight_error}")
         return _theorem_invalid(preflight_error)
 
     class _TheoremAttemptInvalid(Exception):
-        def __init__(self, detail: str, *, build_output: str = "") -> None:
+        def __init__(
+            self,
+            detail: str,
+            *,
+            build_output: str = "",
+            skip_viewer_state: bool = False,
+        ) -> None:
             super().__init__(detail)
             self.detail = detail
             self.build_output = build_output
+            self.skip_viewer_state = skip_viewer_state
 
     outcome: CycleOutcome
     worker_result: Any = SimpleNamespace(captured_output="", usage=None, ok=True, error="")
@@ -3375,11 +3663,6 @@ def run_theorem_stating_cycle(
         _save_live_viewer_state(config, tablet, state, source="worker", in_flight_cycle=cycle)
 
         (repo / "Tablet").mkdir(parents=True, exist_ok=True)
-        fix_lake_permissions(
-            repo,
-            burst_user=config.tmux.burst_user,
-            include_package_builds=True,
-        )
         _setup_theorem_stating_permissions(
             config,
             target=state.theorem_soundness_target,
@@ -3450,18 +3733,26 @@ def run_theorem_stating_cycle(
             if not worker_result.ok:
                 raise _TheoremAttemptInvalid(f"Worker burst failed: {worker_result.error}")
 
+            post_burst_surface_errors = prepare_supervisor_read_surfaces(
+                repo,
+                config.state_dir,
+                burst_user=getattr(config.tmux, "burst_user", None),
+                include_tablet=True,
+                include_staging=True,
+                include_package_builds=True,
+            )
+            if post_burst_surface_errors:
+                raise _TheoremAttemptInvalid(
+                    _shared_surface_error_detail(post_burst_surface_errors),
+                    skip_viewer_state=True,
+                )
+
             worker_handoff, handoff_error = _accept_validated_artifact(
                 config,
                 "worker_handoff.json",
                 kind="worker-handoff",
                 phase="theorem_stating",
                 repo_for_validation=repo,
-            )
-
-            fix_lake_permissions(
-                repo,
-                burst_user=config.tmux.burst_user,
-                include_package_builds=True,
             )
 
             # Discover what the worker created/modified before deciding whether the
@@ -3488,21 +3779,21 @@ def run_theorem_stating_cycle(
             worker_status = str(worker_handoff.get("status", "") or "").strip().upper()
 
             difficulty_hints: Dict[str, str] = {}
-            kind_hints: Dict[str, str] = {}
+            paper_provenance_hints: Dict[str, Dict[str, Any]] = {}
             hints = worker_handoff.get("difficulty_hints", {})
             if isinstance(hints, dict):
                 for k, v in hints.items():
                     if v in ("easy", "hard"):
                         difficulty_hints[k] = v
-            raw_kind_hints = worker_handoff.get("kind_hints", {})
-            if isinstance(raw_kind_hints, dict):
-                for k, v in raw_kind_hints.items():
-                    if v in ("paper_main_result", "paper_intermediate"):
-                        kind_hints[k] = v
+            raw_paper_provenance_hints = worker_handoff.get("paper_provenance_hints", {})
+            if isinstance(raw_paper_provenance_hints, dict):
+                for k, v in raw_paper_provenance_hints.items():
+                    if isinstance(v, dict) and "start_line" in v and "end_line" in v:
+                        paper_provenance_hints[str(k)] = dict(v)
             _register_theorem_attempt_nodes(
                 new_nodes,
                 difficulty_hints=difficulty_hints,
-                kind_hints=kind_hints,
+                paper_provenance_hints=paper_provenance_hints,
             )
 
             if worker_status == "CRISIS":
@@ -3634,7 +3925,11 @@ def run_theorem_stating_cycle(
                     outcome = CycleOutcome(outcome="PROGRESS", detail="Modified existing nodes")
         except _TheoremAttemptInvalid as exc:
             print(f"  INVALID: {exc.detail}")
-            outcome = _theorem_invalid(exc.detail, build_output=exc.build_output)
+            outcome = _theorem_invalid(
+                exc.detail,
+                build_output=exc.build_output,
+                skip_viewer_state=exc.skip_viewer_state,
+            )
 
         regenerate_support_files(tablet, repo)
         _save_runtime_tablet(config, tablet, cycle=cycle)
@@ -3685,26 +3980,36 @@ def run_theorem_stating_cycle(
         repaired_failures = _repair_stale_legacy_correspondence_failures(tablet, state, repo)
         if repaired_hashes or repaired_failures:
             _save_runtime_tablet(config, tablet, cycle=cycle)
-        all_check_nodes = [n for n in tablet.nodes if tablet.nodes[n].kind != "preamble"]
-        forced_corr_nodes = _theorem_stating_persisted_correspondence_nodes(tablet, state)
-        corr_check_nodes = _theorem_stating_correspondence_frontier(
+        nl_verification_results = _run_theorem_stating_verification(
+            config,
+            policy,
             tablet,
-            repo,
-            forced_nodes=forced_corr_nodes,
-        )
-        persisted_corr_blocked = _theorem_stating_has_correspondence_blockers(state)
-        print(f"  Running NL verification for {len(all_check_nodes)} nodes...")
-        if state.theorem_soundness_target:
-            print(f"  Current theorem-stating soundness target: {state.theorem_soundness_target}")
-        print(f"  Statement-level correspondence frontier: {len(corr_check_nodes)} nodes")
-        verification_state = _suspend_theorem_soundness_target(state) if corr_check_nodes else state
-        nl_verification_results = _run_nl_verification(
-            config, policy, tablet, all_check_nodes, state=verification_state, cycle=cycle, correspondence_node_names=corr_check_nodes, log_dir=log_dir, nl_cache=nl_cache,
+            state,
+            cycle=cycle,
+            log_dir=log_dir,
+            nl_cache=nl_cache,
             human_input=state.human_input,
-            soundness_target_node=state.theorem_soundness_target or None,
-            persisted_correspondence_blocked=persisted_corr_blocked,
-            force_correspondence_node_names=forced_corr_nodes,
         )
+        if _correspondence_gate_open(nl_verification_results):
+            state.open_blockers = _reconcile_theorem_stating_open_rejections(
+                nl_verification_results,
+                [],
+            )
+            state.theorem_correspondence_blocked = True
+            state.theorem_soundness_target = ""
+            state.theorem_target_edit_mode = "repair"
+        else:
+            current_target = state.theorem_soundness_target
+            state.open_blockers = [
+                entry
+                for entry in normalize_open_blockers(state.open_blockers)
+                if entry.get("phase") == "soundness"
+                and (
+                    not current_target
+                    or entry.get("node") in {"(global)", current_target}
+                )
+            ]
+            state.theorem_correspondence_blocked = False
         save_json(verification_checkpoint, nl_verification_results)
         # Save checkpoint: verification done
         state.resume_from = "reviewer"
@@ -3769,7 +4074,16 @@ def run_theorem_stating_cycle(
             except Exception:
                 worker_handoff = None
 
-    orphan_candidates = find_orphan_nodes(tablet, repo)
+    configured_main_result_issues = main_result_target_issues(
+        tablet,
+        repo,
+        _configured_main_result_targets(config),
+    )
+    unsupported_nodes = find_unsupported_nodes(
+        tablet,
+        repo,
+        _configured_main_result_targets(config),
+    )
 
     correspondence_blocked = _correspondence_gate_open(nl_verification_results)
     reviewer_state = _suspend_theorem_soundness_target(state) if correspondence_blocked else state
@@ -3781,7 +4095,8 @@ def run_theorem_stating_cycle(
         worker_handoff=worker_handoff,
         worker_output=(worker_result.captured_output[-15000:] if worker_result.captured_output else "") if not resume_from else "",
         nl_verification=nl_verification_results if nl_verification_results else None,
-        orphan_candidates=orphan_candidates,
+        main_result_issues=configured_main_result_issues,
+        unsupported_nodes=unsupported_nodes,
         validation_summary={
             "outcome": outcome.outcome,
             "detail": outcome.detail,
@@ -3833,7 +4148,23 @@ def run_theorem_stating_cycle(
             decision["reset_to_checkpoint"] = ""
     if isinstance(decision, dict):
         if outcome.outcome != "INVALID":
-            _enforce_theorem_stating_orphan_candidates(decision, orphan_candidates)
+            for name, provenance in decision.get("paper_provenance_assignments", {}).items():
+                if name in tablet.nodes and isinstance(provenance, dict):
+                    tablet.nodes[name].paper_provenance = dict(provenance)
+
+            current_main_result_issues = main_result_target_issues(
+                tablet,
+                repo,
+                _configured_main_result_targets(config),
+            )
+            current_unsupported_nodes = find_unsupported_nodes(
+                tablet,
+                repo,
+                _configured_main_result_targets(config),
+            )
+            _enforce_theorem_stating_main_result_targets(decision, current_main_result_issues)
+            _enforce_theorem_stating_support_closure(decision, current_unsupported_nodes)
+
             open_rejections = _reconcile_theorem_stating_open_rejections(
                 nl_verification_results,
                 decision.get("open_blockers", decision.get("open_rejections", state.open_blockers)),
@@ -3842,27 +4173,19 @@ def run_theorem_stating_cycle(
             _enforce_theorem_stating_open_rejections(decision, open_rejections)
             state.open_blockers = open_rejections
 
-            for name, kind in decision.get("kind_assignments", {}).items():
-                if name in tablet.nodes and kind in {"paper_main_result", "paper_intermediate"}:
-                    tablet.nodes[name].kind = kind
-
             if correspondence_blocked:
                 state.theorem_correspondence_blocked = True
                 state.theorem_soundness_target = ""
                 state.theorem_target_edit_mode = "repair"
             else:
                 state.theorem_correspondence_blocked = False
-                pending_soundness_candidates = _eligible_soundness_nodes(config, tablet)
-                pending_soundness_candidates = nl_cache.filter_uncached(repo, pending_soundness_candidates, "soundness")
-                pending_soundness_agents = _effective_soundness_agents(config, policy)
                 prior_soundness_target = state.theorem_soundness_target
-                pending_soundness_target = _select_theorem_soundness_target(
+                pending_soundness_target = _pending_theorem_soundness_target(
                     config,
+                    policy,
                     tablet,
-                    pending_soundness_candidates,
-                    soundness_agents=pending_soundness_agents,
-                    disagree_bias=policy.verification.soundness_disagree_bias,
-                    preferred=state.theorem_soundness_target,
+                    state,
+                    nl_cache=nl_cache,
                 )
                 if pending_soundness_target:
                     state.theorem_soundness_target = pending_soundness_target
@@ -4100,6 +4423,8 @@ def run_cycle(
     previous_outcome: Optional[Dict[str, Any]] = None,
 ) -> CycleOutcome:
     """Run a single supervisor cycle."""
+    from lagent_tablets.health import prepare_supervisor_read_surfaces
+
     cycle = state.cycle + 1
     cycle_start = time.monotonic()
     state.cycle = cycle
@@ -4131,6 +4456,26 @@ def run_cycle(
         effective_worker = config.worker
 
     print(f"=== Cycle {cycle} | Active: {active_node} | Difficulty: {node_difficulty} | Worker: {effective_worker.provider}/{effective_worker.model} ===")
+
+    def _proof_invalid(detail: str, *, skip_viewer_state: bool = False) -> CycleOutcome:
+        save_state(state_path(config), state)
+        if not skip_viewer_state:
+            _save_live_viewer_state(config, tablet, state, source="worker")
+        return CycleOutcome(outcome="INVALID", detail=detail)
+
+    entry_surface_errors = prepare_supervisor_read_surfaces(
+        repo,
+        config.state_dir,
+        burst_user=getattr(config.tmux, "burst_user", None),
+        include_tablet=True,
+        include_staging=True,
+        include_package_builds=True,
+    )
+    if entry_surface_errors:
+        detail = _shared_surface_error_detail(entry_surface_errors)
+        print(f"  INVALID: {detail}")
+        return _proof_invalid(detail, skip_viewer_state=True)
+
     # Clear stale verification/reviewer activity from the previous cycle before
     # the new worker burst starts.
     _save_live_viewer_state(config, tablet, state, source="worker")
@@ -4139,14 +4484,6 @@ def run_cycle(
     # Regenerate scripts each cycle (hot-reloadable)
     forbidden = [kw for kw in FORBIDDEN_KEYWORDS_DEFAULT if kw not in config.workflow.forbidden_keyword_allowlist]
     write_scripts(repo, config.state_dir, allowed_prefixes=config.workflow.allowed_import_prefixes, forbidden_keywords=forbidden)
-
-    # Fix .lake permissions before any compilation
-    from lagent_tablets.health import fix_lake_permissions
-    fix_lake_permissions(
-        repo,
-        burst_user=config.tmux.burst_user,
-        include_package_builds=True,
-    )
 
     # Ensure oleans are up to date before the burst (so check_node works for the worker)
     _ensure_lake_build(repo)
@@ -4230,6 +4567,19 @@ def run_cycle(
         _save_live_viewer_state(config, tablet, state, source="worker")
         return CycleOutcome(outcome="INVALID", detail=f"Worker burst failed: {worker_result.error}")
 
+    post_burst_surface_errors = prepare_supervisor_read_surfaces(
+        repo,
+        config.state_dir,
+        burst_user=getattr(config.tmux, "burst_user", None),
+        include_tablet=True,
+        include_staging=True,
+        include_package_builds=True,
+    )
+    if post_burst_surface_errors:
+        detail = _shared_surface_error_detail(post_burst_surface_errors)
+        print(f"  INVALID: {detail}")
+        return _proof_invalid(detail, skip_viewer_state=True)
+
     worker_handoff, handoff_error = _accept_validated_artifact(
         config,
         "worker_handoff.json",
@@ -4245,13 +4595,12 @@ def run_cycle(
             detail=f"Invalid worker handoff: {handoff_error or 'missing raw/done artifact'}",
         )
     state.last_worker_handoff = worker_handoff
-
-    # Fix .lake permissions after burst (worker may have created oleans)
-    fix_lake_permissions(
-        repo,
-        burst_user=config.tmux.burst_user,
-        include_package_builds=True,
-    )
+    paper_provenance_hints: Dict[str, Dict[str, Any]] = {}
+    raw_paper_provenance_hints = worker_handoff.get("paper_provenance_hints", {})
+    if isinstance(raw_paper_provenance_hints, dict):
+        for k, v in raw_paper_provenance_hints.items():
+            if isinstance(k, str) and isinstance(v, dict):
+                paper_provenance_hints[k] = dict(v)
 
     # Check the active node's hash AFTER the burst
     hash_after = hashlib.sha256(active_lean.read_bytes()).hexdigest() if active_lean.exists() else ""
@@ -4370,7 +4719,15 @@ def run_cycle(
     if outcome.outcome == "PROGRESS":
         for name in outcome.nodes_created:
             if name not in tablet.nodes:
-                register_new_node(tablet, repo, name=name, kind="helper_lemma", cycle=cycle)
+                env = node_statement_environment(repo, name)
+                register_new_node(
+                    tablet,
+                    repo,
+                    name=name,
+                    kind="helper_lemma" if env == "helper" else "ordinary",
+                    cycle=cycle,
+                    paper_provenance=paper_provenance_hints.get(name, {}),
+                )
         changed_nodes = sorted(
             {
                 Path(fname).stem
@@ -4653,6 +5010,8 @@ def run_cleanup_cycle(
     previous_outcome: Optional[Dict[str, Any]] = None,
 ) -> CycleOutcome:
     """Run one terminal style-cleanup cycle over an already complete tablet."""
+    from lagent_tablets.health import prepare_supervisor_read_surfaces
+
     cycle = state.cycle + 1
     cycle_start = time.monotonic()
     state.cycle = cycle
@@ -4666,18 +5025,31 @@ def run_cleanup_cycle(
 
     effective_worker = config.hard_worker or config.worker
     print(f"=== Cleanup Cycle {cycle} | Focus: {active_node or '(none)'} | Worker: {effective_worker.provider}/{effective_worker.model} ===")
+
+    def _cleanup_invalid(detail: str, *, skip_viewer_state: bool = False) -> CycleOutcome:
+        save_state(state_path(config), state)
+        if not skip_viewer_state:
+            _save_live_viewer_state(config, tablet, state, source="worker")
+        return CycleOutcome(outcome="INVALID", detail=detail)
+
+    entry_surface_errors = prepare_supervisor_read_surfaces(
+        repo,
+        config.state_dir,
+        burst_user=getattr(config.tmux, "burst_user", None),
+        include_tablet=True,
+        include_staging=True,
+        include_package_builds=True,
+    )
+    if entry_surface_errors:
+        detail = _shared_surface_error_detail(entry_surface_errors)
+        print(f"  INVALID: {detail}")
+        return _cleanup_invalid(detail, skip_viewer_state=True)
+
     _save_live_viewer_state(config, tablet, state, source="worker")
 
     forbidden = [kw for kw in FORBIDDEN_KEYWORDS_DEFAULT if kw not in config.workflow.forbidden_keyword_allowlist]
     write_scripts(repo, config.state_dir, allowed_prefixes=config.workflow.allowed_import_prefixes, forbidden_keywords=forbidden)
 
-    from lagent_tablets.health import fix_lake_permissions
-
-    fix_lake_permissions(
-        repo,
-        burst_user=config.tmux.burst_user,
-        include_package_builds=True,
-    )
     _ensure_lake_build(repo)
     _setup_cleanup_permissions(config)
 
@@ -4721,6 +5093,19 @@ def run_cleanup_cycle(
         save_state(state_path(config), state)
         _save_live_viewer_state(config, tablet, state, source="worker")
         return CycleOutcome(outcome="INVALID", detail=f"Worker burst failed: {worker_result.error}")
+
+    post_burst_surface_errors = prepare_supervisor_read_surfaces(
+        repo,
+        config.state_dir,
+        burst_user=getattr(config.tmux, "burst_user", None),
+        include_tablet=True,
+        include_staging=True,
+        include_package_builds=True,
+    )
+    if post_burst_surface_errors:
+        detail = _shared_surface_error_detail(post_burst_surface_errors)
+        print(f"  INVALID: {detail}")
+        return _cleanup_invalid(detail, skip_viewer_state=True)
 
     worker_handoff, handoff_error = _accept_validated_artifact(
         config,

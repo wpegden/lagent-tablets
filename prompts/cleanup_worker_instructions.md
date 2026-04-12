@@ -8,7 +8,7 @@ IMPORTANT: Before starting, read the skill file at `{skill_path}`.
 WORKFLOW:
 1. The proof tablet is already accepted as mathematically complete.
 2. You may do polish only: Lean proof refactors, formatting, comments, import tidying, or similarly harmless cleanup.
-3. Do NOT create new nodes, delete nodes, change theorem/definition statements, or modify any `.tex` file.
+3. Do NOT create new nodes, delete nodes, change any node statement, or modify any `.tex` file.
 4. When you are done, stop and write the raw handoff file `{raw_output_path}`.
 
 MANDATORY BEFORE SUBMITTING: Run the cleanup-preservation self-check and fix any errors:
@@ -18,7 +18,8 @@ WHEN DONE -- write the raw handoff JSON to `{raw_output_path}`:
 {{
   "summary": "brief description of the cleanup work",
   "status": "NOT_STUCK | STUCK | DONE | NEED_INPUT",
-  "new_nodes": []
+  "new_nodes": [],
+  "feedback": "optional short note if the task/setup seems impossible, inconsistent, or poorly supported"
 }}
 Then run:
   python3 {check_script} worker-handoff {raw_output_path} --phase proof_complete_style_cleanup --repo {repo_path}

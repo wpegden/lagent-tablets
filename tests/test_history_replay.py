@@ -20,7 +20,7 @@ from lagent_tablets.config import (
     WorkflowConfig,
 )
 from lagent_tablets.git_ops import commit_cycle, init_repo
-from lagent_tablets.history_replay import find_first_history_divergence
+from lagent_tablets.history_replay import _normalize_prompt, find_first_history_divergence
 from lagent_tablets.prompts import build_theorem_stating_prompt
 from lagent_tablets.state import SupervisorState, TabletState, save_state, save_tablet
 
@@ -116,6 +116,27 @@ def _initial_commit(repo: Path) -> None:
 
 
 class TestHistoryReplay(unittest.TestCase):
+    def test_normalize_prompt_canonicalizes_runtime_skill_paths(self) -> None:
+        repo = Path(tempfile.mkdtemp())
+        init_repo(repo)
+        _write_base_repo(repo)
+        config = _make_config(repo)
+        replay_repo = Path(tempfile.mkdtemp()) / "replay"
+        replay_repo.mkdir(parents=True, exist_ok=True)
+        replay_config = _make_config(replay_repo)
+
+        prompt = (
+            f"Read the skill file at "
+            f"`{repo / '.agent-supervisor' / 'runtime' / 'skills' / 'THEOREM_STATING_WORKER.md'}`.\n"
+        )
+        normalized = _normalize_prompt(prompt, config, replay_config)
+
+        self.assertIn(
+            str((Path(__file__).resolve().parent.parent / "skills" / "THEOREM_STATING_WORKER.md").resolve()),
+            normalized,
+        )
+        self.assertNotIn(str(repo / ".agent-supervisor" / "runtime" / "skills"), normalized)
+
     def test_reports_worker_prompt_divergence(self) -> None:
         repo = Path(tempfile.mkdtemp())
         init_repo(repo)

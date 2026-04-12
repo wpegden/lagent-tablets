@@ -146,13 +146,15 @@ class TestViewerSnapshots(unittest.TestCase):
                 }
             }
         })
-        state = SupervisorState(cycle=9, phase="theorem_stating")
+        state = SupervisorState(cycle=9, phase="theorem_stating", resume_from="verification")
 
-        with patch("lagent_tablets.viewer_state._live_verification_statuses", side_effect=AssertionError("should not run")):
+        with patch("lagent_tablets.viewer_state._live_verification_statuses", side_effect=AssertionError("should not run")), \
+             patch("lagent_tablets.viewer_state.prime_correspondence_fingerprints", side_effect=AssertionError("should not prime")):
             snapshot = build_live_viewer_state(repo, tablet, state, fast=True)
 
         self.assertEqual(snapshot["nodes"]["foo"]["verification"]["correspondence"], "pass")
         self.assertEqual(snapshot["nodes"]["foo"]["verification"]["nl_proof"], "fail")
+        self.assertFalse(snapshot["nodes"]["foo"]["activity"]["correspondence"])
 
     def test_write_live_snapshot_writes_project_viewer_cache(self) -> None:
         repo = Path(tempfile.mkdtemp()) / "extremal_tablets"

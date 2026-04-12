@@ -25,6 +25,10 @@ def project_scratch_dir(state_dir: Path) -> Path:
     return state_dir / "scratch"
 
 
+def project_feedback_log_path(state_dir: Path) -> Path:
+    return state_dir / "agent_feedback.jsonl"
+
+
 def project_runtime_dir(state_dir: Path) -> Path:
     return state_dir / "runtime"
 

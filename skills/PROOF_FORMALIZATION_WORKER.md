@@ -34,6 +34,9 @@ Prefer Mathlib lemmas and definitions over project-local wrappers whenever possi
 
 - In `easy` mode, stay within the frozen easy-mode scope from the prompt.
 - In `hard` mode, you may add imports/helpers only as permitted by the prompt.
+- If you create a new structural node in proof_formalization, `helper` and `definition` are the normal `.tex` environments.
+- New paper-anchored `theorem`/`lemma`/`corollary` nodes are unusual but allowed when they are genuinely needed; if you create one, follow the full node spec and include structured `paper_provenance_hints` in the handoff.
+- Ordinary proof_formalization must not mutate the accepted coarse package. Changing accepted coarse-node statements, `.tex`, or coarse-to-coarse structure requires reviewer-authorized `proof_edit_mode: "coarse_restructure"`.
 
 ## Lean Workflow
 

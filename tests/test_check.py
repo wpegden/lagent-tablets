@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +17,7 @@ from lagent_tablets.check import (
     check_tablet_scoped,
     run_print_axioms,
     validate_correspondence_result_data,
+    validate_json_artifact,
     validate_node_soundness_result_data,
     validate_reviewer_decision_data,
     validate_worker_handoff_data,
@@ -150,7 +152,7 @@ class TestAxiomAudit(unittest.TestCase):
         self.assertFalse(result["tex_format_valid"])
         self.assertTrue(any(".tex format errors" in err for err in result["errors"]))
 
-    def test_check_node_warns_when_definition_like_roles_mismatch(self):
+    def test_check_node_rejects_definition_like_roles_mismatch(self):
         repo = self._make_repo("-- [TABLET NODE: foo]\ntheorem foo : True := by\n  trivial\n")
         (repo / "Tablet" / "foo.tex").write_text(
             "\\begin{definition}[foo]\nFoo.\n\\end{definition}\n",
@@ -165,7 +167,26 @@ class TestAxiomAudit(unittest.TestCase):
                 forbidden_keywords=["sorry", "axiom"],
             )
 
-        self.assertTrue(any("disguised definitions" in warn for warn in result["warnings"]))
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("disguised definitions" in err for err in result["errors"]))
+
+    def test_check_node_rejects_definition_like_lean_for_helper_env(self):
+        repo = self._make_repo("-- [TABLET NODE: foo]\ndef foo : Prop := True\n")
+        (repo / "Tablet" / "foo.tex").write_text(
+            "\\begin{helper}[foo]\nFoo.\n\\end{helper}\n\\begin{proof}\nProof.\n\\end{proof}\n",
+            encoding="utf-8",
+        )
+
+        with patch("lagent_tablets.check.run_lake_env_lean", return_value={"ok": True, "returncode": 0, "output": ""}):
+            result = check_node(
+                repo,
+                "foo",
+                allowed_prefixes=["Mathlib"],
+                forbidden_keywords=["sorry", "axiom"],
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("proof-bearing env `helper`" in err for err in result["errors"]))
 
     def test_check_tablet_validates_preamble_tex_with_definitions(self):
         repo = Path(tempfile.mkdtemp())
@@ -254,6 +275,32 @@ class TestAxiomAudit(unittest.TestCase):
         )
 
         self.assertTrue(result["ok"])
+
+    def test_check_proof_hard_scope_rejects_out_of_scope_created_node_in_restructure_mode(self):
+        repo = Path(tempfile.mkdtemp())
+        tablet = repo / "Tablet"
+        tablet.mkdir()
+        (tablet / "main_thm.lean").write_text("-- [TABLET NODE: main_thm]\ntheorem main_thm : True := by\n  sorry\n", encoding="utf-8")
+        (tablet / "main_thm.tex").write_text("\\begin{theorem}True\\end{theorem}\n", encoding="utf-8")
+        before = {
+            "main_thm.lean": "a",
+            "main_thm.tex": "b",
+        }
+        (tablet / "rogue_helper.lean").write_text("-- [TABLET NODE: rogue_helper]\ntheorem rogue_helper : True := by\n  sorry\n", encoding="utf-8")
+        (tablet / "rogue_helper.tex").write_text("\\begin{helper}True\\end{helper}\n", encoding="utf-8")
+
+        result = check_proof_hard_scope(
+            repo,
+            active_node="main_thm",
+            snapshot_before=before,
+            proof_edit_mode="restructure",
+            authorized_nodes=["main_thm"],
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(
+            any("Out-of-scope created nodes" in err for err in result["errors"])
+        )
 
     def test_check_proof_hard_scope_rejects_coarse_tex_change_without_coarse_restructure(self):
         repo = Path(tempfile.mkdtemp())
@@ -358,9 +405,11 @@ class TestArtifactValidation(unittest.TestCase):
             "paper_faithfulness": {"decision": "FAIL", "issues": [{"node": "foo", "description": "Mismatch"}]},
             "overall": "REJECT",
             "summary": "Paper mismatch remains",
+            "feedback": "Need a better paper excerpt.",
         })
         self.assertTrue(result["ok"])
         self.assertEqual(result["data"]["overall"], "REJECT")
+        self.assertEqual(result["data"]["feedback"], "Need a better paper excerpt.")
 
     def test_rejects_node_soundness_with_wrong_node(self):
         result = validate_node_soundness_result_data({
@@ -372,23 +421,44 @@ class TestArtifactValidation(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertTrue(any("node must equal foo" in err for err in result["errors"]))
 
+    def test_validates_node_soundness_feedback(self):
+        result = validate_node_soundness_result_data({
+            "node": "foo",
+            "soundness": {"decision": "UNSOUND", "explanation": "gap"},
+            "overall": "REJECT",
+            "summary": "gap remains",
+            "feedback": "The provided children do not match the proof sketch.",
+        }, node_name="foo")
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            result["data"]["feedback"],
+            "The provided children do not match the proof sketch.",
+        )
+
     def test_validates_theorem_reviewer_decision(self):
         result = validate_reviewer_decision_data({
             "decision": "CONTINUE",
             "reason": "Need to fix correspondence.",
             "next_prompt": "Fix the quantifier mismatch.",
+            "feedback": "The current guidance is under-specific.",
             "target_edit_mode": "repair",
             "next_active_node": "",
             "issues": ["Missing quantifier"],
-            "kind_assignments": {"main_result": "paper_main_result"},
+            "paper_provenance_assignments": {
+                "main_result": {"start_line": 10, "end_line": 12, "tex_label": "sum"}
+            },
             "paper_focus_ranges": [{"start_line": 10, "end_line": 12, "reason": "statement"}],
             "orphan_resolutions": [],
             "open_blockers": [{"node": "foo", "phase": "correspondence", "reason": "Missing quantifier"}],
         }, phase="theorem_stating")
         self.assertTrue(result["ok"])
         self.assertEqual(result["data"]["decision"], "CONTINUE")
+        self.assertEqual(result["data"]["feedback"], "The current guidance is under-specific.")
         self.assertEqual(result["data"]["open_blockers"][0]["phase"], "correspondence")
-        self.assertEqual(result["data"]["kind_assignments"]["main_result"], "paper_main_result")
+        self.assertEqual(
+            result["data"]["paper_provenance_assignments"]["main_result"]["tex_label"],
+            "sum",
+        )
 
     def test_validates_theorem_reviewer_decision_with_soundness_blocker(self):
         result = validate_reviewer_decision_data({
@@ -512,32 +582,146 @@ class TestArtifactValidation(unittest.TestCase):
         }, phase="proof_complete_style_cleanup")
         self.assertTrue(result["ok"])
 
+    def test_validate_json_artifact_accepts_reviewer_decision(self):
+        repo = Path(tempfile.mkdtemp())
+        raw = repo / "reviewer_decision.raw.json"
+        raw.write_text(
+            json.dumps(
+                {
+                    "decision": "CONTINUE",
+                    "reason": "Need theorem repairs.",
+                    "next_prompt": "Tighten the paper-facing statements.",
+                    "next_active_node": "",
+                    "paper_focus_ranges": [],
+                    "support_resolutions": [],
+                    "open_blockers": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = validate_json_artifact(
+            "reviewer-decision",
+            raw,
+            phase="theorem_stating",
+            repo=repo,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"]["decision"], "CONTINUE")
+
     def test_validates_worker_handoff_new_nodes_exist(self):
         repo = Path(tempfile.mkdtemp())
         tablet = repo / "Tablet"
         tablet.mkdir()
         (tablet / "helper.lean").write_text("-- [TABLET NODE: helper]\ntheorem helper : True := by\n  trivial\n")
-        (tablet / "helper.tex").write_text("\\begin{lemma}True\\end{lemma}\n")
+        (tablet / "helper.tex").write_text("\\begin{helper}True\\end{helper}\n")
+
+        result = validate_worker_handoff_data({
+            "summary": "Added helper",
+            "status": "NOT_STUCK",
+            "new_nodes": ["helper"],
+            "feedback": "The missing paper import made this awkward.",
+            "difficulty_hints": {"helper": "easy"},
+            "paper_provenance_hints": {},
+        }, phase="theorem_stating", repo=repo)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"]["feedback"], "The missing paper import made this awkward.")
+
+    def test_worker_handoff_allows_optional_helper_provenance(self):
+        repo = Path(tempfile.mkdtemp())
+        tablet = repo / "Tablet"
+        tablet.mkdir()
+        (repo / "paper.tex").write_text(
+            "intro\n\\begin{lemma}\\label{helper-ref}\nStatement.\n\\end{lemma}\n",
+            encoding="utf-8",
+        )
+        (tablet / "helper.lean").write_text("-- [TABLET NODE: helper]\ntheorem helper : True := by\n  trivial\n")
+        (tablet / "helper.tex").write_text("\\begin{helper}True\\end{helper}\n", encoding="utf-8")
 
         result = validate_worker_handoff_data({
             "summary": "Added helper",
             "status": "NOT_STUCK",
             "new_nodes": ["helper"],
             "difficulty_hints": {"helper": "easy"},
-            "kind_hints": {"helper": "paper_intermediate"},
+            "paper_provenance_hints": {
+                "helper": {"start_line": 2, "end_line": 4, "tex_label": "helper-ref"}
+            },
         }, phase="theorem_stating", repo=repo)
         self.assertTrue(result["ok"])
 
-    def test_worker_handoff_rejects_kind_hints_outside_new_nodes(self):
+    def test_proof_worker_handoff_accepts_new_paper_statement_with_provenance(self):
+        repo = Path(tempfile.mkdtemp())
+        tablet = repo / "Tablet"
+        tablet.mkdir()
+        (repo / "paper.tex").write_text(
+            "intro\n\\begin{lemma}\\label{sum}\nStatement.\n\\end{lemma}\n",
+            encoding="utf-8",
+        )
+        (tablet / "paper_aux.lean").write_text("-- [TABLET NODE: paper_aux]\nlemma paper_aux : True := by\n  trivial\n")
+        (tablet / "paper_aux.tex").write_text("\\begin{lemma}True\\end{lemma}\n", encoding="utf-8")
+
+        result = validate_worker_handoff_data({
+            "summary": "Added a cited lemma",
+            "status": "DONE",
+            "new_nodes": ["paper_aux"],
+            "paper_provenance_hints": {
+                "paper_aux": {"start_line": 2, "end_line": 4, "tex_label": "sum"}
+            },
+        }, phase="proof_formalization", repo=repo)
+        self.assertTrue(result["ok"])
+
+    def test_proof_worker_handoff_accepts_unlabeled_paper_statement_with_line_range(self):
+        repo = Path(tempfile.mkdtemp())
+        tablet = repo / "Tablet"
+        tablet.mkdir()
+        (repo / "paper.tex").write_text(
+            "intro\n\\begin{lemma}\nStatement.\n\\end{lemma}\n",
+            encoding="utf-8",
+        )
+        (tablet / "paper_aux.lean").write_text("-- [TABLET NODE: paper_aux]\nlemma paper_aux : True := by\n  trivial\n")
+        (tablet / "paper_aux.tex").write_text("\\begin{lemma}True\\end{lemma}\n", encoding="utf-8")
+
+        result = validate_worker_handoff_data({
+            "summary": "Added an unlabeled cited lemma",
+            "status": "DONE",
+            "new_nodes": ["paper_aux"],
+            "paper_provenance_hints": {
+                "paper_aux": {"start_line": 2, "end_line": 4}
+            },
+        }, phase="proof_formalization", repo=repo)
+        self.assertTrue(result["ok"])
+
+    def test_proof_worker_handoff_rejects_new_paper_statement_without_provenance(self):
+        repo = Path(tempfile.mkdtemp())
+        tablet = repo / "Tablet"
+        tablet.mkdir()
+        (repo / "paper.tex").write_text(
+            "intro\n\\begin{lemma}\\label{sum}\nStatement.\n\\end{lemma}\n",
+            encoding="utf-8",
+        )
+        (tablet / "paper_aux.lean").write_text("-- [TABLET NODE: paper_aux]\nlemma paper_aux : True := by\n  trivial\n")
+        (tablet / "paper_aux.tex").write_text("\\begin{lemma}True\\end{lemma}\n", encoding="utf-8")
+
+        result = validate_worker_handoff_data({
+            "summary": "Added a cited lemma",
+            "status": "DONE",
+            "new_nodes": ["paper_aux"],
+            "paper_provenance_hints": {},
+        }, phase="proof_formalization", repo=repo)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("must include start_line/end_line" in err for err in result["errors"]))
+
+    def test_worker_handoff_rejects_paper_provenance_hints_outside_new_nodes(self):
         result = validate_worker_handoff_data({
             "summary": "Added helper",
             "status": "NOT_STUCK",
             "new_nodes": ["helper"],
             "difficulty_hints": {"helper": "easy"},
-            "kind_hints": {"main_thm": "paper_main_result"},
+            "paper_provenance_hints": {"main_thm": {"start_line": 10, "end_line": 12}},
         }, phase="theorem_stating")
         self.assertFalse(result["ok"])
-        self.assertTrue(any("kind_hints keys must be listed in new_nodes" in err for err in result["errors"]))
+        self.assertTrue(any("paper_provenance_hints keys must be listed in new_nodes" in err for err in result["errors"]))
 
     def test_validates_cleanup_worker_handoff(self):
         result = validate_worker_handoff_data({

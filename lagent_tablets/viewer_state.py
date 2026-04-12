@@ -41,7 +41,7 @@ from lagent_tablets.tablet import PREAMBLE_NAME, extract_tablet_imports, has_sor
 
 
 _TEX_ENV_RE = re.compile(
-    r"\\begin\{(theorem|lemma|definition|proposition|corollary)\}(?:\[(.*?)\])?"
+    r"\\begin\{(theorem|lemma|definition|proposition|corollary|helper)\}(?:\[(.*?)\])?"
 )
 
 
@@ -414,9 +414,19 @@ def _normalize_activity(nodes: Iterable[str], activity: Optional[Dict[str, Itera
     return normalized
 
 
-def _default_live_activity(repo_path: Path, tablet: TabletState, state: SupervisorState) -> Dict[str, Iterable[str]]:
+def _default_live_activity(
+    repo_path: Path,
+    tablet: TabletState,
+    state: SupervisorState,
+    *,
+    fast: bool = False,
+) -> Dict[str, Iterable[str]]:
     activity: Dict[str, Iterable[str]] = {}
     if state.phase == "theorem_stating" and state.resume_from == "verification":
+        if fast:
+            if state.theorem_soundness_target:
+                activity["soundness"] = [state.theorem_soundness_target]
+            return activity
         prime_correspondence_fingerprints(
             repo_path,
             [
@@ -493,7 +503,7 @@ def build_live_viewer_state(
     )
     normalized_activity = _normalize_activity(
         nodes.keys(),
-        activity or _default_live_activity(repo_path, tablet, state),
+        activity or _default_live_activity(repo_path, tablet, state, fast=fast),
     )
     for name, payload in nodes.items():
         if name == PREAMBLE_NAME:

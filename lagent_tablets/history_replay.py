@@ -53,6 +53,7 @@ from lagent_tablets.cycle import (
 )
 from lagent_tablets.git_ops import _read_cycle_meta, get_cycle_history
 from lagent_tablets.nl_cache import NLCache
+from lagent_tablets.project_paths import project_runtime_skills_dir
 from lagent_tablets.prompts import (
     build_correspondence_prompt,
     build_node_soundness_prompt,
@@ -232,6 +233,7 @@ def _remap_config(config: Config, replay_repo: Path) -> Config:
 def _normalize_prompt(prompt: str, original: Config, replay: Config) -> str:
     text = str(prompt or "")
     replacements: List[Tuple[str, str]] = []
+    source_skills_dir = str((Path(__file__).resolve().parent.parent / "skills").resolve())
     for old, new in [
         (str(replay.state_dir), str(original.state_dir)),
         (str(replay.repo_path), str(original.repo_path)),
@@ -240,6 +242,22 @@ def _normalize_prompt(prompt: str, original: Config, replay: Config) -> str:
         (str(replay.workflow.approved_axioms_path), str(original.workflow.approved_axioms_path)),
         (str(replay.workflow.human_input_path), str(original.workflow.human_input_path)),
         (str(replay.workflow.input_request_path), str(original.workflow.input_request_path)),
+        (
+            str(project_runtime_skills_dir(replay.state_dir).resolve()),
+            source_skills_dir,
+        ),
+        (
+            str(project_runtime_skills_dir(original.state_dir).resolve()),
+            source_skills_dir,
+        ),
+        (
+            str((replay.repo_path / ".agent-supervisor" / "skills").resolve()),
+            source_skills_dir,
+        ),
+        (
+            str((original.repo_path / ".agent-supervisor" / "skills").resolve()),
+            source_skills_dir,
+        ),
     ]:
         if old and old != new:
             replacements.append((old, new))
@@ -362,8 +380,9 @@ def _compare_prompt(
     cycle: int,
     stage: str,
 ) -> Optional[ReplayResult]:
-    normalized = _normalize_prompt(replay_prompt, original_config, replay_config)
-    if normalized == historical.prompt:
+    normalized_historical = _normalize_prompt(historical.prompt, original_config, replay_config)
+    normalized_replay = _normalize_prompt(replay_prompt, original_config, replay_config)
+    if normalized_replay == normalized_historical:
         return None
     return ReplayResult(
         status="diverged",
@@ -372,9 +391,9 @@ def _compare_prompt(
         stage=stage,
         artifact=historical.exact_id,
         historical_ref=f"cycle-{cycle}",
-        historical_prompt=historical.prompt,
-        replay_prompt=normalized,
-        diff=_prompt_diff(historical.prompt, normalized),
+        historical_prompt=normalized_historical,
+        replay_prompt=normalized_replay,
+        diff=_prompt_diff(normalized_historical, normalized_replay),
     )
 
 
@@ -946,7 +965,8 @@ def _reviewer_prompt(
             worker_handoff=worker_handoff if isinstance(worker_handoff, dict) else None,
             worker_output=worker_output[-15000:] if worker_output else "",
             nl_verification=historical_results if historical_results else None,
-            orphan_candidates=[],
+            main_result_issues=[],
+            unsupported_nodes=[],
             validation_summary={
                 "outcome": cycle_meta.get("outcome", ""),
                 "detail": cycle_meta.get("detail", ""),

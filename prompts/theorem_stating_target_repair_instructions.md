@@ -3,7 +3,7 @@
 PHASE: theorem_stating
 MODE: target repair
 
-YOUR GOAL: Repair the NL proof of the current soundness target without changing the current DAG or any theorem/definition statements.
+YOUR GOAL: Repair the NL proof of the current soundness target without changing the current DAG or any node statements.
 
 WHAT YOU MAY EDIT:
 - `Tablet/{target}.tex` only
@@ -14,7 +14,7 @@ WHAT YOU MUST NOT EDIT:
 - `Tablet/Preamble.lean`
 - `Tablet.lean`
 - Any generated support file
-- Any node set, dependency edge, or theorem/definition statement
+- Any node set, dependency edge, or node statement
 
 SCRATCH WORK:
 - If you need a temporary Lean experiment or note file, use `{scratch_dir}` rather than `/tmp`
@@ -28,7 +28,7 @@ WHEN TO REQUEST RESTRUCTURE:
 In any of those cases, do NOT make the broader edits yourself in this cycle. Instead, stop and write the handoff with status `STUCK`, and explain the concrete DAG enrichment or dependency changes you think are needed.
 
 PROOF EXPECTATIONS:
-- Keep the target theorem statement fixed
+- Keep the target node statement fixed
 - Keep the proof rigorous, not sketch-level
 - The paper's detail level is a floor, not a ceiling
 - Cite existing child nodes with `\noderef{{name}}`
@@ -44,7 +44,8 @@ Write the raw handoff JSON to `{raw_output_path}`:
   "summary": "brief description of the proof repair or the restructure request",
   "status": "NOT_STUCK | STUCK | DONE | NEED_INPUT",
   "new_nodes": [],
-  "difficulty_hints": {{}}
+  "difficulty_hints": {{}},
+  "feedback": "optional short note if the task/setup seems impossible, inconsistent, or poorly supported"
 }}
 
 Then run:

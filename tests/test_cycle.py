@@ -20,6 +20,7 @@ from lagent_tablets.check import (
 )
 from lagent_tablets.cycle import (
     _accumulate_verification_usage,
+    _record_agent_feedback,
     _apply_verification_to_tablet,
     _backfill_legacy_correspondence_hashes,
     _changed_tablet_nodes_since_snapshot,
@@ -37,6 +38,7 @@ from lagent_tablets.cycle import (
     _run_nl_verification,
     _run_per_node_soundness,
     _run_single_node_soundness,
+    _run_theorem_stating_verification,
     _select_theorem_soundness_target,
     _snapshot_tablet_dir,
     _snapshot_tablet_node_hashes,
@@ -53,10 +55,35 @@ from lagent_tablets.cycle import (
     run_theorem_stating_cycle,
 )
 from lagent_tablets.nl_cache import correspondence_fingerprint, correspondence_text_fingerprint, soundness_fingerprint
+from lagent_tablets.project_paths import project_feedback_log_path
 from lagent_tablets.state import SupervisorState, TabletNode, TabletState
 
 
 class TestTheoremStatingOpenRejections(unittest.TestCase):
+
+    def test_record_agent_feedback_appends_private_log(self):
+        repo = Path(tempfile.mkdtemp())
+        state_dir = repo / ".agent-supervisor"
+        state_dir.mkdir(parents=True, exist_ok=True)
+
+        _record_agent_feedback(
+            SimpleNamespace(state_dir=state_dir),
+            cycle=3,
+            phase="theorem_stating",
+            role="worker_handoff",
+            artifact="worker_handoff.json",
+            feedback="The prompt did not expose the needed import path.",
+        )
+
+        path = project_feedback_log_path(state_dir)
+        self.assertTrue(path.exists())
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["cycle"], 3)
+        self.assertEqual(records[0]["role"], "worker_handoff")
+        self.assertEqual(records[0]["artifact"], "worker_handoff.json")
+        self.assertEqual(records[0]["feedback"], "The prompt did not expose the needed import path.")
 
     def test_correspondence_gate_open_only_when_correspondence_not_approved(self):
         self.assertFalse(_correspondence_gate_open([]))
@@ -108,12 +135,8 @@ class TestTheoremStatingOpenRejections(unittest.TestCase):
         self.assertTrue(state.theorem_correspondence_blocked)
         self.assertTrue(any("correspondence blockers" in note for note in notes))
 
-    def test_theorem_stating_node_kind_defaults_to_intermediate(self):
-        self.assertEqual(_theorem_stating_node_kind("main_theorem", {}), "paper_intermediate")
-        self.assertEqual(
-            _theorem_stating_node_kind("main_theorem", {"main_theorem": "paper_main_result"}),
-            "paper_main_result",
-        )
+    def test_theorem_stating_node_kind_defaults_to_ordinary(self):
+        self.assertEqual(_theorem_stating_node_kind("main_theorem"), "ordinary")
 
     def test_normalize_theorem_stating_replay_state_strips_stale_proof_phase_carryover(self):
         state = SupervisorState(
@@ -454,7 +477,7 @@ class TestTheoremStatingOrphanCandidates(unittest.TestCase):
             "decision": "ADVANCE_PHASE",
             "reason": "Ready to move on.",
             "next_prompt": "",
-            "orphan_resolutions": [
+            "support_resolutions": [
                 {
                     "node": "is_downset",
                     "action": "remove",
@@ -467,9 +490,9 @@ class TestTheoremStatingOrphanCandidates(unittest.TestCase):
         _enforce_theorem_stating_orphan_candidates(decision, ["is_downset"])
 
         self.assertEqual(decision["decision"], "CONTINUE")
-        self.assertIn("Orphan node candidates remain", decision["reason"])
+        self.assertIn("Unsupported nodes remain outside the configured target-support DAG", decision["reason"])
         self.assertEqual(
-            decision["orphan_resolutions"],
+            decision["support_resolutions"],
             [
                 {
                     "node": "is_downset",
@@ -489,7 +512,7 @@ class TestTheoremStatingOrphanCandidates(unittest.TestCase):
 
         _enforce_theorem_stating_orphan_candidates(decision, ["is_downset"])
 
-        self.assertIn("Resolve the current orphan-node candidates", decision["next_prompt"])
+        self.assertIn("Trim the tablet back to the support DAG", decision["next_prompt"])
         self.assertIn("is_downset", decision["next_prompt"])
 
     def test_prune_deleted_tablet_nodes_removes_missing_nodes(self):
@@ -1754,6 +1777,188 @@ class TestTheoremTargetScope(unittest.TestCase):
 
         self.assertEqual(target, "leaf")
 
+    def test_run_theorem_stating_verification_selects_single_target_after_correspondence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            state_dir = repo / ".agent-supervisor"
+            state_dir.mkdir()
+            tablet_dir = repo / "Tablet"
+            tablet_dir.mkdir()
+            (tablet_dir / "Preamble.lean").write_text("import Mathlib.Data.Nat.Basic\n", encoding="utf-8")
+            (tablet_dir / "leaf.lean").write_text(
+                "import Tablet.Preamble\n\ntheorem leaf : True := by\n  sorry\n",
+                encoding="utf-8",
+            )
+            (tablet_dir / "leaf.tex").write_text(
+                "\\begin{lemma}[Leaf]\nTrue.\n\\end{lemma}\n\\begin{proof}\nProof.\n\\end{proof}\n",
+                encoding="utf-8",
+            )
+            (tablet_dir / "top.lean").write_text(
+                "import Tablet.leaf\n\ntheorem top : True := by\n  sorry\n",
+                encoding="utf-8",
+            )
+            (tablet_dir / "top.tex").write_text(
+                "\\begin{lemma}[Top]\nTrue.\n\\end{lemma}\n\\begin{proof}\nProof.\n\\end{proof}\n",
+                encoding="utf-8",
+            )
+
+            state = SupervisorState(
+                cycle=5,
+                phase="theorem_stating",
+                open_blockers=[{"node": "leaf", "phase": "correspondence", "reason": "old blocker"}],
+            )
+            tablet = TabletState(nodes={
+                "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+                "leaf": TabletNode(name="leaf", kind="ordinary", status="open"),
+                "top": TabletNode(name="top", kind="ordinary", status="open"),
+            })
+            config = SimpleNamespace(
+                repo_path=repo,
+                state_dir=state_dir,
+                verification=SimpleNamespace(
+                    soundness_agents=[SimpleNamespace(provider="claude", model="a", label="A") for _ in range(3)],
+                    correspondence_agents=[],
+                ),
+            )
+
+            from lagent_tablets.nl_cache import NLCache
+            nl_cache = NLCache(state_dir / "nl_cache.json")
+            calls: list[dict] = []
+
+            def fake_run_nl_verification(*args, **kwargs):
+                calls.append({
+                    "correspondence_node_names": kwargs.get("correspondence_node_names"),
+                    "soundness_node_names": kwargs.get("soundness_node_names"),
+                    "soundness_target_node": kwargs.get("soundness_target_node"),
+                })
+                if len(calls) == 1:
+                    return [{
+                        "check": "correspondence",
+                        "overall": "APPROVE",
+                        "summary": "ok",
+                        "node_names": ["leaf", "top"],
+                    }]
+                return [{
+                    "check": "nl_proof",
+                    "overall": "REJECT",
+                    "node_names": ["leaf"],
+                    "node_verdicts": [{"node": "leaf", "overall": "REJECT"}],
+                }]
+
+            with patch("lagent_tablets.cycle._run_nl_verification", side_effect=fake_run_nl_verification):
+                results = _run_theorem_stating_verification(
+                    config,
+                    Policy(),
+                    tablet,
+                    state,
+                    cycle=6,
+                    log_dir=repo,
+                    nl_cache=nl_cache,
+                    human_input="",
+                )
+
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls[0]["soundness_node_names"], [])
+            self.assertEqual(calls[1]["correspondence_node_names"], [])
+            self.assertEqual(calls[1]["soundness_node_names"], ["leaf"])
+            self.assertEqual(calls[1]["soundness_target_node"], "leaf")
+            self.assertEqual(state.theorem_soundness_target, "leaf")
+            self.assertEqual(state.theorem_target_edit_mode, "repair")
+            self.assertEqual(
+                [entry["check"] for entry in results],
+                ["correspondence", "nl_proof"],
+            )
+
+    def test_theorem_stating_resume_from_verification_updates_target_and_blockers_before_reviewer_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True, capture_output=True, text=True)
+            state_dir = repo / ".agent-supervisor"
+            state_dir.mkdir()
+            tablet_dir = repo / "Tablet"
+            tablet_dir.mkdir()
+            (tablet_dir / "Preamble.lean").write_text("import Mathlib.Data.Nat.Basic\n", encoding="utf-8")
+            (tablet_dir / "leaf.lean").write_text("theorem leaf : True := by\n  sorry\n", encoding="utf-8")
+            (tablet_dir / "leaf.tex").write_text(
+                "\\begin{lemma}[Leaf]\nTrue.\n\\end{lemma}\n\\begin{proof}\nProof.\n\\end{proof}\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True, text=True)
+
+            state = SupervisorState(
+                cycle=6,
+                phase="theorem_stating",
+                resume_from="verification",
+                open_blockers=[{"node": "leaf", "phase": "correspondence", "reason": "stale"}],
+            )
+            tablet = TabletState(nodes={
+                "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+                "leaf": TabletNode(name="leaf", kind="ordinary", status="open"),
+            })
+            config = SimpleNamespace(
+                repo_path=repo,
+                state_dir=state_dir,
+                worker=SimpleNamespace(provider="codex", model="gpt-5.4"),
+                reviewer=SimpleNamespace(provider="codex", model="gpt-5.4"),
+                verification=SimpleNamespace(
+                    soundness_agents=[],
+                    correspondence_agents=[],
+                ),
+                tmux=SimpleNamespace(session_name="test", burst_user="worker"),
+                startup_timeout_seconds=60.0,
+                workflow=SimpleNamespace(
+                    allowed_import_prefixes=["Mathlib"],
+                    forbidden_keyword_allowlist=[],
+                    approved_axioms_path=None,
+                    paper_tex_path=None,
+                ),
+                goal_file=repo / "GOAL.txt",
+            )
+            config.goal_file.write_text("", encoding="utf-8")
+            captured_reviewer_states: list[SupervisorState] = []
+
+            def fake_build_reviewer_prompt(*args, **kwargs):
+                captured_reviewer_states.append(SupervisorState.from_dict(args[1].to_dict()))
+                return "reviewer prompt"
+
+            def fake_theorem_verification(*args, **kwargs):
+                state.theorem_soundness_target = "leaf"
+                state.theorem_target_edit_mode = "repair"
+                state.theorem_correspondence_blocked = False
+                return [
+                    {"check": "correspondence", "overall": "APPROVE", "summary": "ok", "node_names": ["leaf"]},
+                    {
+                        "check": "nl_proof",
+                        "overall": "REJECT",
+                        "node_names": ["leaf"],
+                        "node_verdicts": [{"node": "leaf", "overall": "REJECT"}],
+                    },
+                ]
+
+            with patch("lagent_tablets.cycle._save_live_viewer_state"), \
+                 patch("lagent_tablets.cycle._save_runtime_tablet"), \
+                 patch("lagent_tablets.cycle._accumulate_verification_usage"), \
+                 patch("lagent_tablets.cycle._apply_verification_to_tablet"), \
+                 patch("lagent_tablets.cycle._run_theorem_stating_verification", side_effect=fake_theorem_verification), \
+                 patch("lagent_tablets.prompts.build_theorem_stating_reviewer_prompt", side_effect=fake_build_reviewer_prompt), \
+                 patch("lagent_tablets.cycle.run_reviewer_burst", return_value=SimpleNamespace(ok=True, transcript_path=None, error="", captured_output="", usage=None)), \
+                 patch(
+                     "lagent_tablets.cycle._accept_validated_artifact",
+                     return_value=({"decision": "CONTINUE", "reason": "keep going", "next_prompt": "", "next_active_node": "", "reset_to_checkpoint": ""}, None),
+                 ), \
+                 patch("lagent_tablets.git_ops.commit_checkpoint"), \
+                 patch("lagent_tablets.chat_history.commit_chat_attempt", return_value=None):
+                outcome = run_theorem_stating_cycle(config, state, tablet, Policy())
+
+            self.assertEqual(outcome.outcome, "PROGRESS")
+            self.assertTrue(captured_reviewer_states)
+            reviewer_state = captured_reviewer_states[-1]
+            self.assertEqual(reviewer_state.theorem_soundness_target, "leaf")
+            self.assertEqual(reviewer_state.open_blockers, [])
+
     def test_validate_theorem_target_repair_changes_only_allows_target_tex(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
@@ -2590,6 +2795,45 @@ class TestTheoremTargetScope(unittest.TestCase):
             for call in mock_fix.call_args_list:
                 self.assertTrue(call.kwargs.get("include_package_builds"))
 
+    def test_theorem_stating_surface_invalid_skips_viewer_refresh(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            state_dir = repo / ".agent-supervisor"
+            state_dir.mkdir()
+            tablet_dir = repo / "Tablet"
+            tablet_dir.mkdir()
+            (tablet_dir / "Preamble.lean").write_text("import Mathlib.Data.Nat.Basic\n", encoding="utf-8")
+
+            state = SupervisorState(cycle=0, phase="theorem_stating")
+            tablet = TabletState(nodes={"Preamble": TabletNode(name="Preamble", kind="preamble", status="closed")})
+            config = SimpleNamespace(
+                repo_path=repo,
+                state_dir=state_dir,
+                worker=SimpleNamespace(provider="codex", model="gpt-5.4"),
+                reviewer=SimpleNamespace(provider="codex", model="gpt-5.4"),
+                verification=SimpleNamespace(soundness_agents=[], correspondence_agents=[]),
+                tmux=SimpleNamespace(session_name="test", burst_user="worker"),
+                startup_timeout_seconds=60.0,
+                workflow=SimpleNamespace(
+                    allowed_import_prefixes=["Mathlib"],
+                    forbidden_keyword_allowlist=[],
+                    approved_axioms_path=None,
+                    paper_tex_path=None,
+                ),
+                goal_file=repo / "GOAL.txt",
+            )
+            config.goal_file.write_text("", encoding="utf-8")
+
+            with patch(
+                "lagent_tablets.health.prepare_supervisor_read_surfaces",
+                return_value=["Tablet/foo.lean: symlinks are not allowed"],
+            ), patch("lagent_tablets.cycle._save_live_viewer_state") as mock_viewer:
+                outcome = run_theorem_stating_cycle(config, state, tablet, Policy())
+
+            self.assertEqual(outcome.outcome, "INVALID")
+            self.assertIn("Supervisor-readable surfaces are invalid", outcome.detail)
+            self.assertEqual(mock_viewer.call_count, 0)
+
     def test_proof_formalization_hard_mode_runs_scoped_deterministic_check(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
@@ -2824,6 +3068,117 @@ class TestTheoremTargetScope(unittest.TestCase):
             self.assertEqual(mock_verify.call_args.args[3], ["helper"])
             self.assertEqual(mock_verify.call_args.kwargs["soundness_node_names"], [])
 
+    def test_proof_formalization_new_paper_statement_registers_provenance_without_joining_coarse_package(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            state_dir = repo / ".agent-supervisor"
+            state_dir.mkdir()
+            tablet_dir = repo / "Tablet"
+            tablet_dir.mkdir()
+            (repo / "paper.tex").write_text(
+                "intro\n\\begin{lemma}\\label{paper-aux}\nTrue.\n\\end{lemma}\n",
+                encoding="utf-8",
+            )
+            (tablet_dir / "Preamble.lean").write_text("import Mathlib.Data.Nat.Basic\n", encoding="utf-8")
+            (tablet_dir / "foo.lean").write_text(
+                "import Tablet.Preamble\n\n-- [TABLET NODE: foo]\n\ntheorem foo : True := by\n  sorry\n",
+                encoding="utf-8",
+            )
+            (tablet_dir / "foo.tex").write_text(
+                "\\begin{theorem}[Foo]\nTrue.\n\\end{theorem}\n\\begin{proof}\nProof.\n\\end{proof}\n",
+                encoding="utf-8",
+            )
+
+            state = SupervisorState(cycle=3, phase="proof_formalization", active_node="foo")
+            tablet = TabletState(
+                active_node="foo",
+                nodes={
+                    "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+                    "foo": TabletNode(
+                        name="foo",
+                        kind="ordinary",
+                        status="open",
+                        difficulty="hard",
+                        coarse=True,
+                        coarse_content_hash="stable-foo",
+                    ),
+                },
+            )
+            config = SimpleNamespace(
+                repo_path=repo,
+                state_dir=state_dir,
+                worker=SimpleNamespace(provider="codex", model="gpt-5.4"),
+                easy_worker=None,
+                hard_worker=None,
+                reviewer=SimpleNamespace(provider="codex", model="gpt-5.4"),
+                tmux=SimpleNamespace(session_name="test", burst_user="worker"),
+                startup_timeout_seconds=60.0,
+                workflow=SimpleNamespace(
+                    allowed_import_prefixes=["Mathlib"],
+                    forbidden_keyword_allowlist=[],
+                    approved_axioms_path=None,
+                ),
+            )
+
+            def fake_worker_burst(*args, **kwargs):
+                (tablet_dir / "paper_aux.lean").write_text(
+                    "import Tablet.Preamble\n\n-- [TABLET NODE: paper_aux]\n\nlemma paper_aux : True := by\n  trivial\n",
+                    encoding="utf-8",
+                )
+                (tablet_dir / "paper_aux.tex").write_text(
+                    "\\begin{lemma}[PaperAux]\nTrue.\n\\end{lemma}\n\\begin{proof}\nProof.\n\\end{proof}\n",
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(ok=True, transcript_path=None, error="", captured_output="", usage=None)
+
+            worker_handoff = {
+                "summary": "created cited paper lemma",
+                "status": "DONE",
+                "new_nodes": ["paper_aux"],
+                "paper_provenance_hints": {
+                    "paper_aux": {"start_line": 2, "end_line": 4, "tex_label": "paper-aux"}
+                },
+            }
+            reviewer_decision = {
+                "decision": "CONTINUE",
+                "reason": "continue",
+                "next_prompt": "Continue",
+                "next_active_node": "foo",
+                "difficulty_assignments": {},
+                "elevate_to_hard": [],
+                "proof_edit_mode": "local",
+                "paper_focus_ranges": [],
+            }
+
+            with patch("lagent_tablets.health.fix_lake_permissions"), \
+                 patch("lagent_tablets.cycle._ensure_lake_build"), \
+                 patch("lagent_tablets.cycle.setup_permissions"), \
+                 patch("lagent_tablets.cycle.build_worker_prompt", return_value="prompt"), \
+                 patch("lagent_tablets.cycle.build_reviewer_prompt", return_value="reviewer"), \
+                 patch("lagent_tablets.cycle.run_worker_burst", side_effect=fake_worker_burst), \
+                 patch("lagent_tablets.cycle.run_reviewer_burst", return_value=SimpleNamespace(ok=True, transcript_path=None, error="", captured_output="", usage=None)), \
+                 patch("lagent_tablets.cycle._accept_validated_artifact", side_effect=[
+                     (worker_handoff, None),
+                     (reviewer_decision, None),
+                 ]), \
+                 patch("lagent_tablets.cycle.run_check_tablet", return_value={"errors": []}), \
+                 patch("lagent_tablets.cycle.check_proof_hard_scope", return_value={"ok": True, "errors": [], "warnings": [], "changes": {"created": ["paper_aux.lean", "paper_aux.tex"], "modified": [], "deleted": []}}), \
+                 patch("lagent_tablets.cycle.validate_worker_cycle_v2", return_value=CycleOutcome(outcome="PROGRESS", detail="created paper_aux", nodes_closed=["paper_aux"], nodes_created=["paper_aux"])), \
+                 patch("lagent_tablets.cycle._run_scoped_tablet_check", return_value=None), \
+                 patch("lagent_tablets.cycle._run_nl_verification", return_value=[]), \
+                 patch("lagent_tablets.git_ops.commit_checkpoint"), \
+                 patch("lagent_tablets.git_ops.commit_cycle"):
+                outcome = run_cycle(config, state, tablet, Policy())
+
+            self.assertEqual(outcome.outcome, "PROGRESS")
+            self.assertIn("paper_aux", tablet.nodes)
+            self.assertEqual(
+                tablet.nodes["paper_aux"].paper_provenance,
+                {"start_line": 2, "end_line": 4, "tex_label": "paper-aux"},
+            )
+            self.assertEqual(tablet.nodes["paper_aux"].kind, "ordinary")
+            self.assertFalse(tablet.nodes["paper_aux"].coarse)
+
     def test_proof_formalization_runtime_permission_repairs_include_package_builds(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
@@ -2886,6 +3241,57 @@ class TestTheoremTargetScope(unittest.TestCase):
             self.assertTrue(mock_fix.call_args_list)
             for call in mock_fix.call_args_list:
                 self.assertTrue(call.kwargs.get("include_package_builds"))
+
+    def test_proof_formalization_surface_invalid_skips_viewer_refresh(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            state_dir = repo / ".agent-supervisor"
+            state_dir.mkdir()
+            tablet_dir = repo / "Tablet"
+            tablet_dir.mkdir()
+            (tablet_dir / "Preamble.lean").write_text("import Mathlib.Data.Nat.Basic\n", encoding="utf-8")
+            (tablet_dir / "foo.lean").write_text(
+                "import Tablet.Preamble\n\n-- [TABLET NODE: foo]\n\nlemma foo : True := by\n  sorry\n",
+                encoding="utf-8",
+            )
+            (tablet_dir / "foo.tex").write_text(
+                "\\begin{lemma}[Foo]\nTrue.\n\\end{lemma}\n\\begin{proof}\nProof.\n\\end{proof}\n",
+                encoding="utf-8",
+            )
+
+            state = SupervisorState(cycle=3, phase="proof_formalization", active_node="foo")
+            tablet = TabletState(
+                active_node="foo",
+                nodes={
+                    "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+                    "foo": TabletNode(name="foo", kind="helper_lemma", status="open", difficulty="hard"),
+                },
+            )
+            config = SimpleNamespace(
+                repo_path=repo,
+                state_dir=state_dir,
+                worker=SimpleNamespace(provider="codex", model="gpt-5.4"),
+                easy_worker=None,
+                hard_worker=None,
+                reviewer=SimpleNamespace(provider="codex", model="gpt-5.4"),
+                tmux=SimpleNamespace(session_name="test", burst_user="worker"),
+                startup_timeout_seconds=60.0,
+                workflow=SimpleNamespace(
+                    allowed_import_prefixes=["Mathlib"],
+                    forbidden_keyword_allowlist=[],
+                    approved_axioms_path=None,
+                ),
+            )
+
+            with patch(
+                "lagent_tablets.health.prepare_supervisor_read_surfaces",
+                return_value=["Tablet/foo.lean: supervisor cannot read file"],
+            ), patch("lagent_tablets.cycle._save_live_viewer_state") as mock_viewer:
+                outcome = run_cycle(config, state, tablet, Policy())
+
+            self.assertEqual(outcome.outcome, "INVALID")
+            self.assertIn("Supervisor-readable surfaces are invalid", outcome.detail)
+            self.assertEqual(mock_viewer.call_count, 0)
 
     def test_proof_formalization_coarse_restructure_runs_coarse_wide_sweep_and_promotes_new_nodes(self):
         with tempfile.TemporaryDirectory() as tmp:

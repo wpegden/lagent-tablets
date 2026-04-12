@@ -16,20 +16,22 @@ You may:
 - Edit other existing node files only when those nodes are inside the authorized impact region above
 - Change accepted coarse-node statements or `.tex` files when that is genuinely necessary for the same target-centered restructure
 - Add or remove `import Tablet.*` or `import Mathlib.*` lines in files inside the authorized impact region
-- Add `import Mathlib.*` lines to `Tablet/Preamble.lean` (additions only, no removals)
-- Create new helper nodes: write both `Tablet/{{name}}.lean` and `Tablet/{{name}}.tex` files
+- Edit import lines in `Tablet/Preamble.lean` as needed
+- Create new nodes inside the authorized region when they genuinely improve the coarse package, following the shared node spec for their chosen statement environments
 - Update the STRATEGY comment block with your approach, blockers, and failed attempts
 
 You must NOT:
 - Edit existing nodes outside the authorized impact region
 - Treat this as a general whole-tablet refactor
 - Add `axiom`, `constant`, `unsafe`, `native_decide`, `opaque`, or other forbidden keywords
-- Use `sorry` in definitions -- only in theorem/lemma proof bodies
+- Use `sorry` in definitions -- only in proof-bearing theorem-like declaration bodies (`helper`, `lemma`, `theorem`, `corollary`)
 - Use `import Mathlib` -- only specific submodule imports
 
 This mode has a high bar. Use it only because the accepted coarse theorem-stating package itself must change. If the issue can be solved by adding non-coarse helpers beneath the existing coarse package, do that in ordinary proof mode instead.
 
 After the usual deterministic and local verification checks, the supervisor will run a coarse-wide correspondence / paper-faithfulness sweep over the resulting coarse package before accepting this cycle. New nodes you create during a successful coarse-restructure will become part of that refreshed coarse package.
+
+If you create new paper-anchored `theorem`/`lemma`/`corollary` nodes in this mode, or new `definition` nodes that are intended to cover configured `main_result_targets`, include structured `paper_provenance_hints` in the handoff. Treat those nodes as part of the coarse-package redesign, not as disposable helper churn.
 
 If you believe even this broader coarse-restructure is insufficient, return `status: STUCK` and explain what still blocks progress.
 
@@ -43,7 +45,11 @@ WHEN DONE -- write the raw handoff JSON to `{raw_output_path}`:
 {{
   "summary": "brief description of what you changed in the coarse package",
   "status": "NOT_STUCK | STUCK | DONE | NEED_INPUT",
-  "new_nodes": ["list", "of", "new", "node", "names"]
+  "new_nodes": ["list", "of", "new", "node", "names"],
+  "paper_provenance_hints": {{
+    "paper_result_node": {{"start_line": 130, "end_line": 148, "tex_label": "sum"}}
+  }},
+  "feedback": "optional short note if the task/setup seems impossible, inconsistent, or poorly supported"
 }}
 Then run:
   python3 {check_script} worker-handoff {raw_output_path} --phase proof_formalization --repo {repo_path}

@@ -22,7 +22,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from lagent_tablets.config import (
     Config,
@@ -69,6 +69,27 @@ from lagent_tablets.project_paths import (
     project_viewer_dir,
 )
 from lagent_tablets.check import write_scripts
+
+
+def _config_main_result_targets(config: Config) -> list[dict[str, Any]]:
+    workflow = getattr(config, "workflow", None)
+    raw = getattr(workflow, "main_result_targets", None) if workflow is not None else None
+    if raw in (None, []):
+        raw = getattr(workflow, "main_result_labels", []) if workflow is not None else []
+    if not isinstance(raw, list):
+        return []
+    from lagent_tablets.tablet import main_result_target_key, normalize_main_result_target
+
+    seen: set[str] = set()
+    targets: list[dict[str, Any]] = []
+    for raw_target in raw:
+        target = normalize_main_result_target(raw_target)
+        key = main_result_target_key(target)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        targets.append(target)
+    return targets
 
 
 def ensure_directories(config: Config) -> None:
@@ -161,53 +182,124 @@ def _check_restart_request(config: Config) -> bool:
     return False
 
 
-def _capture_trusted_main_result_hashes(config: Config, tablet: TabletState) -> dict[str, str]:
-    """Snapshot correspondence fingerprints for currently trusted main results."""
+def _capture_trusted_main_result_target_state(
+    config: Config,
+    tablet: TabletState,
+) -> dict[str, dict[str, object]]:
+    """Snapshot trusted main-result coverage keyed by configured targets."""
     from lagent_tablets.nl_cache import NLCache
+    from lagent_tablets.tablet import main_result_target_coverage, main_result_target_key
 
+    targets = _config_main_result_targets(config)
+    if not targets:
+        return {}
+
+    coverage = main_result_target_coverage(tablet, config.repo_path, targets)
     cache = NLCache(config.state_dir / "nl_cache.json")
-    trusted: dict[str, str] = {}
-    for name, node in sorted(tablet.nodes.items()):
-        if node.kind != "paper_main_result":
+    trusted: dict[str, dict[str, object]] = {}
+    for target in targets:
+        key = main_result_target_key(target)
+        entry = coverage.get(key, {"nodes": []})
+        nodes = sorted(str(name) for name in entry.get("nodes", []))
+        if not nodes:
             continue
-        fp = cache.correspondence_fingerprint(config.repo_path, name)
-        if fp:
-            trusted[name] = fp
+        parts = []
+        for name in nodes:
+            fp = cache.correspondence_fingerprint(config.repo_path, name)
+            parts.append({"node": name, "fingerprint": fp or ""})
+        fingerprint = ""
+        if parts:
+            import hashlib
+
+            fingerprint = hashlib.sha256(
+                json.dumps(parts, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            ).hexdigest()
+        trusted[key] = {
+            "target": dict(target),
+            "nodes": nodes,
+            "fingerprint": fingerprint,
+        }
     return trusted
 
 
-def _trusted_main_result_review_issues(
+def _trusted_main_result_target_review_issues(
     config: Config,
     state: SupervisorState,
     tablet: TabletState,
 ) -> list[str]:
-    """Return paper main results whose correspondence drifted after human review."""
-    trusted = dict(state.trusted_main_result_hashes)
+    """Return configured main-result targets whose trusted state drifted."""
+    from lagent_tablets.nl_cache import NLCache
+    from lagent_tablets.tablet import (
+        format_main_result_target,
+        main_result_target_coverage,
+        main_result_target_issues,
+        main_result_target_key,
+    )
+
+    targets = _config_main_result_targets(config)
+    trusted = dict(state.trusted_main_result_target_state)
     if not trusted:
         return []
+    if not targets and not trusted:
+        return []
 
-    from lagent_tablets.nl_cache import NLCache
-
-    cache = NLCache(config.state_dir / "nl_cache.json")
-    current_main_results = {
-        name for name, node in tablet.nodes.items()
-        if node.kind == "paper_main_result"
+    configured_keys = [main_result_target_key(target) for target in targets if main_result_target_key(target)]
+    configured_by_key = {
+        main_result_target_key(target): target
+        for target in targets
+        if main_result_target_key(target)
     }
     issues: list[str] = []
+    if set(trusted) != set(configured_keys):
+        removed = sorted(set(trusted) - set(configured_keys))
+        added = sorted(set(configured_keys) - set(trusted))
+        for key in removed:
+            target_text = format_main_result_target(trusted.get(key, {}).get("target", {}))
+            issues.append(f"{target_text}: removed from configured main_result_targets since the last human review")
+        for key in added:
+            target_text = format_main_result_target(configured_by_key.get(key, {}))
+            issues.append(f"{target_text}: newly added to configured main_result_targets since the last human review")
 
-    removed = sorted(set(trusted) - current_main_results)
-    issues.extend(f"{name}: removed from the main-result set after human review" for name in removed)
+    coverage = main_result_target_coverage(tablet, config.repo_path, targets)
+    for entry in main_result_target_issues(tablet, config.repo_path, targets):
+        issues.append(str(entry.get("reason", "")).strip())
 
-    added = sorted(current_main_results - set(trusted))
-    issues.extend(f"{name}: newly classified as a paper main result after human review" for name in added)
-
-    for name in sorted(current_main_results & set(trusted)):
-        current_fp = cache.correspondence_fingerprint(config.repo_path, name)
-        if not current_fp:
-            issues.append(f"{name}: current correspondence fingerprint could not be computed")
+    cache = NLCache(config.state_dir / "nl_cache.json")
+    for target in targets:
+        key = main_result_target_key(target)
+        if key not in trusted:
             continue
-        if current_fp != trusted[name]:
-            issues.append(f"{name}: correspondence changed since the last human-reviewed package")
+        target_text = format_main_result_target(target)
+        stored_entry = trusted.get(key)
+        if not isinstance(stored_entry, dict):
+            issues.append(f"{target_text}: stored trusted main-result snapshot is malformed")
+            continue
+        stored_nodes = sorted(str(name) for name in stored_entry.get("nodes", []) if str(name).strip())
+        current_nodes = sorted(str(name) for name in coverage.get(key, {}).get("nodes", []))
+        if stored_nodes != current_nodes:
+            issues.append(
+                f"{target_text}: covering node set changed since the last human-reviewed package "
+                f"(was {stored_nodes or ['(none)']}, now {current_nodes or ['(none)']})"
+            )
+            continue
+        parts = []
+        for name in current_nodes:
+            current_fp = cache.correspondence_fingerprint(config.repo_path, name)
+            if not current_fp:
+                issues.append(f"{target_text}: current correspondence fingerprint could not be computed for `{name}`")
+                parts = []
+                break
+            parts.append({"node": name, "fingerprint": current_fp})
+        if not parts:
+            continue
+        import hashlib
+
+        current_combined = hashlib.sha256(
+            json.dumps(parts, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        stored_fingerprint = str(stored_entry.get("fingerprint", "") or "").strip()
+        if current_combined != stored_fingerprint:
+            issues.append(f"{target_text}: correspondence changed since the last human-reviewed target package")
 
     return issues
 
@@ -252,8 +344,8 @@ def _process_human_approval_signal(
     if next_phase is not None:
         print(f"Human approved. Advancing phase: {state.phase} -> {next_phase}")
         if state.phase == "theorem_stating" and next_phase == "proof_formalization":
-            state.trusted_main_result_hashes = _capture_trusted_main_result_hashes(config, tablet)
-            print(f"  Trusted paper main results: {len(state.trusted_main_result_hashes)}")
+            state.trusted_main_result_target_state = _capture_trusted_main_result_target_state(config, tablet)
+            print(f"  Trusted main-result targets: {len(state.trusted_main_result_target_state)}")
             freeze_current_coarse_package(tablet, config.repo_path, cycle=state.cycle)
             print(f"  Frozen coarse package: {len([n for n in tablet.nodes.values() if n.coarse])} nodes")
         state.phase = next_phase
@@ -265,16 +357,16 @@ def _process_human_approval_signal(
     if (
         isinstance(state.last_review, dict)
         and state.last_review.get("decision") == "NEED_INPUT"
-        and state.last_review.get("human_gate") == "paper_main_result_correspondence"
+        and state.last_review.get("human_gate") in {"main_result_target_correspondence", "main_result_label_correspondence"}
     ):
-        state.trusted_main_result_hashes = _capture_trusted_main_result_hashes(config, tablet)
+        state.trusted_main_result_target_state = _capture_trusted_main_result_target_state(config, tablet)
         state.awaiting_human_input = False
         state.last_review = {
             "decision": "CONTINUE",
-            "reason": "Human re-approved the paper main results after correspondence drift.",
-            "next_prompt": "Continue from the current phase with the newly re-trusted paper main results.",
+            "reason": "Human re-approved the configured main-result targets after correspondence drift.",
+            "next_prompt": "Continue from the current phase with the newly re-trusted main-result target package.",
         }
-        print(f"Human approved updated paper main results. Trusted set: {len(state.trusted_main_result_hashes)}")
+        print(f"Human approved updated main-result targets. Trusted set: {len(state.trusted_main_result_target_state)}")
         return True
 
     state.awaiting_human_input = False
@@ -287,27 +379,27 @@ def _process_human_approval_signal(
     return True
 
 
-def _apply_trusted_main_result_review_gate(
+def _apply_trusted_main_result_target_review_gate(
     config: Config,
     state: SupervisorState,
     tablet: TabletState,
 ) -> bool:
-    """Require renewed human review when trusted paper main results drift."""
-    issues = _trusted_main_result_review_issues(config, state, tablet)
+    """Require renewed human review when trusted main-result targets drift."""
+    issues = _trusted_main_result_target_review_issues(config, state, tablet)
     if not issues:
         return False
     state.awaiting_human_input = True
     state.last_review = {
         "decision": "NEED_INPUT",
-        "human_gate": "paper_main_result_correspondence",
-        "reason": "Human-reviewed paper main results lost correspondence and must be reviewed again.",
+        "human_gate": "main_result_target_correspondence",
+        "reason": "Human-reviewed main-result targets changed and must be reviewed again.",
         "next_prompt": (
-            "Review the changed paper main results. Approve to re-trust the current package, "
+            "Review the changed configured main-result targets. Approve to re-trust the current package, "
             "or provide human feedback describing what must be restored."
         ),
         "issues": issues,
     }
-    print("Trusted paper-main-result review gate opened:")
+    print("Trusted main-result review gate opened:")
     for issue in issues:
         print(f"  - {issue}")
     write_live_viewer_state(
@@ -320,6 +412,76 @@ def _apply_trusted_main_result_review_gate(
     )
     save_state(state_path(config), state)
     return True
+
+
+def _capture_trusted_paper_statement_hashes(config: Config, tablet: TabletState) -> dict[str, str]:
+    """Backward-compatible projection to label->fingerprint snapshots."""
+    return {
+        label: str(entry.get("fingerprint", "") or "")
+        for label, entry in _capture_trusted_main_result_target_state(config, tablet).items()
+    }
+
+
+def _trusted_main_result_review_issues(
+    config: Config,
+    state: SupervisorState,
+    tablet: TabletState,
+) -> list[str]:
+    """Backward-compatible alias."""
+    return _trusted_main_result_target_review_issues(config, state, tablet)
+
+
+def _trusted_paper_statement_review_issues(
+    config: Config,
+    state: SupervisorState,
+    tablet: TabletState,
+) -> list[str]:
+    """Backward-compatible alias."""
+    return _trusted_main_result_target_review_issues(config, state, tablet)
+
+
+def _apply_trusted_main_result_review_gate(
+    config: Config,
+    state: SupervisorState,
+    tablet: TabletState,
+) -> bool:
+    """Backward-compatible alias."""
+    return _apply_trusted_main_result_target_review_gate(config, state, tablet)
+
+
+def _apply_trusted_paper_statement_review_gate(
+    config: Config,
+    state: SupervisorState,
+    tablet: TabletState,
+) -> bool:
+    """Backward-compatible alias."""
+    return _apply_trusted_main_result_target_review_gate(config, state, tablet)
+
+
+def _capture_trusted_main_result_label_state(
+    config: Config,
+    tablet: TabletState,
+) -> dict[str, dict[str, object]]:
+    """Backward-compatible alias."""
+    return _capture_trusted_main_result_target_state(config, tablet)
+
+
+def _trusted_main_result_label_review_issues(
+    config: Config,
+    state: SupervisorState,
+    tablet: TabletState,
+) -> list[str]:
+    """Backward-compatible alias."""
+    return _trusted_main_result_target_review_issues(config, state, tablet)
+
+
+def _apply_trusted_main_result_label_review_gate(
+    config: Config,
+    state: SupervisorState,
+    tablet: TabletState,
+) -> bool:
+    """Backward-compatible alias."""
+    return _apply_trusted_main_result_target_review_gate(config, state, tablet)
 
 
 def _restart_supervisor_process(argv: list[str]) -> None:
@@ -519,10 +681,10 @@ def main(argv: Optional[list] = None) -> int:
 
     if args.preview_next_cycle:
         preview = preview_next_cycle(config, state, tablet, policy)
-        trusted_issues = _trusted_main_result_review_issues(config, state, tablet)
+        trusted_issues = _trusted_main_result_label_review_issues(config, state, tablet)
         if trusted_issues:
             preview["preflight_error"] = (
-                "Human-reviewed paper main results lost correspondence and require renewed human review."
+                "Human-reviewed configured main-result targets changed and require renewed human review."
             )
             preview["trusted_main_result_issues"] = trusted_issues
         summary = {
@@ -634,7 +796,7 @@ def main(argv: Optional[list] = None) -> int:
                 burst_user=config.tmux.burst_user,
                 include_package_builds=True,
             )
-            _apply_trusted_main_result_review_gate(config, state, tablet)
+            _apply_trusted_main_result_label_review_gate(config, state, tablet)
 
             if remaining_cycles is not None:
                 remaining_cycles -= 1
@@ -705,7 +867,7 @@ def main(argv: Optional[list] = None) -> int:
         health.on_cycle_outcome(state.cycle, outcome.outcome, outcome.detail)
 
         previous_outcome = outcome
-        _apply_trusted_main_result_review_gate(config, state, tablet)
+        _apply_trusted_main_result_label_review_gate(config, state, tablet)
 
         # Fix .lake permissions after each cycle
         fix_lake_permissions(

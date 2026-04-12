@@ -36,9 +36,9 @@ RESTRUCTURE EXPECTATIONS:
 
 TABLET / NODE RULES:
 - Every node must still have matching `.lean` and `.tex` files
-- Every definition must be concrete: no `opaque`, no `axiom`, no `sorry` in definitions
+- Every definition must have an explicit body: no `opaque`, no `axiom`, no `sorry` in definitions
 - Prefer existing Mathlib definitions over project wrappers whenever feasible
-- Do not use theorem/lemma/corollary nodes as disguised definitions. If you are introducing a paper-facing concept, make it an actual definition node.
+- Do not use proof-bearing nodes (`helper`, `lemma`, `theorem`, `corollary`) as disguised definitions. If you are introducing a paper-facing concept, make it an actual definition node.
 - Use `\noderef{{name}}` to cite other nodes in NL proofs
 - The paper's detail level is a floor, not a ceiling
 
@@ -49,13 +49,16 @@ MANDATORY BEFORE SUBMITTING:
 
 WHEN DONE:
 Write the raw handoff JSON to `{raw_output_path}`:
-{{
-  "summary": "brief description of the restructure or proof improvement",
-  "status": "NOT_STUCK | STUCK | DONE | NEED_INPUT",
-  "new_nodes": ["list any genuinely new prerequisite nodes you added"],
-  "difficulty_hints": {{"new_node_name": "easy | hard"}},
-  "kind_hints": {{"new_node_name": "paper_intermediate | paper_main_result"}}
-}}
+	{{
+	  "summary": "brief description of the restructure or proof improvement",
+	  "status": "NOT_STUCK | STUCK | DONE | NEED_INPUT",
+	  "new_nodes": ["list any genuinely new prerequisite nodes you added"],
+	  "difficulty_hints": {{"new_node_name": "easy | hard"}},
+	  "paper_provenance_hints": {{
+	    "new_paper_node": {{"start_line": 130, "end_line": 148, "tex_label": "sum"}}
+	  }},
+	  "feedback": "optional short note if the task/setup seems impossible, inconsistent, or poorly supported"
+	}}
 
 Then run:
   python3 {check_script} worker-handoff {raw_output_path} --phase theorem_stating --repo {repo_path}

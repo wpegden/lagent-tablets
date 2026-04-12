@@ -20,17 +20,22 @@ from lagent_tablets.tablet import (
     extract_tablet_imports,
     find_name_conflicts,
     find_orphan_nodes,
+    find_unsupported_nodes,
     generate_header_tex,
     generate_index_md,
     generate_node_lean,
     generate_readme_md,
     has_sorry,
+    infer_main_result_targets_from_paper,
     is_valid_node_name,
     mask_comments_and_strings,
+    main_result_target_issues,
     node_lean_path,
     node_tex_path,
+    main_result_label_issues,
     regenerate_support_files,
     register_new_node,
+    resolve_main_result_targets,
     scan_forbidden_keywords,
     validate_imports,
     validate_preamble_diff,
@@ -198,6 +203,11 @@ class TestTexValidation(unittest.TestCase):
         errors = validate_tex_format(tex)
         self.assertEqual(errors, [])
 
+    def test_valid_regular_helper_node(self):
+        tex = "\\begin{helper}[Foo]\nStatement\n\\end{helper}\n\n\\begin{proof}\nProof text\n\\end{proof}\n"
+        errors = validate_tex_format(tex)
+        self.assertEqual(errors, [])
+
     def test_missing_statement(self):
         tex = "\\begin{proof}\nProof text\n\\end{proof}\n"
         errors = validate_tex_format(tex)
@@ -275,53 +285,286 @@ class TestImportClosure(unittest.TestCase):
         self.assertEqual(closure, set())
 
 
-class TestOrphanDetection(unittest.TestCase):
+class TestTargetSupportClosure(unittest.TestCase):
 
-    def test_no_orphans(self):
+    def test_target_covering_leaf_is_supported(self):
         repo = Path(tempfile.mkdtemp())
         tdir = repo / "Tablet"
         tdir.mkdir()
         (tdir / "Preamble.lean").write_text("import Mathlib.X\n")
+        (tdir / "Preamble.tex").write_text("\\begin{proposition}Imports.\\end{proposition}\n")
         (tdir / "helper.lean").write_text("import Tablet.Preamble\ntheorem helper : True := sorry\n")
+        (tdir / "helper.tex").write_text("\\begin{helper}\nTrue.\n\\end{helper}\n\\begin{proof}\nProof.\n\\end{proof}\n")
         (tdir / "main_thm.lean").write_text("import Tablet.helper\ntheorem main_thm : True := sorry\n")
+        (tdir / "main_thm.tex").write_text("\\begin{theorem}\nTrue.\n\\end{theorem}\n\\begin{proof}\nProof.\n\\end{proof}\n")
 
         tablet = TabletState(nodes={
             "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
             "helper": TabletNode(name="helper", kind="helper_lemma", status="open"),
-            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open"),
+            "main_thm": TabletNode(
+                name="main_thm",
+                kind="ordinary",
+                status="open",
+                paper_provenance={"start_line": 10, "end_line": 12, "tex_label": "main"},
+            ),
         })
-        orphans = find_orphan_nodes(tablet, repo)
-        self.assertEqual(orphans, [])
+        unsupported = find_unsupported_nodes(tablet, repo, ["main"])
+        self.assertEqual(unsupported, [])
 
-    def test_orphan_detected(self):
+    def test_unsupported_helper_outside_target_closure_is_flagged(self):
         repo = Path(tempfile.mkdtemp())
         tdir = repo / "Tablet"
         tdir.mkdir()
         (tdir / "Preamble.lean").write_text("import Mathlib.X\n")
+        (tdir / "Preamble.tex").write_text("\\begin{proposition}Imports.\\end{proposition}\n")
         (tdir / "orphan.lean").write_text("import Tablet.Preamble\ntheorem orphan : True := sorry\n")
+        (tdir / "orphan.tex").write_text("\\begin{helper}\nTrue.\n\\end{helper}\n\\begin{proof}\nProof.\n\\end{proof}\n")
         (tdir / "main_thm.lean").write_text("import Tablet.Preamble\ntheorem main_thm : True := sorry\n")
+        (tdir / "main_thm.tex").write_text("\\begin{theorem}\nTrue.\n\\end{theorem}\n\\begin{proof}\nProof.\n\\end{proof}\n")
 
         tablet = TabletState(nodes={
             "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
             "orphan": TabletNode(name="orphan", kind="helper_lemma", status="open"),
-            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open"),
+            "main_thm": TabletNode(
+                name="main_thm",
+                kind="ordinary",
+                status="open",
+                paper_provenance={"start_line": 10, "end_line": 12, "tex_label": "main"},
+            ),
         })
-        orphans = find_orphan_nodes(tablet, repo)
-        self.assertEqual(orphans, ["orphan"])
+        unsupported = find_unsupported_nodes(tablet, repo, ["main"])
+        self.assertEqual(unsupported, ["orphan"])
 
-    def test_paper_main_result_not_orphan(self):
+    def test_target_pruning_is_suspended_until_every_target_is_covered(self):
         repo = Path(tempfile.mkdtemp())
         tdir = repo / "Tablet"
         tdir.mkdir()
         (tdir / "Preamble.lean").write_text("import Mathlib.X\n")
+        (tdir / "Preamble.tex").write_text("\\begin{proposition}Imports.\\end{proposition}\n")
         (tdir / "main_thm.lean").write_text("import Tablet.Preamble\ntheorem main_thm : True := sorry\n")
+        (tdir / "main_thm.tex").write_text("\\begin{theorem}\nTrue.\n\\end{theorem}\n\\begin{proof}\nProof.\n\\end{proof}\n")
 
         tablet = TabletState(nodes={
             "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
-            "main_thm": TabletNode(name="main_thm", kind="paper_main_result", status="open"),
+            "main_thm": TabletNode(
+                name="main_thm",
+                kind="ordinary",
+                status="open",
+                paper_provenance={"start_line": 10, "end_line": 12, "tex_label": "main"},
+            ),
+        })
+        unsupported = find_unsupported_nodes(tablet, repo, ["main", "missing_target"])
+        self.assertEqual(unsupported, [])
+
+    def test_non_target_leaf_theorem_is_not_protected_by_env(self):
+        repo = Path(tempfile.mkdtemp())
+        tdir = repo / "Tablet"
+        tdir.mkdir()
+        (tdir / "Preamble.lean").write_text("import Mathlib.X\n")
+        (tdir / "main_target.lean").write_text("import Tablet.Preamble\ntheorem main_target : True := sorry\n")
+        (tdir / "main_target.tex").write_text(
+            "\\begin{theorem}\nTrue.\n\\end{theorem}\n\\begin{proof}\nProof.\n\\end{proof}\n"
+        )
+        (tdir / "leaf_thm.lean").write_text("import Tablet.Preamble\ntheorem leaf_thm : True := sorry\n")
+        (tdir / "leaf_thm.tex").write_text(
+            "\\begin{theorem}\nTrue.\n\\end{theorem}\n\\begin{proof}\nProof.\n\\end{proof}\n"
+        )
+
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_target": TabletNode(
+                name="main_target",
+                kind="ordinary",
+                status="open",
+                paper_provenance={"start_line": 1, "end_line": 3, "tex_label": "main"},
+            ),
+            "leaf_thm": TabletNode(name="leaf_thm", kind="ordinary", status="open"),
+        })
+        unsupported = find_unsupported_nodes(tablet, repo, ["main"])
+        self.assertEqual(unsupported, ["leaf_thm"])
+
+    def test_helper_cannot_cover_main_result_label(self):
+        repo = Path(tempfile.mkdtemp())
+        tdir = repo / "Tablet"
+        tdir.mkdir()
+        (tdir / "Preamble.lean").write_text("import Mathlib.X\n")
+        (tdir / "main_helper.lean").write_text("import Tablet.Preamble\ntheorem main_helper : True := sorry\n")
+        (tdir / "main_helper.tex").write_text(
+            "\\begin{helper}\nTrue.\n\\end{helper}\n\\begin{proof}\nProof.\n\\end{proof}\n"
+        )
+
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main_helper": TabletNode(
+                name="main_helper",
+                kind="ordinary",
+                status="open",
+                paper_provenance={"start_line": 10, "end_line": 12, "tex_label": "main"},
+            ),
+        })
+        issues = main_result_label_issues(tablet, repo, ["main"])
+        self.assertEqual(
+            issues,
+            [
+                {
+                    "label": "main",
+                    "kind": "helper_forbidden",
+                    "nodes": ["main_helper"],
+                    "reason": "Configured main-result label `main` is attached to helper node(s): main_helper.",
+                },
+                {
+                    "label": "main",
+                    "kind": "missing",
+                    "nodes": [],
+                    "reason": "Configured main-result label `main` is not covered by any non-helper node.",
+                },
+            ],
+        )
+
+    def test_find_orphan_nodes_is_now_plain_leaf_detection(self):
+        repo = Path(tempfile.mkdtemp())
+        tdir = repo / "Tablet"
+        tdir.mkdir()
+        (tdir / "Preamble.lean").write_text("import Mathlib.X\n")
+        (tdir / "Preamble.tex").write_text("\\begin{proposition}Imports.\\end{proposition}\n")
+        (tdir / "helper.lean").write_text("import Tablet.Preamble\ntheorem helper : True := sorry\n")
+        (tdir / "helper.tex").write_text(
+            "\\begin{helper}\nTrue.\n\\end{helper}\n\\begin{proof}\nProof.\n\\end{proof}\n"
+        )
+
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "helper": TabletNode(name="helper", kind="ordinary", status="open"),
+            "main_thm": TabletNode(name="main_thm", kind="ordinary", status="open"),
         })
         orphans = find_orphan_nodes(tablet, repo)
-        self.assertEqual(orphans, [])
+        self.assertEqual(orphans, ["helper", "main_thm"])
+
+
+class TestMainResultTargets(unittest.TestCase):
+
+    def test_infers_targets_from_labeled_and_unlabeled_paper_statements(self):
+        repo = Path(tempfile.mkdtemp())
+        paper = repo / "paper.tex"
+        paper.write_text(
+            "Intro\n"
+            "\\begin{theorem}\\label{main}\nA.\n\\end{theorem}\n"
+            "Middle\n"
+            "\\begin{corollary}\nB.\n\\end{corollary}\n",
+            encoding="utf-8",
+        )
+
+        targets = infer_main_result_targets_from_paper(paper)
+        self.assertEqual(
+            targets,
+            [
+                {"start_line": 2, "end_line": 4, "tex_label": "main"},
+                {"start_line": 6, "end_line": 8},
+            ],
+        )
+
+    def test_ignores_theorem_blocks_in_tex_preamble_macros(self):
+        repo = Path(tempfile.mkdtemp())
+        paper = repo / "paper.tex"
+        paper.write_text(
+            "\\documentclass{amsart}\n"
+            "\\newenvironment{thmnum}[1]{\n"
+            "  \\setcounter{thmtemp}{\\value{theorem}}\n"
+            "  \\setcounter{theorem}{#1}\n"
+            "  \\addtocounter{theorem}{-1}\n"
+            "  \\begin{theorem}\n"
+            "}{\n"
+            "  \\end{theorem}\n"
+            "}\n"
+            "\\begin{document}\n"
+            "\\begin{theorem}\\label{main}\n"
+            "A.\n"
+            "\\end{theorem}\n"
+            "\\begin{corollary}\n"
+            "B.\n"
+            "\\end{corollary}\n"
+            "\\end{document}\n",
+            encoding="utf-8",
+        )
+
+        targets = infer_main_result_targets_from_paper(paper)
+        self.assertEqual(
+            targets,
+            [
+                {"start_line": 11, "end_line": 13, "tex_label": "main"},
+                {"start_line": 14, "end_line": 16},
+            ],
+        )
+
+    def test_ignores_commented_out_statements_in_document_body(self):
+        repo = Path(tempfile.mkdtemp())
+        paper = repo / "paper.tex"
+        paper.write_text(
+            "\\begin{document}\n"
+            "%\\begin{theorem}\\label{ghost}\n"
+            "% Ghost.\n"
+            "%\\end{theorem}\n"
+            "\\begin{theorem}\\label{main}\n"
+            "A.\n"
+            "\\end{theorem}\n"
+            "\\end{document}\n",
+            encoding="utf-8",
+        )
+
+        targets = infer_main_result_targets_from_paper(paper)
+        self.assertEqual(
+            targets,
+            [
+                {"start_line": 5, "end_line": 7, "tex_label": "main"},
+            ],
+        )
+
+    def test_resolve_main_result_targets_enriches_labels_with_line_ranges(self):
+        repo = Path(tempfile.mkdtemp())
+        paper = repo / "paper.tex"
+        paper.write_text(
+            "\\begin{theorem}\\label{main}\nA.\n\\end{theorem}\n",
+            encoding="utf-8",
+        )
+
+        targets = resolve_main_result_targets(
+            paper_path=paper,
+            raw_labels=["main"],
+        )
+        self.assertEqual(
+            targets,
+            [{"start_line": 1, "end_line": 3, "tex_label": "main"}],
+        )
+
+    def test_line_range_target_can_be_covered_without_tex_label(self):
+        repo = Path(tempfile.mkdtemp())
+        tdir = repo / "Tablet"
+        tdir.mkdir()
+        (tdir / "Preamble.lean").write_text("import Mathlib.X\n", encoding="utf-8")
+        (tdir / "main.lean").write_text("import Tablet.Preamble\ntheorem main : True := sorry\n", encoding="utf-8")
+        (tdir / "main.tex").write_text(
+            "\\begin{theorem}\nTrue.\n\\end{theorem}\n\\begin{proof}\nProof.\n\\end{proof}\n",
+            encoding="utf-8",
+        )
+
+        tablet = TabletState(nodes={
+            "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
+            "main": TabletNode(
+                name="main",
+                kind="ordinary",
+                status="open",
+                paper_provenance={"start_line": 10, "end_line": 12},
+            ),
+        })
+
+        self.assertEqual(
+            main_result_target_issues(
+                tablet,
+                repo,
+                [{"start_line": 10, "end_line": 12}],
+            ),
+            [],
+        )
 
 
 class TestPreambleDiff(unittest.TestCase):
@@ -377,29 +620,45 @@ class TestSupportFileGeneration(unittest.TestCase):
     def test_index_md(self):
         tablet = TabletState(nodes={
             "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed", title="Imports"),
-            "thm_a": TabletNode(name="thm_a", kind="paper_main_result", status="closed", title="Theorem A"),
+            "thm_a": TabletNode(
+                name="thm_a",
+                kind="ordinary",
+                status="closed",
+                title="Theorem A",
+                paper_provenance={"start_line": 10, "end_line": 12},
+            ),
             "helper": TabletNode(name="helper", kind="helper_lemma", status="open", title="Helper"),
         })
         repo = Path(tempfile.mkdtemp())
         tdir = repo / "Tablet"
         tdir.mkdir()
         (tdir / "Preamble.lean").write_text("import Mathlib.X\n")
+        (tdir / "Preamble.tex").write_text("\\begin{proposition}Imports.\\end{proposition}\n")
         (tdir / "thm_a.lean").write_text("import Tablet.Preamble\ntheorem thm_a : True := sorry\n")
+        (tdir / "thm_a.tex").write_text("\\begin{theorem}True\\end{theorem}\n\\begin{proof}Proof\\end{proof}\n")
         (tdir / "helper.lean").write_text("import Tablet.Preamble\ntheorem helper : True := sorry\n")
+        (tdir / "helper.tex").write_text("\\begin{helper}True\\end{helper}\n\\begin{proof}Proof\\end{proof}\n")
 
         index = generate_index_md(tablet, repo)
         self.assertIn("thm_a", index)
         self.assertIn("helper", index)
         self.assertIn("Closed:** 1", index)
+        self.assertIn("| thm_a | theorem |", index)
 
     def test_readme_md(self):
         tablet = TabletState(nodes={
             "Preamble": TabletNode(name="Preamble", kind="preamble", status="closed"),
-            "thm_a": TabletNode(name="thm_a", kind="paper_main_result", status="open", title="Main Theorem", paper_provenance="Thm 1.1"),
+            "thm_a": TabletNode(
+                name="thm_a",
+                kind="ordinary",
+                status="open",
+                title="Main Theorem",
+                paper_provenance={"start_line": 10, "end_line": 12, "tex_label": "thm1"},
+            ),
         })
         readme = generate_readme_md(tablet)
         self.assertIn("Main Theorem", readme)
-        self.assertIn("Thm 1.1", readme)
+        self.assertIn("lines 10-12; label=thm1", readme)
 
     def test_regenerate_creates_files(self):
         tablet = TabletState(nodes={
